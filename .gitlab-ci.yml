@@ -1,0 +1,69 @@
+---
+stages:
+  - test
+  - build
+  - post-test
+
+include:
+  - component: gl.vprw.ru/ci/sast/sast@1
+  - component: gl.vprw.ru/ci/sast/iac@1
+  - component: gl.vprw.ru/ci/sast/bearer@1
+  - component: gl.vprw.ru/ci/secret-detection/sd@1
+  - component: gl.vprw.ru/ci/golang/init-vet@1
+    inputs:
+      job_name: init + format + vet
+  - component: gl.vprw.ru/ci/docker/build-buildah@2
+    inputs:
+      job_name: build container image
+      job_name_manifest: push oci manifest
+      ci_image_name: ckic
+      ci_image_tags: latest,$CI_COMMIT_REF_SLUG
+      dockerfile_path: Dockerfile
+  - component: gl.vprw.ru/ci/container-scanning/cs@1
+    inputs:
+      job_name: container scanning (latest)
+      default_branch_image: $CI_REGISTRY_IMAGE/ckik:latest
+      application_repository: $CI_REGISTRY_IMAGE/ckik
+      application_tag: latest
+  - component: gl.vprw.ru/ci/golang/build-binaries@1
+    inputs:
+      job_name: compile binaries
+      working_dir: cmd/caddy-kubernetes-ingress-controller
+
+go test:
+  stage: test
+  image: ot.cmld.ru/docker.io/library/golang:1.23
+  needs:
+    - job: init + format + vet
+      artifacts: true
+  script:
+    - CGO_ENABLED=1 go test -race $(go list ./... | grep -v /vendor/)
+
+.build rules: &build-rules
+  rules:
+    - if: $CI_COMMIT_TAG || $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes:
+        - Dockerfile
+        - .gitlab-ci.yml
+        - go.mod
+        - "**/*.go"
+        - static/**/*
+        - templates/**/*
+
+build container image:
+  <<: *build-rules
+
+push oci manifest:
+  <<: *build-rules
+
+compile binaries:
+  <<: *build-rules
+  script:
+    - build_binary "ckic-$VERSION" linux amd64
+    - build_binary "ckic-$VERSION" linux arm64
+
+container scanning (latest):
+  <<: *build-rules
+  needs:
+    - job: build container image
+    - job: push oci manifest
