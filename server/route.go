@@ -1,7 +1,6 @@
 package server
 
 import (
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"net/url"
@@ -17,8 +16,7 @@ import (
 const BackendProtocolAnnotation = "caddy-kubernetes-ingress-controller/backend-protocol"
 
 type RoutingTable struct {
-	certificatesByHost map[string]map[string]*tls.Certificate
-	backendsByHost     map[string][]routingTableBackend
+	backendsByHost map[string][]routingTableBackend
 }
 
 type routingTableBackend struct {
@@ -49,8 +47,7 @@ func (rtb routingTableBackend) matches(path string) bool {
 
 func NewRoutingTable(payload *watcher.Payload) *RoutingTable {
 	rt := &RoutingTable{
-		certificatesByHost: make(map[string]map[string]*tls.Certificate),
-		backendsByHost:     make(map[string][]routingTableBackend),
+		backendsByHost: make(map[string][]routingTableBackend),
 	}
 	rt.init(payload)
 	return rt
@@ -119,18 +116,6 @@ func (rt *RoutingTable) matches(sni string, certHost string) bool {
 		certHost = certHost[2:]
 	}
 	return sni == certHost
-}
-
-func (rt *RoutingTable) GetCertificate(sni string) (*tls.Certificate, error) {
-	hostCerts, ok := rt.certificatesByHost[sni]
-	if ok {
-		for h, cert := range hostCerts {
-			if rt.matches(sni, h) {
-				return cert, nil
-			}
-		}
-	}
-	return nil, fmt.Errorf("certificate not found for %s", sni)
 }
 
 func (rt *RoutingTable) GetBackend(host, path string) (*url.URL, error) {
