@@ -16,14 +16,14 @@ include:
     inputs:
       job_name: build container image
       job_name_manifest: push oci manifest
-      ci_image_name: ckic
+      ci_image_name: manager
       ci_image_tags: latest,$CI_COMMIT_REF_SLUG
       dockerfile_path: Dockerfile
   - component: gl.vprw.ru/ci/container-scanning/cs@1
     inputs:
       job_name: container scanning (latest)
-      default_branch_image: $CI_REGISTRY_IMAGE/ckik:latest
-      application_repository: $CI_REGISTRY_IMAGE/ckik
+      default_branch_image: $CI_REGISTRY_IMAGE/manager:latest
+      application_repository: $CI_REGISTRY_IMAGE/manager
       application_tag: latest
   - component: gl.vprw.ru/ci/golang/build-binaries@1
     inputs:
@@ -47,8 +47,6 @@ go test:
         - .gitlab-ci.yml
         - go.mod
         - "**/*.go"
-        - static/**/*
-        - templates/**/*
 
 build container image:
   <<: *build-rules
