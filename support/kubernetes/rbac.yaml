@@ -41,24 +41,26 @@ subjects:
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
+
 metadata:
-  name: configmap-writer
+  name: configmap-reader-and-writer
+
 rules:
   - apiGroups: [""]
     resources: ["configmaps"]
-    verbs: ["create", "update", "patch", "delete"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 
 metadata:
-  name: configmap-writer-binding
+  name: configmap-reader-and-writer-binding
 
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: configmap-writer
+  name: configmap-reader-and-writer
 
 subjects:
   - kind: ServiceAccount
