@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"hash/fnv"
+	"strings"
 	"text/template"
 
 	"github.com/rs/zerolog/log"
@@ -64,7 +65,11 @@ func (c *Controller) Reconcile(ctx context.Context, payload *watcher.Payload) er
 	}
 	log.Info().Msg("caddyfile changed; updating configmap and reloading caddy pods")
 	if err := c.ensureConfigMap(ctx, rendered); err != nil {
-		return fmt.Errorf("failed to ensure caddy configmap: %w", err)
+		if strings.Contains(err.Error(), "already exists") {
+			log.Info().Msg("configmap already exists")
+		} else {
+			return fmt.Errorf("failed to ensure caddy configmap: %w", err)
+		}
 	}
 	if err := c.reloadCaddyPods(ctx); err != nil {
 		return fmt.Errorf("failed to reload caddy pods: %w", err)
