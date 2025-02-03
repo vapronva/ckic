@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"os"
 	"path/filepath"
 
@@ -46,7 +45,7 @@ func main() {
 	})
 	eg, ctx := errgroup.WithContext(context.Background())
 	eg.Go(func() error {
-		log.Info().Msg(fmt.Sprintf("starting watcher with context: %v", ctx))
+		log.Info().Msgf("starting controller in namespace %s", namespace)
 		return w.Run(ctx)
 	})
 	if err := eg.Wait(); err != nil {

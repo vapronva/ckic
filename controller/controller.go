@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"hash/fnv"
-	"strings"
 	"text/template"
 
 	"github.com/rs/zerolog/log"
@@ -47,6 +46,8 @@ func (c *Controller) Reconcile(ctx context.Context, payload *watcher.Payload) er
 		log.Info().Msg("payload is nil; nothing to reconcile")
 		return nil
 	}
+	log.Info().Msg("reconciling caddy configuration")
+	log.Debug().Msgf("payload: %+v", payload)
 	tpl := templates.DefaultCaddyfileTemplate
 	for _, ing := range payload.Ingresses {
 		if ingTmpl, ok := ing.Ingress.Annotations[customTemplateAnnotation]; ok && ingTmpl != "" {
@@ -65,11 +66,7 @@ func (c *Controller) Reconcile(ctx context.Context, payload *watcher.Payload) er
 	}
 	log.Info().Msg("caddyfile changed; updating configmap and reloading caddy pods")
 	if err := c.ensureConfigMap(ctx, rendered); err != nil {
-		if strings.Contains(err.Error(), "already exists") {
-			log.Info().Msg("configmap already exists")
-		} else {
-			return fmt.Errorf("failed to ensure caddy configmap: %w", err)
-		}
+		return fmt.Errorf("failed to ensure caddy configmap: %w", err)
 	}
 	if err := c.reloadCaddyPods(ctx); err != nil {
 		return fmt.Errorf("failed to reload caddy pods: %w", err)
@@ -94,9 +91,14 @@ func (c *Controller) ensureConfigMap(ctx context.Context, caddyfile string) erro
 	cmName := "caddy-kubernetes-ingress-config"
 	dataKey := "Caddyfile"
 	existing, err := c.client.CoreV1().ConfigMaps(c.namespace).Get(ctx, cmName, metav1.GetOptions{})
+	log.Debug().Msgf("existing configmap: %+v", existing)
+	if err != nil {
+		log.Debug().Err(err).Msg("failed to get existing configmap")
+	}
 	if err == nil {
 		existing.Data[dataKey] = caddyfile
 		_, updateErr := c.client.CoreV1().ConfigMaps(c.namespace).Update(ctx, existing, metav1.UpdateOptions{})
+		log.Debug().Err(updateErr).Msg("updating existing configmap")
 		return updateErr
 	}
 	newCm := &corev1.ConfigMap{
@@ -108,6 +110,7 @@ func (c *Controller) ensureConfigMap(ctx context.Context, caddyfile string) erro
 			dataKey: caddyfile,
 		},
 	}
+	log.Debug().Msgf("creating new configmap: %+v", newCm)
 	_, createErr := c.client.CoreV1().ConfigMaps(c.namespace).Create(ctx, newCm, metav1.CreateOptions{})
 	return createErr
 }
