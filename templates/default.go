@@ -1,21 +1,19 @@
 package templates
 
 const DefaultCaddyfileTemplate = `
-{{- range .Ingresses }}
-{{- $ing := .Ingress }}
-{{- range $rule := $ing.Spec.Rules }}
-{{ $rule.Host }} {
-{{- if $rule.HTTP }}
-    {{- range $path := $rule.HTTP.Paths }}
-	route {{ $path.Path }} {
-		reverse_proxy {{ $path.Backend.Service.Name }}:{{ $path.Backend.Service.Port.Number }}
-	}
+{{- with .Ingress }}
+{{- range .Spec.Rules }}
+{{ .Host }} {
+  {{- if .HTTP }}
+    {{- range .HTTP.Paths }}
+      route {{ .Path }} {
+        reverse_proxy {{ .Backend.Service.Name }}:{{ service_port .Backend.Service.Name .Backend.Service.Port }}
+      }
     {{- end }}
-{{- else }}
-	# WARN: no HTTP specified for this rule
-{{- end }}
+  {{- else }}
+      # WARN: no HTTP rule defined for this host
+  {{- end }}
 }
-
 {{- end }}
 {{- end }}
 `

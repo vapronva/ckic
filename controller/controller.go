@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"hash/fnv"
+	"strings"
 	"text/template"
 
 	"github.com/rs/zerolog/log"
@@ -12,6 +13,7 @@ import (
 	"gl.vprw.ru/vapronva/caddy-kubernetes-ingress-controller/watcher"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
@@ -48,24 +50,32 @@ func (c *Controller) Reconcile(ctx context.Context, payload *watcher.Payload) er
 	}
 	log.Info().Msg("reconciling caddy configuration")
 	log.Debug().Msgf("payload: %+v", payload)
-	tpl := templates.DefaultCaddyfileTemplate
-	for _, ing := range payload.Ingresses {
-		if ingTmpl, ok := ing.Ingress.Annotations[customTemplateAnnotation]; ok && ingTmpl != "" {
-			tpl = ingTmpl
-			break
+	var fragments []string
+	for _, ingPayload := range payload.Ingresses {
+		var tplStr string
+		ingressName := ingPayload.Ingress.Name
+		if custom, ok := ingPayload.Ingress.Annotations[customTemplateAnnotation]; ok && custom != "" {
+			tplStr = custom
+			log.Debug().Msgf("using custom template for ingress %s", ingressName)
+		} else {
+			tplStr = templates.DefaultCaddyfileTemplate
+			log.Debug().Msgf("using default template for ingress %s", ingressName)
 		}
+		rendered, err := c.renderIngressTemplate(tplStr, &ingPayload)
+		if err != nil {
+			log.Error().Err(err).Str("ingress", ingressName).Msg("error rendering ingress template")
+			continue
+		}
+		fragments = append(fragments, rendered)
 	}
-	rendered, err := c.renderCaddyfile(tpl, payload)
-	if err != nil {
-		return fmt.Errorf("failed to render caddyfile template: %w", err)
-	}
-	cfgHash := hashString(rendered)
+	finalCaddyfile := strings.Join(fragments, "\n")
+	cfgHash := hashString(finalCaddyfile)
 	if cfgHash == c.lastConfigHash {
 		log.Debug().Msg("caddyfile has not changed; skipping update/reload")
 		return nil
 	}
 	log.Info().Msg("caddyfile changed; updating configmap and reloading caddy pods")
-	if err := c.ensureConfigMap(ctx, rendered); err != nil {
+	if err := c.ensureConfigMap(ctx, finalCaddyfile); err != nil {
 		return fmt.Errorf("failed to ensure caddy configmap: %w", err)
 	}
 	if err := c.reloadCaddyPods(ctx); err != nil {
@@ -75,13 +85,26 @@ func (c *Controller) Reconcile(ctx context.Context, payload *watcher.Payload) er
 	return nil
 }
 
-func (c *Controller) renderCaddyfile(tplStr string, payload *watcher.Payload) (string, error) {
-	tpl, err := template.New("caddyfile").Parse(tplStr)
+func (c *Controller) renderIngressTemplate(tplStr string, data *watcher.IngressPayload) (string, error) {
+	funcMap := template.FuncMap{
+		"service_port": func(svcName string, port intstr.IntOrString) int {
+			if port.Type == intstr.Int {
+				return int(port.IntVal)
+			}
+			if ports, ok := data.ServicePorts[svcName]; ok {
+				if portNum, ok2 := ports[port.StrVal]; ok2 {
+					return portNum
+				}
+			}
+			return 0
+		},
+	}
+	tmpl, err := template.New("caddyfile").Funcs(funcMap).Parse(tplStr)
 	if err != nil {
 		return "", err
 	}
 	var buf bytes.Buffer
-	if err := tpl.Execute(&buf, payload); err != nil {
+	if err := tmpl.Execute(&buf, data); err != nil {
 		return "", err
 	}
 	return buf.String(), nil
@@ -92,9 +115,6 @@ func (c *Controller) ensureConfigMap(ctx context.Context, caddyfile string) erro
 	dataKey := "Caddyfile"
 	existing, err := c.client.CoreV1().ConfigMaps(c.namespace).Get(ctx, cmName, metav1.GetOptions{})
 	log.Debug().Msgf("existing configmap: %+v", existing)
-	if err != nil {
-		log.Debug().Err(err).Msg("failed to get existing configmap")
-	}
 	if err == nil {
 		existing.Data[dataKey] = caddyfile
 		_, updateErr := c.client.CoreV1().ConfigMaps(c.namespace).Update(ctx, existing, metav1.UpdateOptions{})
@@ -158,7 +178,6 @@ func (c *Controller) reloadCaddyPods(ctx context.Context) error {
 				Msg("failed caddy reload command")
 		}
 	}
-
 	return nil
 }
 
