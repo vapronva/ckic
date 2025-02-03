@@ -12,7 +12,7 @@ const DefaultCaddyfileTemplate = `
 	}
     {{- end }}
 {{- else }}
-	# WANR: no HTTP specified for this rule
+	# WARN: no HTTP specified for this rule
 {{- end }}
 }
 
