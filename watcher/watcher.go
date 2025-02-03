@@ -71,7 +71,7 @@ func (w *Watcher) Run(ctx context.Context) error {
 				addBackend(&ingressPayload, *ingress.Spec.DefaultBackend)
 			}
 			for _, rule := range ingress.Spec.Rules {
-				if rule.HTTP != nil {
+				if rule.HTTP == nil {
 					continue
 				}
 				for _, path := range rule.HTTP.Paths {
@@ -94,13 +94,6 @@ func (w *Watcher) Run(ctx context.Context) error {
 		},
 	}
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		informer := factory.Core().V1().Secrets().Informer()
-		informer.AddEventHandler(handler)
-		informer.Run(ctx.Done())
-		wg.Done()
-	}()
 	wg.Add(1)
 	go func() {
 		informer := factory.Networking().V1().Ingresses().Informer()

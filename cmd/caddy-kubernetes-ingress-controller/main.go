@@ -9,6 +9,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"gl.vprw.ru/vapronva/caddy-kubernetes-ingress-controller/controller"
 	"gl.vprw.ru/vapronva/caddy-kubernetes-ingress-controller/watcher"
 	"golang.org/x/sync/errgroup"
 	"k8s.io/apimachinery/pkg/util/runtime"
@@ -32,12 +33,16 @@ func main() {
 			log.Warn().Err(err).Msgf("[k8s] %s", msg)
 		},
 	}
-	client, err := kubernetes.NewForConfig(getKubernetesConfig())
+	cfg := getKubernetesConfig()
+	client, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
-		log.Fatal().Err(err).Msg("failed to create kubernetes client")
+		log.Fatal().Err(err).Msg("failed to create Kubernetes client")
 	}
+	ctrl := controller.NewController(client, cfg, namespace, containerAnnotation)
 	w := watcher.New(client, func(payload *watcher.Payload) {
-		log.Info().Msg(fmt.Sprintf("received payload: %v", payload))
+		if err := ctrl.Reconcile(context.Background(), payload); err != nil {
+			log.Error().Err(err).Msg("controller reconciliation failed")
+		}
 	})
 	eg, ctx := errgroup.WithContext(context.Background())
 	eg.Go(func() error {
@@ -55,7 +60,7 @@ func getKubernetesConfig() *rest.Config {
 		config, err = clientcmd.BuildConfigFromFlags("", filepath.Join(os.Getenv("HOME"), ".kube", "config"))
 	}
 	if err != nil {
-		log.Fatal().Err(err).Msg("failed to get kubernetes configuration")
+		log.Fatal().Err(err).Msg("failed to get Kubernetes configuration")
 	}
 	return config
 }

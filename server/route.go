@@ -76,7 +76,6 @@ func (rt *RoutingTable) addBackend(ingressPayload watcher.IngressPayload, rule n
 			rtb, err := newRoutingTableBackend(scheme, "", backend.Service.Name,
 				rt.getServicePort(ingressPayload, backend.Service.Name, intstr.FromInt(int(backend.Service.Port.Number))))
 			if err != nil {
-				// this shouldn't happen
 				log.Error().Err(err).Send()
 				return
 			}
