@@ -16,4 +16,4 @@ USER nobody
 
 ENTRYPOINT ["/usr/bin/ckic"]
 
-CMD ["--namespace", "caddy-ckic-system", "--container-annotation", "cmld.ru/ckic=true"]
+CMD ["--namespace", "ckic-system", "--container-annotation", "cmld.ru/ckic/ingress-controller/caddy"]

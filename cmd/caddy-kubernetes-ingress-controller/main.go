@@ -24,7 +24,7 @@ var (
 )
 
 func main() {
-	flag.StringVar(&namespace, "namespace", "", "namespace to edit and create configmaps")
+	flag.StringVar(&namespace, "namespace", "ckic-system", "namespace to edit and create configmaps")
 	flag.StringVar(&containerAnnotation, "container-annotation", "caddy-kubernetes-ingress-controller/caddy-instance", "annotation to use to determine which caddy instance to update")
 	flag.Parse()
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})

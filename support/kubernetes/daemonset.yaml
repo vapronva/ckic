@@ -1,0 +1,26 @@
+---
+apiVersion: apps/v1
+kind: DaemonSet
+
+metadata:
+  name: caddy-kubernetes-ingress-controller
+  namespace: ckic-system
+  labels:
+    cmld.ru/ckic/ingress-controller: "true"
+
+spec:
+  selector:
+    matchLabels:
+      cmld.ru/ckic/ingress-controller: "true"
+  template:
+    metadata:
+      labels:
+        cmld.ru/ckic/ingress-controller: "true"
+    spec:
+      serviceAccountName: ckic
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: manager
+          image: rg.gl.vprw.ru/vapronva/ckic/manager:latest
+          imagePullPolicy: Always
