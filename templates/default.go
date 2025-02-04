@@ -7,7 +7,7 @@ const DefaultCaddyfileTemplate = `
   {{- if .HTTP }}
     {{- range .HTTP.Paths }}
       route {{ .Path }} {
-        reverse_proxy {{ .Backend.Service.Name }}:{{ service_port .Backend.Service.Name .Backend.Service.Port }}
+        reverse_proxy {{ .Backend.Service.Name }}:{{ .Backend.Service.Port.Number }}
       }
     {{- end }}
   {{- else }}

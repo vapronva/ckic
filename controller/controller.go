@@ -13,7 +13,6 @@ import (
 	"gl.vprw.ru/vapronva/caddy-kubernetes-ingress-controller/watcher"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
@@ -75,10 +74,10 @@ func (c *Controller) Reconcile(ctx context.Context, payload *watcher.Payload) er
 		return nil
 	}
 	log.Info().Msg("caddyfile changed; updating configmap and reloading caddy pods")
-	if err := c.ensureConfigMap(ctx, finalCaddyfile); err != nil {
+	if err := c.EnsureConfigMap(ctx, finalCaddyfile); err != nil {
 		return fmt.Errorf("failed to ensure caddy configmap: %w", err)
 	}
-	if err := c.reloadCaddyPods(ctx); err != nil {
+	if err := c.ReloadCaddyPods(ctx); err != nil {
 		return fmt.Errorf("failed to reload caddy pods: %w", err)
 	}
 	c.lastConfigHash = cfgHash
@@ -86,20 +85,7 @@ func (c *Controller) Reconcile(ctx context.Context, payload *watcher.Payload) er
 }
 
 func (c *Controller) renderIngressTemplate(tplStr string, data *watcher.IngressPayload) (string, error) {
-	funcMap := template.FuncMap{
-		"service_port": func(svcName string, port intstr.IntOrString) int {
-			if port.Type == intstr.Int {
-				return int(port.IntVal)
-			}
-			if ports, ok := data.ServicePorts[svcName]; ok {
-				if portNum, ok2 := ports[port.StrVal]; ok2 {
-					return portNum
-				}
-			}
-			return 0
-		},
-	}
-	tmpl, err := template.New("caddyfile").Funcs(funcMap).Parse(tplStr)
+	tmpl, err := template.New("caddyfile").Parse(tplStr)
 	if err != nil {
 		return "", err
 	}
@@ -110,7 +96,7 @@ func (c *Controller) renderIngressTemplate(tplStr string, data *watcher.IngressP
 	return buf.String(), nil
 }
 
-func (c *Controller) ensureConfigMap(ctx context.Context, caddyfile string) error {
+func (c *Controller) EnsureConfigMap(ctx context.Context, caddyfile string) error {
 	cmName := "caddy-kubernetes-ingress-config"
 	dataKey := "Caddyfile"
 	existing, err := c.client.CoreV1().ConfigMaps(c.namespace).Get(ctx, cmName, metav1.GetOptions{})
@@ -135,7 +121,7 @@ func (c *Controller) ensureConfigMap(ctx context.Context, caddyfile string) erro
 	return createErr
 }
 
-func (c *Controller) reloadCaddyPods(ctx context.Context) error {
+func (c *Controller) ReloadCaddyPods(ctx context.Context) error {
 	podList, err := c.client.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return err

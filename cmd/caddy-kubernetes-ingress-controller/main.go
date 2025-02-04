@@ -32,7 +32,7 @@ func main() {
 			log.Warn().Err(err).Msgf("[k8s] %s", msg)
 		},
 	}
-	cfg := getKubernetesConfig()
+	cfg := GetKubernetesConfig()
 	client, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to create Kubernetes client")
@@ -53,7 +53,7 @@ func main() {
 	}
 }
 
-func getKubernetesConfig() *rest.Config {
+func GetKubernetesConfig() *rest.Config {
 	config, err := rest.InClusterConfig()
 	if err != nil {
 		config, err = clientcmd.BuildConfigFromFlags("", filepath.Join(os.Getenv("HOME"), ".kube", "config"))
