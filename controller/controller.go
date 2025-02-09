@@ -122,7 +122,7 @@ func (c *Controller) EnsureConfigMap(ctx context.Context, caddyfile string) erro
 }
 
 func (c *Controller) ReloadCaddyPods(ctx context.Context) error {
-	podList, err := c.client.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+	podList, err := c.client.CoreV1().Pods(c.namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return err
 	}
