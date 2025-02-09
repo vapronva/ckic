@@ -123,6 +123,7 @@ func (c *Controller) EnsureConfigMap(ctx context.Context, caddyfile string) erro
 
 func (c *Controller) ReloadCaddyPods(ctx context.Context) error {
 	podList, err := c.client.CoreV1().Pods(c.namespace).List(ctx, metav1.ListOptions{})
+	log.Debug().Msgf("podList to consider for reloading: %s", podList)
 	if err != nil {
 		return err
 	}
@@ -139,6 +140,7 @@ func (c *Controller) ReloadCaddyPods(ctx context.Context) error {
 		if _, ok := pod.Annotations[c.containerAnnotation]; !ok {
 			continue
 		}
+		log.Debug().Msgf("the pod we will reload caddy in: %s", pod.Name)
 		var containerName string
 		if len(pod.Spec.Containers) == 1 {
 			containerName = pod.Spec.Containers[0].Name
