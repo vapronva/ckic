@@ -1,0 +1,85 @@
+(basic-compression-set) {
+  encode {
+    zstd
+    gzip 7
+    br 9
+    match {
+      header Content-Type text/*
+      header Content-Type message/*
+      header Content-Type font/*
+      header Content-Type multipart/mixed*
+      header Content-Type multipart/bag*
+      header Content-Type application/font*
+      header Content-Type application/eot*
+      header Content-Type application/opentype*
+      header Content-Type application/x-opentype*
+      header Content-Type application/otf*
+      header Content-Type application/x-otf*
+      header Content-Type application/truetype*
+      header Content-Type application/x-truetype*
+      header Content-Type application/ttf*
+      header Content-Type application/x-ttf*
+      header Content-Type application/vnd.ms-fontobject*
+      header Content-Type application/json*
+      header Content-Type application/*+json*
+      header Content-Type application/wasm*
+      header Content-Type application/javascript*
+      header Content-Type application/x-javascript*
+      header Content-Type application/x-httpd-cgi*
+      header Content-Type application/x-perl*
+      header Content-Type application/x-protobuf*
+      header Content-Type application/xml*
+      header Content-Type application/*+xml*
+      header Content-Type application/dns-message*
+      header Content-Type image/vnd.microsoft.icon*
+      header Content-Type image/x-icon*
+      header Content-Type image/svg+xml*
+    }
+  }
+}
+
+(default-headers-set) {
+  request_id 32
+  header * {
+    x-cmld-request-id "{http.request_id}"
+    X-Robots-Tag "noindex, noarchive, nofollow, nositelinkssearchbox, noimageindex"
+    X-Content-Type-Options "nosniff"
+    Referrer-Policy "same-origin"
+    Permissions-Policy "interest-cohort=()"
+    X-DNS-Prefetch-Control "on"
+    -Server
+  }
+}
+
+(default-headers-set-custom) {
+  request_id 32
+  header * {
+    x-cmld-request-id "{http.request_id}"
+    X-Content-Type-Options "nosniff"
+    Referrer-Policy "same-origin"
+    Permissions-Policy "interest-cohort=()"
+    X-DNS-Prefetch-Control "on"
+    Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+    -Server
+  }
+}
+
+(reverse-proxy-xri-hd) {
+  reverse_proxy {
+    to {args[:]}
+    header_up X-Real-IP {client_ip}
+    header_down -Server
+  }
+}
+
+(reverse-proxy-xri-hd-proxy-protocol) {
+  reverse_proxy {
+    to {args[:]}
+    header_up X-Real-IP {client_ip}
+    header_down -Server
+    transport http {
+      proxy_protocol v2
+    }
+  }
+}
+

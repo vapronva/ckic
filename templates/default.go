@@ -6,14 +6,19 @@ const DefaultCaddyfileTemplate = `
   {{- range .Spec.Rules }}
 {{ .Host }}:443 {
   {{- if .HTTP }}
+  import basic-compression-set
+  import default-headers-set-custom
+  header * {
+    X-Robots-Tag "noindex, noarchive, nofollow"
+  }
     {{- if gt (len .HTTP.Paths) 0 }}
       {{- if eq (len .HTTP.Paths) 1 }}
         {{- $path := index .HTTP.Paths 0 }}
-  reverse_proxy {{ printf "%s.%s.svc.cluster.local:%d" $path.Backend.Service.Name $namespace $path.Backend.Service.Port.Number }}
+  import reverse-proxy-xri-hd {{ printf "%s.%s.svc.cluster.local:%d" $path.Backend.Service.Name $namespace $path.Backend.Service.Port.Number }}
       {{- else }}
         {{- range .HTTP.Paths }}
   route {{ .Path }} {
-    reverse_proxy {{ printf "%s.%s.svc.cluster.local:%d" .Backend.Service.Name $namespace .Backend.Service.Port.Number }}
+    import reverse-proxy-xri-hd {{ printf "%s.%s.svc.cluster.local:%d" .Backend.Service.Name $namespace .Backend.Service.Port.Number }}
   }
         {{- end }}
       {{- end }}
