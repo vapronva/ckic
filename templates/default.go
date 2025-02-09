@@ -2,18 +2,28 @@ package templates
 
 const DefaultCaddyfileTemplate = `
 {{- with .Ingress }}
-{{- range .Spec.Rules }}
-{{ .Host }} {
+  {{- $namespace := .Namespace }}
+  {{- range .Spec.Rules }}
+{{ .Host }}:443 {
   {{- if .HTTP }}
-    {{- range .HTTP.Paths }}
-      route {{ .Path }} {
-        reverse_proxy {{ .Backend.Service.Name }}:{{ .Backend.Service.Port.Number }}
-      }
+    {{- if gt (len .HTTP.Paths) 0 }}
+      {{- if eq (len .HTTP.Paths) 1 }}
+        {{- $path := index .HTTP.Paths 0 }}
+  reverse_proxy {{ printf "%s.%s.svc.cluster.local:%d" $path.Backend.Service.Name $namespace $path.Backend.Service.Port.Number }}
+      {{- else }}
+        {{- range .HTTP.Paths }}
+  route {{ .Path }} {
+    reverse_proxy {{ printf "%s.%s.svc.cluster.local:%d" .Backend.Service.Name $namespace .Backend.Service.Port.Number }}
+  }
+        {{- end }}
+      {{- end }}
+    {{- else }}
+  # WARN: HTTP rule is present for host {{ .Host }} but no paths have been configured
     {{- end }}
   {{- else }}
-      # WARN: no HTTP rule defined for this host
+  # WARN: no HTTP rule defined for this host
   {{- end }}
 }
-{{- end }}
+  {{- end }}
 {{- end }}
 `
