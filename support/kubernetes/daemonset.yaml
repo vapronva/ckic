@@ -6,16 +6,16 @@ metadata:
   name: caddy-kubernetes-ingress-controller
   namespace: ckic-system
   labels:
-    cmld.ru/ckic/ingress-controller: "true"
+    ckic.cmld.ru/ingress-controller: "true"
 
 spec:
   selector:
     matchLabels:
-      cmld.ru/ckic/ingress-controller: "true"
+      ckic.cmld.ru/ingress-controller: "true"
   template:
     metadata:
       labels:
-        cmld.ru/ckic/ingress-controller: "true"
+        ckic.cmld.ru/ingress-controller: "true"
     spec:
       serviceAccountName: ckic
       hostNetwork: true

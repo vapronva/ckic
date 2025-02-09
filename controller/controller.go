@@ -17,7 +17,7 @@ import (
 	"k8s.io/client-go/rest"
 )
 
-const customTemplateAnnotation = "cmld.ru/ckic/caddy-template"
+const customTemplateAnnotation = "ckic.cmld.ru/caddy-template"
 
 type Controller struct {
 	client              kubernetes.Interface

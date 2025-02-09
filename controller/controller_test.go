@@ -74,7 +74,7 @@ func TestController_Reconcile_CustomTemplate(t *testing.T) {
 			Name:      "test-ing-custom",
 			Namespace: "default",
 			Annotations: map[string]string{
-				"cmld.ru/ckic/caddy-template": "{{ .Ingress.Name }}-custom",
+				"ckic.cmld.ru/caddy-template": "{{ .Ingress.Name }}-custom",
 			},
 		},
 	}
@@ -98,7 +98,7 @@ func TestController_Reconcile_InvalidCustomTemplate(t *testing.T) {
 			Name:      "bad-template",
 			Namespace: "default",
 			Annotations: map[string]string{
-				"cmld.ru/ckic/caddy-template": "{{ .ThisDoesNotExist }",
+				"ckic.cmld.ru/caddy-template": "{{ .ThisDoesNotExist }",
 			},
 		},
 	}
