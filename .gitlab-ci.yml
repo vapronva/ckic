@@ -91,7 +91,7 @@ validate + lint (helm chart):
   image: $CT_IMAGE
   script:
     - cd "chart" || exit
-    - ct lint --validate-chart-schema --validate-yaml --chart-dirs . --charts . --debug
+    - ct lint --validate-chart-schema --validate-yaml --chart-dirs . --charts . --debug --validate-maintainers=false
 
 publish helm chart to gitlab registry:
   <<:

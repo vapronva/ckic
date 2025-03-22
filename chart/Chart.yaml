@@ -10,3 +10,8 @@ version: 0.1.0
 appVersion: 0.2.0
 
 icon: https://gl.vprw.ru/uploads/-/system/project/avatar/177/ckic-avatar-takanashikiara-bluefield-twt-1.jpg
+
+maintainers:
+  - name: Vladimir Malinovskiy
+    email: git@vprw.ru
+    url: https://vapronva.pw
