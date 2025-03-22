@@ -36,6 +36,7 @@ include:
     inputs:
       job_name: compile binaries
       working_dir: cmd/caddy-kubernetes-ingress-controller
+      golang_version: "1.24"
 
 go test:
   stage: test

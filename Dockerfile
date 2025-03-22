@@ -10,7 +10,7 @@ RUN set -ex && \
 
 FROM ot.cmld.ru/docker.io/library/alpine:3
 
-COPY --from=build /usr/bin/ckic /usr/bin/ckic
+COPY --from=build /usr/bin/ckic-manager /usr/bin/ckic-manager
 
 USER nobody
 
