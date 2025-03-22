@@ -1,0 +1,59 @@
+---
+replicaCount: 1
+
+image:
+  repository: rg.gl.vprw.ru
+  image: vapronva/ckic/manager
+  tag: latest
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+
+podSecurityContext: {}
+
+securityContext:
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 1000
+
+# TODO: actually collect how much resources the manager needs
+resources:
+  limits:
+    cpu: 200m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+config:
+  nodeLabel: ckic.cmld.ru/enabled=true
+  configMapName: caddy-config
+  configMapNamespace: caddy-system
+  communicationMethod: clusterip  # or "direct"
+  logLevel: info
+
+defaultCaddyConfig: |
+  {
+    http_port 80
+    https_port 443
+    admin :2019
+  }
+
+  :80 {
+    respond "Caddy is running! Default configuration."
+  }
+

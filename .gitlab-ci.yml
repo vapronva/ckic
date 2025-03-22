@@ -3,6 +3,10 @@ stages:
   - test
   - build
   - post-test
+  - publish
+
+variables:
+  CT_IMAGE: ot.cmld.ru/quay.io/helmpack/chart-testing:v3.12.0
 
 include:
   - component: gl.vprw.ru/ci/sast/sast@1
@@ -32,7 +36,7 @@ include:
 
 go test:
   stage: test
-  image: ot.cmld.ru/docker.io/library/golang:1.23
+  image: ot.cmld.ru/docker.io/library/golang:1.24
   needs:
     - job: init + format + vet
       artifacts: true
@@ -47,21 +51,56 @@ go test:
         - .gitlab-ci.yml
         - go.mod
         - "**/*.go"
+        - $CI_CONFIG_PATH
 
 build container image:
-  <<: *build-rules
+  <<:
+    - *build-rules
 
 push oci manifest:
-  <<: *build-rules
+  <<:
+    - *build-rules
 
 compile binaries:
-  <<: *build-rules
+  <<:
+    - *build-rules
   script:
-    - build_binary "ckic-$VERSION" linux amd64
-    - build_binary "ckic-$VERSION" linux arm64
+    - build_binary "ckic-manager-$VERSION" linux amd64
+    - build_binary "ckic-manager-$VERSION" linux arm64
 
 container scanning (latest):
   <<: *build-rules
   needs:
     - job: build container image
     - job: push oci manifest
+
+.chart build and publish rules: &chart-build-and-publish-rules
+  rules:
+    - if: $CI_COMMIT_TAG || $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes:
+        - chart/**/*
+        - $CI_CONFIG_PATH
+
+validate + lint (helm chart):
+  <<:
+    - *chart-build-and-publish-rules
+  stage: test
+  image: $CT_IMAGE
+  script:
+    - cd "chart" || exit
+    - ct lint --all --validate-chart-schema --validate-yaml --chart-dirs . --charts . --debug
+
+publish helm chart to gitlab registry:
+  <<:
+    - *chart-build-and-publish-rules
+  stage: publish
+  image: $CT_IMAGE
+  needs:
+    - job: validate + lint (helm chart)
+    - job: kics
+      optional: true
+  script:
+    - helm plugin install https://github.com/chartmuseum/helm-push.git
+    - helm repo add --username gitlab-ci-token --password "$CI_JOB_TOKEN" "$CI_PROJECT_NAME" "$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/helm/stable"
+    - helm package ./chart --destination ./packages
+    - find ./packages -name "*.tgz" -print -exec helm cm-push {} "$CI_PROJECT_NAME" \;

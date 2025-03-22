@@ -1,0 +1,4 @@
+chart/
+.gitlab-ci.yml
+CODEOWNERS
+README.md
