@@ -12,10 +12,13 @@ include:
   - component: gl.vprw.ru/ci/sast/sast@1
   - component: gl.vprw.ru/ci/sast/iac@1
   - component: gl.vprw.ru/ci/sast/bearer@1
+    inputs:
+      image: docker.io/bearer/bearer:latest
   - component: gl.vprw.ru/ci/secret-detection/sd@1
   - component: gl.vprw.ru/ci/golang/init-vet@1
     inputs:
       job_name: init + format + vet
+      golang_version: "1.24"
   - component: gl.vprw.ru/ci/docker/build-buildah@2
     inputs:
       job_name: build container image
@@ -88,7 +91,7 @@ validate + lint (helm chart):
   image: $CT_IMAGE
   script:
     - cd "chart" || exit
-    - ct lint --all --validate-chart-schema --validate-yaml --chart-dirs . --charts . --debug
+    - ct lint --validate-chart-schema --validate-yaml --chart-dirs . --charts . --debug
 
 publish helm chart to gitlab registry:
   <<:
