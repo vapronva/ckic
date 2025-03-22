@@ -56,4 +56,3 @@ defaultCaddyConfig: |
   :80 {
     respond "Caddy is running! Default configuration."
   }
-
