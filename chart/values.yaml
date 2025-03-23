@@ -26,14 +26,12 @@ securityContext:
   runAsNonRoot: true
   runAsUser: 1000
 
-# TODO: actually collect how much resources the manager needs
 resources:
   limits:
-    cpu: 200m
-    memory: 256Mi
+    memory: 20Mi
   requests:
-    cpu: 100m
-    memory: 128Mi
+    cpu: 5m
+    memory: 10Mi
 
 nodeSelector: {}
 tolerations: []
@@ -45,6 +43,8 @@ config:
   configMapNamespace: caddy-system
   communicationMethod: clusterip  # or "direct"
   logLevel: info
+  caddyImage: rg.gl.vprw.ru/oss-images/zerossl-caddy/caddy:2.9.1-alpine
+  enableNodePort: true
 
 defaultCaddyConfig: |
   {
