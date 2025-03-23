@@ -44,6 +44,12 @@ spec:
             - "--caddy-image={{ .Values.config.caddyImage }}"
             - "--enable-loadbalancer={{ .Values.config.enableLoadBalancer }}"
             - "--prefer-saved-state={{ .Values.config.preferSavedState }}"
+            - "--env-secret={{ .Values.config.secretName }}"
+            {{- range .Values.config.secretEnvKeys }}
+            - "--env-keys={{ . }}"
+            {{- end }}
+            - "--data-pvc={{ .Values.config.dataVolumePVC }}"
+            - "--config-pvc={{ .Values.config.configVolumePVC }}"
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       {{- with .Values.nodeSelector }}

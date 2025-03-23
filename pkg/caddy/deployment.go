@@ -13,7 +13,18 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
-func DeployCaddy(ctx context.Context, clientset *kubernetes.Clientset, nodeName, namespace, caddyImage string, enableLoadBalancer bool) (*Instance, error) {
+func DeployCaddy(
+	ctx context.Context,
+	clientset *kubernetes.Clientset,
+	nodeName,
+	namespace,
+	caddyImage string,
+	enableLoadBalancer bool,
+	envSecretName string,
+	envSecretKeys []string,
+	dataVolumePVC string,
+	configVolumePVC string,
+) (*Instance, error) {
 	deployCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()
 	logger := log.With().Str("node", nodeName).Logger()
@@ -26,7 +37,16 @@ func DeployCaddy(ctx context.Context, clientset *kubernetes.Clientset, nodeName,
 		FailureCount:   0,
 		KubeClient:     clientset,
 	}
-	if err := deployDeployment(deployCtx, clientset, instance, caddyImage); err != nil {
+	if err := deployDeployment(
+		deployCtx,
+		clientset,
+		instance,
+		caddyImage,
+		envSecretName,
+		envSecretKeys,
+		dataVolumePVC,
+		configVolumePVC,
+	); err != nil {
 		return nil, err
 	}
 	if err := deployService(deployCtx, clientset, instance); err != nil {
@@ -53,9 +73,115 @@ func DeployCaddy(ctx context.Context, clientset *kubernetes.Clientset, nodeName,
 	return instance, nil
 }
 
-func deployDeployment(ctx context.Context, clientset *kubernetes.Clientset, instance *Instance, caddyImage string) error {
+func deployDeployment(
+	ctx context.Context,
+	clientset *kubernetes.Clientset,
+	instance *Instance,
+	caddyImage string,
+	envSecretName string,
+	envSecretKeys []string,
+	dataVolumePVC string,
+	configVolumePVC string,
+) error {
 	logger := log.With().Str("deployment", instance.DeploymentName).Logger()
 	replicas := int32(1)
+	caddyContainer := corev1.Container{
+		Name:  "caddy",
+		Image: caddyImage,
+		Ports: []corev1.ContainerPort{
+			{Name: "http-tcp", ContainerPort: 80, Protocol: corev1.ProtocolTCP},
+			{Name: "http-udp", ContainerPort: 80, Protocol: corev1.ProtocolUDP},
+			{Name: "https-tcp", ContainerPort: 443, Protocol: corev1.ProtocolTCP},
+			{Name: "https-udp", ContainerPort: 443, Protocol: corev1.ProtocolUDP},
+			{Name: "admin", ContainerPort: 2019, Protocol: corev1.ProtocolTCP},
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: "caddy-config", MountPath: "/etc/caddy/Caddyfile", SubPath: "Caddyfile"},
+			{Name: "opt-data", MountPath: "/data"},
+			{Name: "opt-config", MountPath: "/config"},
+		},
+	}
+	if envSecretName != "" && len(envSecretKeys) > 0 {
+		logger.Info().
+			Str("secret", envSecretName).
+			Strs("keys", envSecretKeys).
+			Msg("Configuring environment variables from secret")
+
+		var envVars []corev1.EnvVar
+		for _, key := range envSecretKeys {
+			envVars = append(envVars, corev1.EnvVar{
+				Name: key,
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: envSecretName,
+						},
+						Key: key,
+					},
+				},
+			})
+		}
+		caddyContainer.Env = envVars
+	}
+	volumes := []corev1.Volume{
+		{
+			Name: "caddy-config",
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: "caddy-default-config",
+					},
+					Items: []corev1.KeyToPath{
+						{Key: "Caddyfile", Path: "Caddyfile"},
+					},
+				},
+			},
+		},
+	}
+	if dataVolumePVC != "" {
+		logger.Info().Str("pvc", dataVolumePVC).Msg("Using PVC for data volume")
+		volumes = append(volumes, corev1.Volume{
+			Name: "opt-data",
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: dataVolumePVC,
+				},
+			},
+		})
+	} else {
+		logger.Info().Msg("Using HostPath for data volume")
+		volumes = append(volumes, corev1.Volume{
+			Name: "opt-data",
+			VolumeSource: corev1.VolumeSource{
+				HostPath: &corev1.HostPathVolumeSource{
+					Path: "/opt/cmld/caddy/data",
+					Type: hostPathTypePtr(corev1.HostPathDirectoryOrCreate),
+				},
+			},
+		})
+	}
+	if configVolumePVC != "" {
+		logger.Info().Str("pvc", configVolumePVC).Msg("Using PVC for config volume")
+		volumes = append(volumes, corev1.Volume{
+			Name: "opt-config",
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: configVolumePVC,
+				},
+			},
+		})
+	} else {
+		logger.Info().Msg("Using HostPath for config volume")
+		volumes = append(volumes, corev1.Volume{
+			Name: "opt-config",
+			VolumeSource: corev1.VolumeSource{
+				HostPath: &corev1.HostPathVolumeSource{
+					Path: "/opt/cmld/caddy/config",
+					Type: hostPathTypePtr(corev1.HostPathDirectoryOrCreate),
+				},
+			},
+		})
+	}
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      instance.DeploymentName,
@@ -86,57 +212,8 @@ func deployDeployment(ctx context.Context, clientset *kubernetes.Clientset, inst
 					NodeSelector: map[string]string{
 						"kubernetes.io/hostname": instance.NodeName,
 					},
-					Containers: []corev1.Container{
-						{
-							Name:  "caddy",
-							Image: caddyImage,
-							Ports: []corev1.ContainerPort{
-								{Name: "http-tcp", ContainerPort: 80, Protocol: corev1.ProtocolTCP},
-								{Name: "http-udp", ContainerPort: 80, Protocol: corev1.ProtocolUDP},
-								{Name: "https-tcp", ContainerPort: 443, Protocol: corev1.ProtocolTCP},
-								{Name: "https-udp", ContainerPort: 443, Protocol: corev1.ProtocolUDP},
-								{Name: "admin", ContainerPort: 2019, Protocol: corev1.ProtocolTCP},
-							},
-							VolumeMounts: []corev1.VolumeMount{
-								{Name: "caddy-config", MountPath: "/etc/caddy/Caddyfile", SubPath: "Caddyfile"},
-								{Name: "opt-data", MountPath: "/data"},
-								{Name: "opt-config", MountPath: "/config"},
-							},
-						},
-					},
-					Volumes: []corev1.Volume{
-						{
-							Name: "caddy-config",
-							VolumeSource: corev1.VolumeSource{
-								ConfigMap: &corev1.ConfigMapVolumeSource{
-									LocalObjectReference: corev1.LocalObjectReference{
-										Name: "caddy-default-config",
-									},
-									Items: []corev1.KeyToPath{
-										{Key: "Caddyfile", Path: "Caddyfile"},
-									},
-								},
-							},
-						},
-						{
-							Name: "opt-data",
-							VolumeSource: corev1.VolumeSource{
-								HostPath: &corev1.HostPathVolumeSource{
-									Path: "/opt/cmld/caddy/data",
-									Type: hostPathTypePtr(corev1.HostPathDirectoryOrCreate),
-								},
-							},
-						},
-						{
-							Name: "opt-config",
-							VolumeSource: corev1.VolumeSource{
-								HostPath: &corev1.HostPathVolumeSource{
-									Path: "/opt/cmld/caddy/config",
-									Type: hostPathTypePtr(corev1.HostPathDirectoryOrCreate),
-								},
-							},
-						},
-					},
+					Containers: []corev1.Container{caddyContainer},
+					Volumes:    volumes,
 				},
 			},
 		},

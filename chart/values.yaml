@@ -46,6 +46,10 @@ config:
   caddyImage: rg.gl.vprw.ru/oss-images/zerossl-caddy/caddy:2.9.1-alpine
   enableLoadBalancer: true
   preferSavedState: false
+  secretName: caddy-env
+  secretEnvKeys: []
+  dataVolumePVC: caddy-data-lv
+  configVolumePVC: caddy-config-lv
 
 defaultCaddyConfig: |
   {

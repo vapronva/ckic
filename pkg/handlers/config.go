@@ -21,6 +21,10 @@ type ConfigHandler struct {
 	EnableLoadBalancer  bool
 	DeployedInstances   map[string]*caddy.Instance
 	Mu                  *sync.RWMutex
+	EnvSecretName       string
+	EnvSecretKeys       []string
+	DataVolumePVC       string
+	ConfigVolumePVC     string
 }
 
 func NewConfigHandler(
@@ -30,6 +34,10 @@ func NewConfigHandler(
 	enableLoadBalancer bool,
 	instances map[string]*caddy.Instance,
 	mu *sync.RWMutex,
+	envSecretName string,
+	envSecretKeys []string,
+	dataVolumePVC string,
+	configVolumePVC string,
 ) *ConfigHandler {
 	return &ConfigHandler{
 		CommunicationMethod: method,
@@ -39,6 +47,10 @@ func NewConfigHandler(
 		EnableLoadBalancer:  enableLoadBalancer,
 		DeployedInstances:   instances,
 		Mu:                  mu,
+		EnvSecretName:       envSecretName,
+		EnvSecretKeys:       envSecretKeys,
+		DataVolumePVC:       dataVolumePVC,
+		ConfigVolumePVC:     configVolumePVC,
 	}
 }
 
@@ -110,6 +122,10 @@ func (h *ConfigHandler) Handle(configData string) {
 				h.Namespace,
 				h.CaddyImage,
 				h.EnableLoadBalancer,
+				h.EnvSecretName,
+				h.EnvSecretKeys,
+				h.DataVolumePVC,
+				h.ConfigVolumePVC,
 			)
 			if err != nil {
 				logger.Error().Err(err).Str("node", nodeName).Msg("Failed to redeploy Caddy instance")

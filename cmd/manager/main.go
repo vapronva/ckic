@@ -26,6 +26,10 @@ func main() {
 	caddyImage := pflag.String("caddy-image", "rg.gl.vprw.ru/oss-images/zerossl-caddy/caddy:2.9.1-alpine", "Caddy image (format image:tag)")
 	enableLoadBalancer := pflag.Bool("enable-loadbalancer", false, "Enable LoadBalancer service exposure")
 	preferSavedState := pflag.Bool("prefer-saved-state", false, "Prefer saved (persistent) state during reconciliation")
+	secretName := pflag.String("env-secret", "", "Name of the Kubernetes Secret to use for environment variables")
+	secretEnvKeys := pflag.StringSlice("env-keys", []string{}, "Keys from the Secret to use as environment variables")
+	dataVolumePVC := pflag.String("data-pvc", "", "Name of PVC to use for the /data volume (defaults to HostPath if empty)")
+	configVolumePVC := pflag.String("config-pvc", "", "Name of PVC to use for the /config volume (defaults to HostPath if empty)")
 	pflag.Parse()
 	var commMethod caddy.CommunicationMethod
 	switch *communicationMethod {
@@ -55,6 +59,10 @@ func main() {
 		CaddyImage:          *caddyImage,
 		EnableLoadBalancer:  *enableLoadBalancer,
 		PreferSavedState:    *preferSavedState,
+		EnvSecretName:       *secretName,
+		EnvSecretKeys:       *secretEnvKeys,
+		DataVolumePVC:       *dataVolumePVC,
+		ConfigVolumePVC:     *configVolumePVC,
 	}
 	ctrl, err := controller.NewController(clientset, cfg)
 	if err != nil {

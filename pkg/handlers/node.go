@@ -32,10 +32,24 @@ type NodeHandler struct {
 	Mu                 *sync.RWMutex
 	jobCh              chan deploymentJob
 	nodeChangeNotifier func()
+	EnvSecretName      string
+	EnvSecretKeys      []string
+	DataVolumePVC      string
+	ConfigVolumePVC    string
 }
 
-func NewNodeHandler(clientset *kubernetes.Clientset, namespace, caddyImage string,
-	enableLoadBalancer bool, instances map[string]*caddy.Instance, mu *sync.RWMutex, notifier func(),
+func NewNodeHandler(
+	clientset *kubernetes.Clientset,
+	namespace,
+	caddyImage string,
+	enableLoadBalancer bool,
+	instances map[string]*caddy.Instance,
+	mu *sync.RWMutex,
+	notifier func(),
+	envSecretName string,
+	envSecretKeys []string,
+	dataVolumePVC string,
+	configVolumePVC string,
 ) *NodeHandler {
 	return &NodeHandler{
 		Clientset:          clientset,
@@ -45,6 +59,10 @@ func NewNodeHandler(clientset *kubernetes.Clientset, namespace, caddyImage strin
 		DeployedInstances:  instances,
 		Mu:                 mu,
 		nodeChangeNotifier: notifier,
+		EnvSecretName:      envSecretName,
+		EnvSecretKeys:      envSecretKeys,
+		DataVolumePVC:      dataVolumePVC,
+		ConfigVolumePVC:    configVolumePVC,
 	}
 }
 
@@ -65,7 +83,18 @@ func (h *NodeHandler) StartWorkerPool(ctx context.Context, workerCount int) {
 						return
 					}
 					deployCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
-					instance, err := caddy.DeployCaddy(deployCtx, h.Clientset, job.nodeName, h.Namespace, h.CaddyImage, h.EnableLoadBalancer)
+					instance, err := caddy.DeployCaddy(
+						deployCtx,
+						h.Clientset,
+						job.nodeName,
+						h.Namespace,
+						h.CaddyImage,
+						h.EnableLoadBalancer,
+						h.EnvSecretName,
+						h.EnvSecretKeys,
+						h.DataVolumePVC,
+						h.ConfigVolumePVC,
+					)
 					cancel()
 					job.resultCh <- &deploymentResult{
 						nodeName: job.nodeName,

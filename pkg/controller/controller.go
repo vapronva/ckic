@@ -26,6 +26,10 @@ type ControllerConfig struct {
 	CaddyImage          string
 	EnableLoadBalancer  bool
 	PreferSavedState    bool
+	EnvSecretName       string
+	EnvSecretKeys       []string
+	DataVolumePVC       string
+	ConfigVolumePVC     string
 }
 
 type Controller struct {
@@ -48,9 +52,9 @@ func NewController(clientset *kubernetes.Clientset, config ControllerConfig) (*C
 		defer mutex.RUnlock()
 		return len(deployedInstances) > 0
 	}
-	nodeHandler := handlers.NewNodeHandler(clientset, config.ConfigMapNamespace, config.CaddyImage, config.EnableLoadBalancer, deployedInstances, mutex, nil)
+	nodeHandler := handlers.NewNodeHandler(clientset, config.ConfigMapNamespace, config.CaddyImage, config.EnableLoadBalancer, deployedInstances, mutex, nil, config.EnvSecretName, config.EnvSecretKeys, config.DataVolumePVC, config.ConfigVolumePVC)
 	nodeWatcher := watcher.NewNodeWatcher(clientset, config.NodeLabel, nodeHandler.Handle)
-	configHandler := handlers.NewConfigHandler(config.CommunicationMethod, clientset, config.ConfigMapNamespace, config.CaddyImage, config.EnableLoadBalancer, deployedInstances, mutex)
+	configHandler := handlers.NewConfigHandler(config.CommunicationMethod, clientset, config.ConfigMapNamespace, config.CaddyImage, config.EnableLoadBalancer, deployedInstances, mutex, config.EnvSecretName, config.EnvSecretKeys, config.DataVolumePVC, config.ConfigVolumePVC)
 	configWatcher := watcher.NewConfigWatcher(clientset, config.ConfigMapNamespace, config.ConfigMapName, configHandler.Handle, nodeAvailabilityCheck)
 	coordinator := NewWatcherCoordinator(nodeWatcher, configWatcher, deployedInstances)
 	nodeHandler.SetNodeChangeNotifier(coordinator.NotifyNodeChange)
