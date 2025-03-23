@@ -11,6 +11,7 @@ import (
 	"github.com/rs/zerolog/log"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"gl.vprw.ru/vapronva/ckic/pkg/constants"
 	"gl.vprw.ru/vapronva/ckic/pkg/errors"
 )
 
@@ -20,6 +21,31 @@ const (
 	CommunicationMethodClusterIP CommunicationMethod = iota
 	CommunicationMethodDirect
 )
+
+func waitForCaddyAPIReady(adminURL string) error {
+	initialDelay := constants.CaddyAPIInitialDelay
+	maxDelay := constants.CaddyAPIMaxDelay
+	delay := initialDelay
+	multiplier := 1.5
+	client := &http.Client{Timeout: 10 * time.Second}
+	for {
+		req, err := http.NewRequest("GET", adminURL, nil)
+		if err != nil {
+			return fmt.Errorf("failed to create readiness request: %w", err)
+		}
+		resp, err := client.Do(req)
+		if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 500 {
+			resp.Body.Close()
+			return nil
+		}
+		if err == nil {
+			resp.Body.Close()
+		}
+		log.Debug().Str("adminURL", adminURL).Msgf("Caddy Admin API not ready, retrying in %v", delay)
+		time.Sleep(delay)
+		delay = min(time.Duration(float64(delay)*multiplier), maxDelay)
+	}
+}
 
 func (i *Instance) UpdateConfig(configData string, method CommunicationMethod) error {
 	var adminURL string
@@ -65,6 +91,15 @@ func (i *Instance) UpdateConfig(configData string, method CommunicationMethod) e
 			Err:      err,
 		}
 	}
+	if err := waitForCaddyAPIReady(adminURL); err != nil {
+		logger.Error().Err(err).Msg("Caddy Admin API not ready")
+		i.FailureCount++
+		return &errors.ErrConfigurationFailed{
+			NodeName: i.NodeName,
+			Reason:   "admin API not ready",
+			Err:      err,
+		}
+	}
 	client := &http.Client{
 		Timeout: 30 * time.Second,
 	}
@@ -102,7 +137,11 @@ func (i *Instance) UpdateConfig(configData string, method CommunicationMethod) e
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		err = fmt.Errorf("caddy returned status %d: %s", resp.StatusCode, string(body))
-		logger.Error().Err(err).Int("status", resp.StatusCode).Msg("Caddy configuration update failed")
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			logger.Error().Err(err).Int("status", resp.StatusCode).Msg("Caddy configuration update failed with client error")
+		} else {
+			logger.Error().Err(err).Int("status", resp.StatusCode).Msg("Caddy configuration update failed")
+		}
 		i.FailureCount++
 		return &errors.ErrConfigurationFailed{
 			NodeName: i.NodeName,

@@ -3,11 +3,13 @@ package handlers
 import (
 	"maps"
 	"sync"
+	"time"
 
 	"github.com/rs/zerolog/log"
 	"k8s.io/client-go/kubernetes"
 
 	"gl.vprw.ru/vapronva/ckic/pkg/caddy"
+	"gl.vprw.ru/vapronva/ckic/pkg/constants"
 )
 
 type ConfigHandler struct {
@@ -35,6 +37,7 @@ func NewConfigHandler(method caddy.CommunicationMethod, clientset *kubernetes.Cl
 func (h *ConfigHandler) Handle(configData string) {
 	logger := log.With().Str("component", "config_handler").Logger()
 	logger.Info().Msg("Detected configuration change, updating Caddy instances")
+	time.Sleep(constants.ConfigUpdateDelay)
 	h.Mu.RLock()
 	instancesCopy := make(map[string]*caddy.Instance)
 	maps.Copy(instancesCopy, h.DeployedInstances)

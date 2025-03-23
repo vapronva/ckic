@@ -10,7 +10,9 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	"gl.vprw.ru/vapronva/ckic/pkg/caddy"
+	"gl.vprw.ru/vapronva/ckic/pkg/constants"
 	"gl.vprw.ru/vapronva/ckic/pkg/handlers"
+	"gl.vprw.ru/vapronva/ckic/pkg/state"
 	"gl.vprw.ru/vapronva/ckic/pkg/watcher"
 )
 
@@ -22,6 +24,7 @@ type ControllerConfig struct {
 	CommunicationMethod caddy.CommunicationMethod
 	CaddyImage          string
 	EnableNodePort      bool
+	PreferSavedState    bool
 }
 
 type Controller struct {
@@ -32,6 +35,7 @@ type Controller struct {
 	nodeHandler       *handlers.NodeHandler
 	configHandler     *handlers.ConfigHandler
 	deployedInstances map[string]*caddy.Instance
+	stateStore        *state.ConfigMapStateStore
 }
 
 func NewController(clientset *kubernetes.Clientset, config ControllerConfig) (*Controller, error) {
@@ -41,6 +45,7 @@ func NewController(clientset *kubernetes.Clientset, config ControllerConfig) (*C
 	nodeWatcher := watcher.NewNodeWatcher(clientset, config.NodeLabel, nodeHandler.Handle)
 	configHandler := handlers.NewConfigHandler(config.CommunicationMethod, clientset, config.ConfigMapNamespace, config.CaddyImage, config.EnableNodePort, deployedInstances, mutex)
 	configWatcher := watcher.NewConfigWatcher(clientset, config.ConfigMapNamespace, config.ConfigMapName, configHandler.Handle)
+	stateStore := state.NewConfigMapStateStore(clientset, config.ConfigMapNamespace, constants.StateConfigMapName)
 	return &Controller{
 		clientset:         clientset,
 		config:            config,
@@ -49,6 +54,7 @@ func NewController(clientset *kubernetes.Clientset, config ControllerConfig) (*C
 		nodeHandler:       nodeHandler,
 		configHandler:     configHandler,
 		deployedInstances: deployedInstances,
+		stateStore:        stateStore,
 	}, nil
 }
 
@@ -67,6 +73,7 @@ func (c *Controller) Run(ctx context.Context) error {
 func (c *Controller) ReconcileState(ctx context.Context) error {
 	logger := log.With().Str("component", "reconcile").Logger()
 	logger.Info().Msg("Starting reconciliation process")
+	discovered := make(map[string]*caddy.Instance)
 	deployments, err := c.clientset.AppsV1().Deployments(c.config.ConfigMapNamespace).List(
 		ctx, metav1.ListOptions{
 			LabelSelector: "ckic.cmld.ru/caddy-managed=true",
@@ -82,10 +89,10 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 			continue
 		}
 		if dep.Status.ReadyReplicas > 0 {
-			podList, err := c.clientset.CoreV1().Pods(c.config.ConfigMapNamespace).List(ctx, metav1.ListOptions{
+			podList, errPL := c.clientset.CoreV1().Pods(c.config.ConfigMapNamespace).List(ctx, metav1.ListOptions{
 				LabelSelector: "app=caddy,instance=" + nodeName,
 			})
-			if err != nil || len(podList.Items) == 0 {
+			if errPL != nil || len(podList.Items) == 0 {
 				logger.Warn().Msgf("No pods found for healthy deployment on node %s", nodeName)
 				continue
 			}
@@ -98,7 +105,7 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 				FailureCount:   0,
 				KubeClient:     c.clientset,
 			}
-			c.deployedInstances[nodeName] = instance
+			discovered[nodeName] = instance
 			logger.Info().Msgf("Adopted existing healthy deployment on node %s", nodeName)
 		} else {
 			logger.Warn().Msgf("Deployment on node %s is not healthy, deleting orphaned deployment", nodeName)
@@ -109,12 +116,30 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 				ServiceName:    dep.Name,
 				KubeClient:     c.clientset,
 			}
-			if err := instance.Delete(); err != nil {
+			if errID := instance.Delete(); errID != nil {
 				logger.Error().Err(err).Msgf("Failed to delete orphaned deployment on node %s", nodeName)
 			} else {
 				logger.Info().Msgf("Deleted orphaned deployment on node %s", nodeName)
 			}
 		}
+	}
+	savedState, err := c.stateStore.LoadState()
+	if err != nil {
+		logger.Warn().Err(err).Msg("Could not load saved state, proceeding with discovered state")
+	}
+	if c.config.PreferSavedState && len(savedState) > 0 {
+		logger.Info().Msg("PreferSavedState is enabled. Merging saved state with discovered state, preferring saved state")
+		for node := range discovered {
+			if savedInst, exists := savedState[node]; exists {
+				discovered[node] = savedInst
+			}
+		}
+	} else {
+		logger.Info().Msg("Using discovered state")
+	}
+	c.deployedInstances = discovered
+	if err := c.stateStore.SaveState(c.deployedInstances); err != nil {
+		logger.Error().Err(err).Msg("Failed to persist state")
 	}
 	logger.Info().Msg("Reconciliation process completed")
 	return nil

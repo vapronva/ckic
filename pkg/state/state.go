@@ -10,6 +10,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	"gl.vprw.ru/vapronva/ckic/pkg/caddy"
+	"gl.vprw.ru/vapronva/ckic/pkg/constants"
 )
 
 type StateStore interface {
@@ -42,7 +43,7 @@ func (s *ConfigMapStateStore) SaveState(state map[string]*caddy.Instance) error 
 		if cm.Data == nil {
 			cm.Data = make(map[string]string)
 		}
-		cm.Data["state"] = string(data)
+		cm.Data[constants.StateKey] = string(data)
 		_, err = s.Client.CoreV1().ConfigMaps(s.Namespace).Update(
 			context.Background(), cm, metav1.UpdateOptions{})
 		if err != nil {
@@ -55,7 +56,7 @@ func (s *ConfigMapStateStore) SaveState(state map[string]*caddy.Instance) error 
 				Namespace: s.Namespace,
 			},
 			Data: map[string]string{
-				"state": string(data),
+				constants.StateKey: string(data),
 			},
 		}
 		_, err = s.Client.CoreV1().ConfigMaps(s.Namespace).Create(
@@ -74,7 +75,7 @@ func (s *ConfigMapStateStore) LoadState() (map[string]*caddy.Instance, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to get state ConfigMap: %w", err)
 	}
-	data, exists := cm.Data["state"]
+	data, exists := cm.Data[constants.StateKey]
 	if !exists {
 		return stateMap, nil
 	}
