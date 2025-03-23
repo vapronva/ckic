@@ -35,7 +35,7 @@ include:
   - component: gl.vprw.ru/ci/golang/build-binaries@1
     inputs:
       job_name: compile binaries
-      working_dir: cmd/caddy-kubernetes-ingress-controller
+      working_dir: cmd/manager
       golang_version: "1.24"
 
 go test:
