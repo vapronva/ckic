@@ -115,7 +115,7 @@ func (w *ConfigWatcher) Start(ctx context.Context) {
 				"Caddyfile": ":80 {\n    respond \"Hello, world!\"\n}\n",
 			},
 		}
-		configMap, err = w.clientset.CoreV1().ConfigMaps(w.namespace).Create(ctx, configMap, metav1.CreateOptions{})
+		_, err = w.clientset.CoreV1().ConfigMaps(w.namespace).Create(ctx, configMap, metav1.CreateOptions{})
 		if err != nil {
 			logger.Error().Err(err).Msg("Failed to create default ConfigMap")
 		}
@@ -133,7 +133,6 @@ func (w *ConfigWatcher) Start(ctx context.Context) {
 			logger.Warn().Msg("ConfigMap missing Caddyfile key")
 		}
 	}
-	w.lastResourceVersion = configMap.ResourceVersion
 	delay := constants.ConfigMapWatcherInitialDelay
 	maxDelay := constants.ConfigMapWatcherMaxDelay
 	multiplier := 1.5
@@ -151,7 +150,7 @@ func (w *ConfigWatcher) Start(ctx context.Context) {
 		}
 		watchOptions := metav1.ListOptions{
 			FieldSelector:   "metadata.name=" + w.configMapName,
-			ResourceVersion: w.lastResourceVersion,
+			ResourceVersion: "",
 		}
 		watcher, err := w.clientset.CoreV1().ConfigMaps(w.namespace).Watch(ctx, watchOptions)
 		if err != nil {
@@ -184,10 +183,7 @@ func (w *ConfigWatcher) Start(ctx context.Context) {
 			}
 			if event.Type == watch.Error {
 				if status, ok := event.Object.(*metav1.Status); ok && status.Code == 410 {
-					logger.Info().Int32("code", status.Code).Msg("Received watch timeout (410); refreshing resource version")
-					if errRRV := w.refreshResourceVersion(ctx, logger); errRRV != nil {
-						logger.Error().Err(errRRV).Msg("Failed to refresh resource version after 410 error")
-					}
+					logger.Info().Int32("code", status.Code).Msg("Received watch timeout (410); ignoring because we restart with an empty resourceVersion")
 				} else {
 					logger.Error().Err(err).Msg("Error in ConfigMap watch channel")
 				}
@@ -198,7 +194,6 @@ func (w *ConfigWatcher) Start(ctx context.Context) {
 				logger.Warn().Msg("Unexpected object in ConfigMap watch")
 				continue
 			}
-			w.lastResourceVersion = cm.ResourceVersion
 			if event.Type == watch.Added || event.Type == watch.Modified {
 				if configData, exists := cm.Data["Caddyfile"]; exists {
 					if w.nodeAvailableCheck() {
