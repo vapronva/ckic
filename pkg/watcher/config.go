@@ -1,33 +1,33 @@
-package controller
+package watcher
 
 import (
 	"context"
 	"time"
 
 	"github.com/rs/zerolog/log"
-	v1 "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 )
 
-type ConfigHandler func(string)
+type ConfigHandlerFunc func(string)
 
 type ConfigWatcher struct {
 	clientset           *kubernetes.Clientset
 	namespace           string
 	configMapName       string
-	configHandler       ConfigHandler
+	configHandler       ConfigHandlerFunc
 	lastResourceVersion string
 }
 
-func NewConfigWatcher(ctx context.Context, clientset *kubernetes.Clientset, namespace, configMapName string, handler ConfigHandler) (*ConfigWatcher, error) {
+func NewConfigWatcher(clientset *kubernetes.Clientset, namespace, configMapName string, handler ConfigHandlerFunc) *ConfigWatcher {
 	return &ConfigWatcher{
 		clientset:     clientset,
 		namespace:     namespace,
 		configMapName: configMapName,
 		configHandler: handler,
-	}, nil
+	}
 }
 
 func (w *ConfigWatcher) Start(ctx context.Context) {
@@ -42,8 +42,7 @@ func (w *ConfigWatcher) Start(ctx context.Context) {
 	if err != nil {
 		logger.Error().Err(err).Msg("Failed to get initial ConfigMap")
 	} else {
-		caddyfileData, exists := configMap.Data["Caddyfile"]
-		if exists {
+		if caddyfileData, exists := configMap.Data["Caddyfile"]; exists {
 			logger.Info().Msg("Initial ConfigMap loaded, notifying handlers")
 			w.configHandler(caddyfileData)
 		} else {
@@ -78,15 +77,14 @@ func (w *ConfigWatcher) Start(ctx context.Context) {
 					logger.Error().Msg("Error watching ConfigMap")
 					break
 				}
-				configMap, ok := event.Object.(*v1.ConfigMap)
+				cm, ok := event.Object.(*corev1.ConfigMap)
 				if !ok {
 					logger.Warn().Msg("Unexpected object type in ConfigMap watcher")
 					continue
 				}
-				w.lastResourceVersion = configMap.ResourceVersion
+				w.lastResourceVersion = cm.ResourceVersion
 				if event.Type == watch.Added || event.Type == watch.Modified {
-					caddyfileData, exists := configMap.Data["Caddyfile"]
-					if exists {
+					if caddyfileData, exists := cm.Data["Caddyfile"]; exists {
 						logger.Info().Str("event", string(event.Type)).Msg("ConfigMap updated, notifying handlers")
 						w.configHandler(caddyfileData)
 					} else {

@@ -11,6 +11,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/pflag"
 
+	"gl.vprw.ru/vapronva/ckic/pkg/caddy"
 	"gl.vprw.ru/vapronva/ckic/pkg/controller"
 	"gl.vprw.ru/vapronva/ckic/pkg/utils"
 )
@@ -25,36 +26,51 @@ func main() {
 	caddyImage := pflag.String("caddy-image", "rg.gl.vprw.ru/oss-images/zerossl-caddy/caddy:2.9.1-alpine", "Caddy image (format image:tag)")
 	enableNodePort := pflag.Bool("enable-nodeport", false, "Enable NodePort service exposure")
 	pflag.Parse()
+	var commMethod caddy.CommunicationMethod
+	switch *communicationMethod {
+	case "clusterip":
+		commMethod = caddy.CommunicationMethodClusterIP
+	case "direct":
+		commMethod = caddy.CommunicationMethodDirect
+	default:
+		log.Warn().Msgf("Unknown communication method %s, defaulting to clusterip", *communicationMethod)
+		commMethod = caddy.CommunicationMethodClusterIP
+	}
 	level, err := zerolog.ParseLevel(*logLevel)
 	if err != nil {
 		level = zerolog.InfoLevel
 	}
 	utils.SetupLogger(level)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	signalCh := make(chan os.Signal, 1)
-	signal.Notify(signalCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		sig := <-signalCh
-		log.Info().Str("signal", sig.String()).Msg("Received signal, shutting down")
-		cancel()
-		time.Sleep(5 * time.Second)
-		os.Exit(0)
-	}()
-	c, err := controller.NewController(ctx, controller.ControllerConfig{
+	clientset, err := utils.GetKubernetesClient(*kubeconfigPath)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Failed to build Kubernetes client")
+	}
+	cfg := controller.ControllerConfig{
 		Kubeconfig:          *kubeconfigPath,
 		NodeLabel:           *nodeLabel,
 		ConfigMapName:       *configMapName,
 		ConfigMapNamespace:  *configMapNamespace,
-		CommunicationMethod: *communicationMethod,
+		CommunicationMethod: commMethod,
 		CaddyImage:          *caddyImage,
 		EnableNodePort:      *enableNodePort,
-	})
-	if err != nil {
-		log.Fatal().Err(err).Msg("Failed to create controller")
 	}
+	ctrl, err := controller.NewController(clientset, cfg)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Failed to initialize controller")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		log.Info().Str("signal", sig.String()).Msg("Received termination signal, shutting down")
+		cancel()
+		time.Sleep(5 * time.Second)
+		os.Exit(0)
+	}()
 	log.Info().Msg("Starting CKIC manager")
-	if err := c.Run(ctx); err != nil {
+	if err := ctrl.Run(ctx); err != nil {
 		log.Fatal().Err(err).Msg("Controller exited with error")
 	}
 }

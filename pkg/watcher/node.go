@@ -1,4 +1,4 @@
-package controller
+package watcher
 
 import (
 	"context"
@@ -33,7 +33,7 @@ type NodeWatcher struct {
 	nodeHandler NodeHandler
 }
 
-func NewNodeWatcher(ctx context.Context, clientset *kubernetes.Clientset, labelSelector string, handler NodeHandler) (*NodeWatcher, error) {
+func NewNodeWatcher(clientset *kubernetes.Clientset, labelSelector string, handler NodeHandler) *NodeWatcher {
 	parts := strings.SplitN(labelSelector, ":", 2)
 	labelKey := parts[0]
 	labelValue := "true"
@@ -45,12 +45,13 @@ func NewNodeWatcher(ctx context.Context, clientset *kubernetes.Clientset, labelS
 		labelKey:    labelKey,
 		labelValue:  labelValue,
 		nodeHandler: handler,
-	}, nil
+	}
 }
 
 func (w *NodeWatcher) Start(ctx context.Context) {
-	logger := log.With().Str("component", "node_watcher").Logger()
-	logger.Info().Str("label", w.labelKey+":"+w.labelValue).Msg("Starting node watcher")
+	logger := log.With().Str("component", "node_watcher").
+		Str("label", w.labelKey+":"+w.labelValue).Logger()
+	logger.Info().Msg("Starting node watcher")
 	for {
 		select {
 		case <-ctx.Done():
