@@ -42,7 +42,7 @@ spec:
             - "--comm-method={{ .Values.config.communicationMethod }}"
             - "--log-level={{ .Values.config.logLevel }}"
             - "--caddy-image={{ .Values.config.caddyImage }}"
-            - "--enable-node-port={{ .Values.config.enableNodePort }}"
+            - "--enable-nodeport={{ .Values.config.enableNodePort }}"
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       {{- with .Values.nodeSelector }}
