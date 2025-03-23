@@ -34,7 +34,7 @@ func ParseExternalEndpoints(endpoints []string, endpointsFile string) (ExternalE
 	for _, endpoint := range endpoints {
 		parts := strings.SplitN(endpoint, "=", 2)
 		if len(parts) != 2 {
-			return nil, fmt.Errorf("invalid external endpoint format: %s, expected nodeName=ip1,ip2,etc", endpoint)
+			return nil, fmt.Errorf("invalid external endpoint format: %s; expected format 'nodeName=ip1,ip2,...'", endpoint)
 		}
 		nodeName := strings.TrimSpace(parts[0])
 		if nodeName == "" {

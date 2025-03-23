@@ -30,7 +30,7 @@ func main() {
 	secretEnvKeys := pflag.StringSlice("env-keys", []string{}, "Keys from the Secret to use as environment variables")
 	dataVolumePVC := pflag.String("data-pvc", "", "Name of PVC to use for the /data volume (defaults to HostPath if empty)")
 	configVolumePVC := pflag.String("config-pvc", "", "Name of PVC to use for the /config volume (defaults to HostPath if empty)")
-	externalEndpoints := pflag.StringSlice("external-endpoints", []string{}, "External endpoints for nodes, format: nodeName=ip1,ip2,...")
+	externalEndpoints := pflag.StringArray("external-endpoints", []string{}, "External endpoints for nodes, format: nodeName=ip1,ip2,...")
 	externalEndpointsFile := pflag.String("external-endpoints-file", "", "Path to JSON file containing external endpoints mapping")
 	pflag.Parse()
 	var commMethod caddy.CommunicationMethod
