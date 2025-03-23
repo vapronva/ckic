@@ -6,7 +6,7 @@ description: Caddy Kubernetes Ingress Controller Manager
 
 type: application
 
-version: 0.2.1
+version: 0.2.2
 appVersion: 0.2.2
 
 icon: https://gl.vprw.ru/uploads/-/system/project/avatar/177/ckic-avatar-takanashikiara-bluefield-twt-1.jpg
