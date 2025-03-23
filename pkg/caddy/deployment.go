@@ -401,7 +401,8 @@ func deployLoadBalancerService(ctx context.Context, clientset *kubernetes.Client
 					Protocol:   corev1.ProtocolUDP,
 				},
 			},
-			Type: corev1.ServiceTypeLoadBalancer,
+			Type:                  corev1.ServiceTypeLoadBalancer,
+			ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyTypeLocal,
 		},
 	}
 	existingNPService, err := clientset.CoreV1().Services(instance.Namespace).Get(ctx, loadBalancerServiceName, metav1.GetOptions{})
