@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -74,6 +75,27 @@ func minDuration(a, b time.Duration) time.Duration {
 	return b
 }
 
+func (w *ConfigWatcher) refreshResourceVersion(ctx context.Context, logger zerolog.Logger) error {
+	cm, err := w.clientset.CoreV1().ConfigMaps(w.namespace).Get(ctx, w.configMapName, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	w.lastResourceVersion = cm.ResourceVersion
+	logger.Info().Str("resourceVersion", w.lastResourceVersion).Msg("Resource version refreshed")
+	if configData, exists := cm.Data["Caddyfile"]; exists {
+		if w.nodeAvailableCheck() {
+			logger.Info().Msg("Refreshed ConfigMap loaded, updating configuration")
+			w.configHandler(configData)
+			w.lastSuccess = time.Now()
+		} else {
+			logger.Info().Msg("Refreshed ConfigMap loaded but no eligible nodes, caching config")
+			w.cachedConfig = configData
+			w.hasCachedConfig = true
+		}
+	}
+	return nil
+}
+
 func (w *ConfigWatcher) Start(ctx context.Context) {
 	logger := log.With().
 		Str("component", "config_watcher").
@@ -98,13 +120,13 @@ func (w *ConfigWatcher) Start(ctx context.Context) {
 			logger.Error().Err(err).Msg("Failed to create default ConfigMap")
 		}
 	} else {
-		if caddyfileData, exists := configMap.Data["Caddyfile"]; exists {
+		if configData, exists := configMap.Data["Caddyfile"]; exists {
 			logger.Info().Msg("Initial ConfigMap loaded")
 			if w.nodeAvailableCheck() {
-				w.configHandler(caddyfileData)
+				w.configHandler(configData)
 			} else {
 				logger.Info().Msg("No eligible nodes available, caching initial config")
-				w.cachedConfig = caddyfileData
+				w.cachedConfig = configData
 				w.hasCachedConfig = true
 			}
 		} else {
@@ -127,10 +149,11 @@ func (w *ConfigWatcher) Start(ctx context.Context) {
 			time.Sleep(10 * time.Second)
 			continue
 		}
-		watcher, err := w.clientset.CoreV1().ConfigMaps(w.namespace).Watch(ctx, metav1.ListOptions{
+		watchOptions := metav1.ListOptions{
 			FieldSelector:   "metadata.name=" + w.configMapName,
 			ResourceVersion: w.lastResourceVersion,
-		})
+		}
+		watcher, err := w.clientset.CoreV1().ConfigMaps(w.namespace).Watch(ctx, watchOptions)
 		if err != nil {
 			logger.Error().Err(err).Msg("Failed to create ConfigMap watcher, retrying")
 			w.failureCount++
@@ -141,6 +164,9 @@ func (w *ConfigWatcher) Start(ctx context.Context) {
 					time.Sleep(sleepTime)
 				}
 				w.failureCount = 0
+				if errRV := w.refreshResourceVersion(ctx, logger); errRV != nil {
+					logger.Error().Err(errRV).Msg("Failed to refresh resource version")
+				}
 			} else {
 				time.Sleep(delay)
 				delay = minDuration(time.Duration(float64(delay)*multiplier), maxDelay)
@@ -158,7 +184,10 @@ func (w *ConfigWatcher) Start(ctx context.Context) {
 			}
 			if event.Type == watch.Error {
 				if status, ok := event.Object.(*metav1.Status); ok && status.Code == 410 {
-					logger.Debug().Int32("code", status.Code).Msg("Received watch timeout (410); restarting watch")
+					logger.Info().Int32("code", status.Code).Msg("Received watch timeout (410); refreshing resource version")
+					if errRRV := w.refreshResourceVersion(ctx, logger); errRRV != nil {
+						logger.Error().Err(errRRV).Msg("Failed to refresh resource version after 410 error")
+					}
 				} else {
 					logger.Error().Err(err).Msg("Error in ConfigMap watch channel")
 				}

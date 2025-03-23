@@ -50,38 +50,75 @@ func (h *ConfigHandler) Handle(configData string) {
 	instancesCopy := make(map[string]*caddy.Instance)
 	maps.Copy(instancesCopy, h.DeployedInstances)
 	h.Mu.RUnlock()
+	var wg sync.WaitGroup
+	var muFailed sync.Mutex
+	var failedNodes []string
+	semaphore := make(chan struct{}, 5)
 	for nodeName, instance := range instancesCopy {
-		instanceLogger := logger.With().Str("node", nodeName).Logger()
-		instanceLogger.Debug().Msg("Updating Caddy configuration")
-		err := instance.UpdateConfig(configData, h.CommunicationMethod)
-		if err != nil {
-			instanceLogger.Error().Err(err).Msg("Failed to update Caddy configuration")
-			if instance.FailureCount >= 5 {
-				instanceLogger.Warn().Msg("Too many update failures, redeploying instance")
-				if err := instance.Delete(); err != nil {
-					instanceLogger.Error().Err(err).Msg("Failed to delete failed Caddy instance")
-					continue
+		wg.Add(1)
+		go func(nodeName string, instance *caddy.Instance) {
+			defer wg.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+			instanceLogger := logger.With().Str("node", nodeName).Logger()
+			instanceLogger.Debug().Msg("Updating Caddy configuration")
+			var err error
+			for retry := range 3 {
+				if retry > 0 {
+					instanceLogger.Info().Int("retry", retry).Msg("Retrying configuration update")
+					time.Sleep(time.Duration(retry*2) * time.Second)
 				}
-				newInstance, err := caddy.DeployCaddy(
-					context.Background(),
-					h.Clientset,
-					nodeName,
-					h.Namespace,
-					h.CaddyImage,
-					h.EnableLoadBalancer,
-				)
-				if err != nil {
-					instanceLogger.Error().Err(err).Msg("Failed to redeploy Caddy instance")
-					continue
+				err = instance.UpdateConfig(configData, h.CommunicationMethod)
+				if err == nil {
+					break
 				}
-				h.Mu.Lock()
-				h.DeployedInstances[nodeName] = newInstance
-				h.Mu.Unlock()
-				instanceLogger.Info().Msg("Successfully redeployed Caddy instance")
 			}
-		} else {
-			instanceLogger.Info().Msg("Successfully updated Caddy configuration")
-			instance.FailureCount = 0
+			if err != nil {
+				instanceLogger.Error().Err(err).Msg("Failed to update Caddy configuration")
+				instance.FailureCount++
+				if instance.FailureCount >= 5 {
+					instanceLogger.Warn().Msg("Too many update failures, marking for redeployment")
+					muFailed.Lock()
+					failedNodes = append(failedNodes, nodeName)
+					muFailed.Unlock()
+				}
+			} else {
+				instanceLogger.Info().Msg("Successfully updated Caddy configuration")
+				instance.FailureCount = 0
+			}
+		}(nodeName, instance)
+	}
+	wg.Wait()
+	if len(failedNodes) > 0 {
+		logger.Info().Msgf("Redeploying %d failed instances", len(failedNodes))
+		for _, nodeName := range failedNodes {
+			h.Mu.RLock()
+			instance := h.DeployedInstances[nodeName]
+			h.Mu.RUnlock()
+			if instance == nil {
+				continue
+			}
+			logger.Info().Str("node", nodeName).Msg("Redeploying failed Caddy instance")
+			if err := instance.Delete(); err != nil {
+				logger.Error().Err(err).Str("node", nodeName).Msg("Failed to delete failed Caddy instance")
+				continue
+			}
+			newInstance, err := caddy.DeployCaddy(
+				context.Background(),
+				h.Clientset,
+				nodeName,
+				h.Namespace,
+				h.CaddyImage,
+				h.EnableLoadBalancer,
+			)
+			if err != nil {
+				logger.Error().Err(err).Str("node", nodeName).Msg("Failed to redeploy Caddy instance")
+				continue
+			}
+			h.Mu.Lock()
+			h.DeployedInstances[nodeName] = newInstance
+			h.Mu.Unlock()
+			logger.Info().Str("node", nodeName).Msg("Successfully redeployed Caddy instance")
 		}
 	}
 }

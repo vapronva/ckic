@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/rs/zerolog/log"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -75,6 +76,7 @@ func (c *Controller) Run(ctx context.Context) error {
 	c.nodeHandler.StartWorkerPool(ctx, 4)
 	go c.nodeWatcher.Start(ctx)
 	go c.configWatcher.Start(ctx)
+	go c.runPeriodicConfigReconciliation(ctx)
 	<-ctx.Done()
 	log.Info().Msg("Controller shutting down")
 	return nil
@@ -153,4 +155,31 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 	}
 	logger.Info().Msg("Reconciliation process completed")
 	return nil
+}
+
+func (c *Controller) runPeriodicConfigReconciliation(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	logger := log.With().Str("component", "config_reconciliation").Logger()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			logger.Info().Msg("Performing periodic configuration reconciliation")
+			configMap, err := c.clientset.CoreV1().ConfigMaps(c.config.ConfigMapNamespace).Get(
+				ctx, c.config.ConfigMapName, metav1.GetOptions{})
+			if err != nil {
+				logger.Error().Err(err).Msg("Failed to get ConfigMap during reconciliation")
+				continue
+			}
+			configData, exists := configMap.Data["Caddyfile"]
+			if !exists {
+				logger.Warn().Msg("ConfigMap missing Caddyfile key during reconciliation")
+				continue
+			}
+			c.configHandler.Handle(configData)
+			logger.Info().Msg("Periodic configuration reconciliation completed")
+		}
+	}
 }
