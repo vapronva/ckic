@@ -241,9 +241,10 @@ func deployLoadBalancerService(ctx context.Context, clientset *kubernetes.Client
 			Name:      loadBalancerServiceName,
 			Namespace: instance.Namespace,
 			Labels: map[string]string{
-				"app":                        "caddy",
-				"instance":                   instance.NodeName,
-				"ckic.cmld.ru/caddy-managed": "true",
+				"app":                                "caddy",
+				"instance":                           instance.NodeName,
+				"ckic.cmld.ru/caddy-managed":         "true",
+				"svccontroller.k3s.cattle.io/lbpool": instance.NodeName,
 			},
 		},
 		Spec: corev1.ServiceSpec{
