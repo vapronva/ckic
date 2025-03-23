@@ -3,10 +3,50 @@ kind: ConfigMap
 apiVersion: v1
 
 metadata:
-  name: caddy-default-config
+  name: caddy-config
   labels:
     {{- include "ckic-manager.labels" . | nindent 4 }}
 
 data:
-  Caddyfile: |-
-{{ .Values.defaultCaddyConfig | indent 4 }}
+  {{- with .Values.caddyConfig }}
+  Caddyfile: |
+    {
+      {{- if .debug }}
+      debug
+      {{- end }}
+      http_port 80
+      https_port 443
+      admin :2019
+      log {
+        output stdout
+        format json
+      }
+      grace_period 10s
+      cert_issuer acme
+      acme_ca https://acme-v02.api.letsencrypt.org/directory
+      servers {
+        max_header_size 5MB
+        enable_full_duplex
+        keepalive_interval 30s
+        protocols h1 h2 h2c h3
+        {{- with .servers }}
+        {{ . | nindent 8 }}
+        {{- end }}
+      }
+      order coraza_waf first
+      order request_id before header
+      order replace after encode
+      {{ .global | nindent 6 }}
+      {{ .global_optional | nindent 6 }}
+    }
+
+    :8000 {
+      handle / {
+        respond "OK"
+      }
+    }
+
+    {{ .caddyfile | nindent 4 }}
+
+    {{ .caddyfile_optional | nindent 4 }}
+  {{- end }}}

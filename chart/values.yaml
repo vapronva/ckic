@@ -51,13 +51,12 @@ config:
   dataVolumePVC: caddy-data-lv
   configVolumePVC: caddy-config-lv
 
-defaultCaddyConfig: |
-  {
-    http_port 80
-    https_port 443
-    admin :2019
-  }
-
-  :80 {
-    respond "Caddy is running! Default configuration."
-  }
+caddyConfig:
+  debug: true
+  servers: ""
+  global: |
+    email {env.ACME_EMAIL}
+    acme_dns powerdns {env.POWERDNS_SERVER_URL} {env.POWERDNS_API_TOKEN}
+  global_optional: ""
+  caddyfile: ""
+  caddyfile_optional: ""

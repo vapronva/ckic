@@ -8,9 +8,12 @@ import (
 	"github.com/rs/zerolog/log"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
+
+	"gl.vprw.ru/vapronva/ckic/pkg/constants"
 )
 
 func DeployCaddy(
@@ -100,6 +103,32 @@ func deployDeployment(
 			{Name: "opt-data", MountPath: "/data"},
 			{Name: "opt-config", MountPath: "/config"},
 		},
+		SecurityContext: &corev1.SecurityContext{
+			Capabilities: &corev1.Capabilities{
+				Add:  []corev1.Capability{"NET_ADMIN", "NET_BIND_SERVICE"},
+				Drop: []corev1.Capability{"ALL"},
+			},
+		},
+	}
+	podDisruptionBudget := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      instance.DeploymentName,
+			Namespace: instance.Namespace,
+			Labels: map[string]string{
+				"app":                        "caddy",
+				"instance":                   instance.NodeName,
+				"ckic.cmld.ru/caddy-managed": "true",
+			},
+		},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			MinAvailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 1},
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"app":      "caddy",
+					"instance": instance.NodeName,
+				},
+			},
+		},
 	}
 	if envSecretName != "" && len(envSecretKeys) > 0 {
 		logger.Info().
@@ -129,7 +158,7 @@ func deployDeployment(
 			VolumeSource: corev1.VolumeSource{
 				ConfigMap: &corev1.ConfigMapVolumeSource{
 					LocalObjectReference: corev1.LocalObjectReference{
-						Name: "caddy-default-config",
+						Name: constants.DefaultConfigMapName,
 					},
 					Items: []corev1.KeyToPath{
 						{Key: "Caddyfile", Path: "Caddyfile"},
@@ -234,6 +263,23 @@ func deployDeployment(
 			return fmt.Errorf("failed to create deployment %s: %w", instance.DeploymentName, err)
 		}
 		logger.Info().Msg("Created Caddy deployment")
+	}
+	existingPDB, err := clientset.PolicyV1().PodDisruptionBudgets(instance.Namespace).Get(ctx, instance.DeploymentName, metav1.GetOptions{})
+	if err == nil {
+		podDisruptionBudget.ResourceVersion = existingPDB.ResourceVersion
+		_, err = clientset.PolicyV1().PodDisruptionBudgets(instance.Namespace).Update(ctx, podDisruptionBudget, metav1.UpdateOptions{})
+		if err != nil {
+			logger.Error().Err(err).Msg("Failed to update existing Caddy PodDisruptionBudget")
+			return fmt.Errorf("failed to update PodDisruptionBudget %s: %w", instance.DeploymentName, err)
+		}
+		logger.Info().Msg("Updated existing Caddy PodDisruptionBudget")
+	} else {
+		_, err = clientset.PolicyV1().PodDisruptionBudgets(instance.Namespace).Create(ctx, podDisruptionBudget, metav1.CreateOptions{})
+		if err != nil {
+			logger.Error().Err(err).Msg("Failed to create Caddy PodDisruptionBudget")
+			return fmt.Errorf("failed to create PodDisruptionBudget %s: %w", instance.DeploymentName, err)
+		}
+		logger.Info().Msg("Created Caddy PodDisruptionBudget")
 	}
 	return nil
 }

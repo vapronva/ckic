@@ -7,7 +7,7 @@ import (
 const (
 	DefaultNamespace             = "caddy-system"
 	DefaultConfigMapName         = "caddy-config"
-	DefaultCaddyDefaultConfigMap = "caddy-default-config"
+	DefaultCaddyDefaultConfigMap = "caddy-config"
 	StateConfigMapName           = "ckic-state"
 	StateKey                     = "state"
 
