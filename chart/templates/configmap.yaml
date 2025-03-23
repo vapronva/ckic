@@ -49,4 +49,4 @@ data:
     {{ .caddyfile | nindent 4 }}
 
     {{ .caddyfile_optional | nindent 4 }}
-  {{- end }}}
+  {{- end }}
