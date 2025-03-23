@@ -24,7 +24,7 @@ func main() {
 	communicationMethod := pflag.String("comm-method", "clusterip", "Communication method (clusterip or direct)")
 	logLevel := pflag.String("log-level", "info", "Log level (debug, info, warn, error)")
 	caddyImage := pflag.String("caddy-image", "rg.gl.vprw.ru/oss-images/zerossl-caddy/caddy:2.9.1-alpine", "Caddy image (format image:tag)")
-	enableNodePort := pflag.Bool("enable-nodeport", false, "Enable NodePort service exposure")
+	enableLoadBalancer := pflag.Bool("enable-loadbalancer", false, "Enable LoadBalancer service exposure")
 	preferSavedState := pflag.Bool("prefer-saved-state", false, "Prefer saved (persistent) state during reconciliation")
 	pflag.Parse()
 	var commMethod caddy.CommunicationMethod
@@ -53,7 +53,7 @@ func main() {
 		ConfigMapNamespace:  *configMapNamespace,
 		CommunicationMethod: commMethod,
 		CaddyImage:          *caddyImage,
-		EnableNodePort:      *enableNodePort,
+		EnableLoadBalancer:  *enableLoadBalancer,
 		PreferSavedState:    *preferSavedState,
 	}
 	ctrl, err := controller.NewController(clientset, cfg)

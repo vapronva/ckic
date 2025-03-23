@@ -42,7 +42,7 @@ spec:
             - "--comm-method={{ .Values.config.communicationMethod }}"
             - "--log-level={{ .Values.config.logLevel }}"
             - "--caddy-image={{ .Values.config.caddyImage }}"
-            - "--enable-nodeport={{ .Values.config.enableNodePort }}"
+            - "--enable-loadbalancer={{ .Values.config.enableLoadBalancer }}"
             - "--prefer-saved-state={{ .Values.config.preferSavedState }}"
           resources:
             {{- toYaml .Values.resources | nindent 12 }}

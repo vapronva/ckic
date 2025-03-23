@@ -17,18 +17,18 @@ type ConfigHandler struct {
 	Clientset           *kubernetes.Clientset
 	Namespace           string
 	CaddyImage          string
-	EnableNodePort      bool
+	EnableLoadBalancer  bool
 	DeployedInstances   map[string]*caddy.Instance
 	Mu                  *sync.RWMutex
 }
 
-func NewConfigHandler(method caddy.CommunicationMethod, clientset *kubernetes.Clientset, namespace, caddyImage string, enableNodePort bool, instances map[string]*caddy.Instance, mu *sync.RWMutex) *ConfigHandler {
+func NewConfigHandler(method caddy.CommunicationMethod, clientset *kubernetes.Clientset, namespace, caddyImage string, enableLoadBalancer bool, instances map[string]*caddy.Instance, mu *sync.RWMutex) *ConfigHandler {
 	return &ConfigHandler{
 		CommunicationMethod: method,
 		Clientset:           clientset,
 		Namespace:           namespace,
 		CaddyImage:          caddyImage,
-		EnableNodePort:      enableNodePort,
+		EnableLoadBalancer:  enableLoadBalancer,
 		DeployedInstances:   instances,
 		Mu:                  mu,
 	}
@@ -54,7 +54,7 @@ func (h *ConfigHandler) Handle(configData string) {
 					instanceLogger.Error().Err(err).Msg("Failed to delete failed Caddy instance")
 					continue
 				}
-				newInstance, err := caddy.DeployCaddy(h.Clientset, nodeName, h.Namespace, h.CaddyImage, h.EnableNodePort)
+				newInstance, err := caddy.DeployCaddy(h.Clientset, nodeName, h.Namespace, h.CaddyImage, h.EnableLoadBalancer)
 				if err != nil {
 					instanceLogger.Error().Err(err).Msg("Failed to redeploy Caddy instance")
 					continue

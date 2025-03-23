@@ -23,7 +23,7 @@ type ControllerConfig struct {
 	ConfigMapNamespace  string
 	CommunicationMethod caddy.CommunicationMethod
 	CaddyImage          string
-	EnableNodePort      bool
+	EnableLoadBalancer  bool
 	PreferSavedState    bool
 }
 
@@ -41,9 +41,9 @@ type Controller struct {
 func NewController(clientset *kubernetes.Clientset, config ControllerConfig) (*Controller, error) {
 	deployedInstances := make(map[string]*caddy.Instance)
 	mutex := &sync.RWMutex{}
-	nodeHandler := handlers.NewNodeHandler(clientset, config.ConfigMapNamespace, config.CaddyImage, config.EnableNodePort, deployedInstances, mutex)
+	nodeHandler := handlers.NewNodeHandler(clientset, config.ConfigMapNamespace, config.CaddyImage, config.EnableLoadBalancer, deployedInstances, mutex)
 	nodeWatcher := watcher.NewNodeWatcher(clientset, config.NodeLabel, nodeHandler.Handle)
-	configHandler := handlers.NewConfigHandler(config.CommunicationMethod, clientset, config.ConfigMapNamespace, config.CaddyImage, config.EnableNodePort, deployedInstances, mutex)
+	configHandler := handlers.NewConfigHandler(config.CommunicationMethod, clientset, config.ConfigMapNamespace, config.CaddyImage, config.EnableLoadBalancer, deployedInstances, mutex)
 	configWatcher := watcher.NewConfigWatcher(clientset, config.ConfigMapNamespace, config.ConfigMapName, configHandler.Handle)
 	stateStore := state.NewConfigMapStateStore(clientset, config.ConfigMapNamespace, constants.StateConfigMapName)
 	return &Controller{

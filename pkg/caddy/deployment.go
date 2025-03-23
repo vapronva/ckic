@@ -13,7 +13,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
-func DeployCaddy(clientset *kubernetes.Clientset, nodeName, namespace, caddyImage string, enableNodePort bool) (*Instance, error) {
+func DeployCaddy(clientset *kubernetes.Clientset, nodeName, namespace, caddyImage string, enableLoadBalancer bool) (*Instance, error) {
 	ctx := context.Background()
 	logger := log.With().Str("node", nodeName).Logger()
 	deploymentName := fmt.Sprintf("caddy-%s", nodeName)
@@ -31,8 +31,8 @@ func DeployCaddy(clientset *kubernetes.Clientset, nodeName, namespace, caddyImag
 	if err := deployService(ctx, clientset, instance); err != nil {
 		return nil, err
 	}
-	if enableNodePort {
-		if err := deployNodePortService(ctx, clientset, instance); err != nil {
+	if enableLoadBalancer {
+		if err := deployLoadBalancerService(ctx, clientset, instance); err != nil {
 			return nil, err
 		}
 	}
@@ -90,8 +90,10 @@ func deployDeployment(ctx context.Context, clientset *kubernetes.Clientset, inst
 							Name:  "caddy",
 							Image: caddyImage,
 							Ports: []corev1.ContainerPort{
-								{Name: "http", ContainerPort: 80, Protocol: corev1.ProtocolTCP},
-								{Name: "https", ContainerPort: 443, Protocol: corev1.ProtocolTCP},
+								{Name: "http-tcp", ContainerPort: 80, Protocol: corev1.ProtocolTCP},
+								{Name: "http-udp", ContainerPort: 80, Protocol: corev1.ProtocolUDP},
+								{Name: "https-tcp", ContainerPort: 443, Protocol: corev1.ProtocolTCP},
+								{Name: "https-udp", ContainerPort: 443, Protocol: corev1.ProtocolUDP},
 								{Name: "admin", ContainerPort: 2019, Protocol: corev1.ProtocolTCP},
 							},
 							VolumeMounts: []corev1.VolumeMount{
@@ -230,12 +232,12 @@ func deployService(ctx context.Context, clientset *kubernetes.Clientset, instanc
 	return nil
 }
 
-func deployNodePortService(ctx context.Context, clientset *kubernetes.Clientset, instance *Instance) error {
-	logger := log.With().Str("nodeport_service", instance.DeploymentName+"-nodeport").Logger()
-	nodePortServiceName := instance.DeploymentName + "-nodeport"
-	nodePortService := &corev1.Service{
+func deployLoadBalancerService(ctx context.Context, clientset *kubernetes.Clientset, instance *Instance) error {
+	logger := log.With().Str("loadbalancer_service", instance.DeploymentName+"-loadbalancer").Logger()
+	loadBalancerServiceName := instance.DeploymentName + "-loadbalancer"
+	loadBalancerService := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      nodePortServiceName,
+			Name:      loadBalancerServiceName,
 			Namespace: instance.Namespace,
 			Labels: map[string]string{
 				"app":                        "caddy",
@@ -249,30 +251,50 @@ func deployNodePortService(ctx context.Context, clientset *kubernetes.Clientset,
 				"instance": instance.NodeName,
 			},
 			Ports: []corev1.ServicePort{
-				{Name: "http-tcp", Port: 80, TargetPort: intstr.FromInt(80), Protocol: corev1.ProtocolTCP},
-				{Name: "http-udp", Port: 80, TargetPort: intstr.FromInt(80), Protocol: corev1.ProtocolUDP},
-				{Name: "https-tcp", Port: 443, TargetPort: intstr.FromInt(443), Protocol: corev1.ProtocolTCP},
-				{Name: "https-udp", Port: 443, TargetPort: intstr.FromInt(443), Protocol: corev1.ProtocolUDP},
+				{
+					Name:       "http-tcp",
+					Port:       80,
+					TargetPort: intstr.FromInt(80),
+					Protocol:   corev1.ProtocolTCP,
+				},
+				{
+					Name:       "https-tcp",
+					Port:       443,
+					TargetPort: intstr.FromInt(443),
+					Protocol:   corev1.ProtocolTCP,
+				},
+				{
+					Name:       "http-udp",
+					Port:       80,
+					TargetPort: intstr.FromInt(80),
+					Protocol:   corev1.ProtocolUDP,
+				},
+				{
+					Name:       "https-udp",
+					Port:       443,
+					TargetPort: intstr.FromInt(443),
+					Protocol:   corev1.ProtocolUDP,
+				},
 			},
-			Type: corev1.ServiceTypeNodePort,
+			Type: corev1.ServiceTypeLoadBalancer,
 		},
 	}
-	existingNPService, err := clientset.CoreV1().Services(instance.Namespace).Get(ctx, nodePortServiceName, metav1.GetOptions{})
+	existingNPService, err := clientset.CoreV1().Services(instance.Namespace).Get(ctx, loadBalancerServiceName, metav1.GetOptions{})
 	if err == nil {
-		nodePortService.ResourceVersion = existingNPService.ResourceVersion
-		_, err = clientset.CoreV1().Services(instance.Namespace).Update(ctx, nodePortService, metav1.UpdateOptions{})
+		loadBalancerService.ResourceVersion = existingNPService.ResourceVersion
+		_, err = clientset.CoreV1().Services(instance.Namespace).Update(ctx, loadBalancerService, metav1.UpdateOptions{})
 		if err != nil {
-			logger.Error().Err(err).Msg("Failed to update existing NodePort service")
-			return fmt.Errorf("failed to update NodePort service %s: %w", nodePortServiceName, err)
+			logger.Error().Err(err).Msg("Failed to update existing LoadBalancer service")
+			return fmt.Errorf("failed to update LoadBalancer service %s: %w", loadBalancerServiceName, err)
 		}
-		logger.Info().Msg("Updated existing NodePort service")
+		logger.Info().Msg("Updated existing LoadBalancer service")
 	} else {
-		_, err = clientset.CoreV1().Services(instance.Namespace).Create(ctx, nodePortService, metav1.CreateOptions{})
+		_, err = clientset.CoreV1().Services(instance.Namespace).Create(ctx, loadBalancerService, metav1.CreateOptions{})
 		if err != nil {
-			logger.Error().Err(err).Msg("Failed to create NodePort service")
-			return fmt.Errorf("failed to create NodePort service %s: %w", nodePortServiceName, err)
+			logger.Error().Err(err).Msg("Failed to create LoadBalancer service")
+			return fmt.Errorf("failed to create LoadBalancer service %s: %w", loadBalancerServiceName, err)
 		}
-		logger.Info().Msg("Created NodePort service")
+		logger.Info().Msg("Created LoadBalancer service")
 	}
 	return nil
 }

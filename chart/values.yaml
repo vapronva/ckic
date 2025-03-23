@@ -44,7 +44,7 @@ config:
   communicationMethod: clusterip  # or "direct"
   logLevel: info
   caddyImage: rg.gl.vprw.ru/oss-images/zerossl-caddy/caddy:2.9.1-alpine
-  enableNodePort: true
+  enableLoadBalancer: true
   preferSavedState: false
 
 defaultCaddyConfig: |

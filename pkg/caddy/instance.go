@@ -31,12 +31,12 @@ func (i *Instance) Delete() error {
 	} else {
 		logger.Info().Msg("Deleted ClusterIP Caddy service")
 	}
-	nodePortServiceName := i.DeploymentName + "-nodeport"
+	loadBalancerServiceName := i.DeploymentName + "-loadbalancer"
 	if err := i.KubeClient.CoreV1().Services(i.Namespace).Delete(
-		ctx, nodePortServiceName, metav1.DeleteOptions{}); err != nil {
-		logger.Warn().Err(err).Msg("Failed to delete NodePort Caddy service (if exists)")
+		ctx, loadBalancerServiceName, metav1.DeleteOptions{}); err != nil {
+		logger.Warn().Err(err).Msg("Failed to delete LoadBalancer Caddy service (if exists)")
 	} else {
-		logger.Info().Msg("Deleted NodePort Caddy service")
+		logger.Info().Msg("Deleted LoadBalancer Caddy service")
 	}
 	if err := i.KubeClient.AppsV1().Deployments(i.Namespace).Delete(
 		ctx, i.DeploymentName, metav1.DeleteOptions{}); err != nil {
