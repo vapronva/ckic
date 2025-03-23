@@ -49,6 +49,9 @@ spec:
             {{- end }}
             - "--data-pvc={{ .Values.config.dataVolumePVC }}"
             - "--config-pvc={{ .Values.config.configVolumePVC }}"
+            {{- range .Values.config.externalEndpoints }}
+            - "--external-endpoint={{ . }}"
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       {{- with .Values.nodeSelector }}

@@ -50,6 +50,7 @@ config:
   secretEnvKeys: []
   dataVolumePVC: caddy-data-lv
   configVolumePVC: caddy-config-lv
+  externalEndpoints: []
 
 caddyConfig:
   debug: true

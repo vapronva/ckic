@@ -30,6 +30,8 @@ func main() {
 	secretEnvKeys := pflag.StringSlice("env-keys", []string{}, "Keys from the Secret to use as environment variables")
 	dataVolumePVC := pflag.String("data-pvc", "", "Name of PVC to use for the /data volume (defaults to HostPath if empty)")
 	configVolumePVC := pflag.String("config-pvc", "", "Name of PVC to use for the /config volume (defaults to HostPath if empty)")
+	externalEndpoints := pflag.StringSlice("external-endpoints", []string{}, "External endpoints for nodes, format: nodeName=ip1,ip2,...")
+	externalEndpointsFile := pflag.String("external-endpoints-file", "", "Path to JSON file containing external endpoints mapping")
 	pflag.Parse()
 	var commMethod caddy.CommunicationMethod
 	switch *communicationMethod {
@@ -50,6 +52,10 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to build Kubernetes client")
 	}
+	extEndpointsMap, err := utils.ParseExternalEndpoints(*externalEndpoints, *externalEndpointsFile)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Failed to parse external endpoints")
+	}
 	cfg := controller.ControllerConfig{
 		Kubeconfig:          *kubeconfigPath,
 		NodeLabel:           *nodeLabel,
@@ -63,6 +69,7 @@ func main() {
 		EnvSecretKeys:       *secretEnvKeys,
 		DataVolumePVC:       *dataVolumePVC,
 		ConfigVolumePVC:     *configVolumePVC,
+		ExternalEndpoints:   extEndpointsMap,
 	}
 	ctrl, err := controller.NewController(clientset, cfg)
 	if err != nil {

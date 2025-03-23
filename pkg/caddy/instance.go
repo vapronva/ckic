@@ -16,6 +16,7 @@ type Instance struct {
 	ServiceName    string                `json:"serviceName"`
 	DeploymentName string                `json:"deploymentName"`
 	FailureCount   int                   `json:"failureCount"`
+	ExternalIPs    []string              `json:"externalIPs,omitempty"`
 	KubeClient     *kubernetes.Clientset `json:"-"`
 }
 

@@ -23,6 +23,7 @@ func DeployCaddy(
 	namespace,
 	caddyImage string,
 	enableLoadBalancer bool,
+	externalIPs []string,
 	envSecretName string,
 	envSecretKeys []string,
 	dataVolumePVC string,
@@ -38,6 +39,7 @@ func DeployCaddy(
 		DeploymentName: deploymentName,
 		ServiceName:    deploymentName,
 		FailureCount:   0,
+		ExternalIPs:    externalIPs,
 		KubeClient:     clientset,
 	}
 	if err := deployDeployment(
@@ -135,7 +137,6 @@ func deployDeployment(
 			Str("secret", envSecretName).
 			Strs("keys", envSecretKeys).
 			Msg("Configuring environment variables from secret")
-
 		var envVars []corev1.EnvVar
 		for _, key := range envSecretKeys {
 			envVars = append(envVars, corev1.EnvVar{
@@ -404,6 +405,10 @@ func deployLoadBalancerService(ctx context.Context, clientset *kubernetes.Client
 			Type:                  corev1.ServiceTypeLoadBalancer,
 			ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyTypeLocal,
 		},
+	}
+	if len(instance.ExternalIPs) > 0 {
+		logger.Info().Strs("externalIPs", instance.ExternalIPs).Msg("Setting external IPs for LoadBalancer service")
+		loadBalancerService.Spec.ExternalIPs = instance.ExternalIPs
 	}
 	existingNPService, err := clientset.CoreV1().Services(instance.Namespace).Get(ctx, loadBalancerServiceName, metav1.GetOptions{})
 	if err == nil {

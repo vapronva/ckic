@@ -15,6 +15,7 @@ import (
 	"gl.vprw.ru/vapronva/ckic/pkg/handlers"
 	"gl.vprw.ru/vapronva/ckic/pkg/state"
 	"gl.vprw.ru/vapronva/ckic/pkg/watcher"
+	"gl.vprw.ru/vapronva/ckic/pkg/utils"
 )
 
 type ControllerConfig struct {
@@ -30,6 +31,7 @@ type ControllerConfig struct {
 	EnvSecretKeys       []string
 	DataVolumePVC       string
 	ConfigVolumePVC     string
+	ExternalEndpoints   utils.ExternalEndpointsMap
 }
 
 type Controller struct {
@@ -52,9 +54,35 @@ func NewController(clientset *kubernetes.Clientset, config ControllerConfig) (*C
 		defer mutex.RUnlock()
 		return len(deployedInstances) > 0
 	}
-	nodeHandler := handlers.NewNodeHandler(clientset, config.ConfigMapNamespace, config.CaddyImage, config.EnableLoadBalancer, deployedInstances, mutex, nil, config.EnvSecretName, config.EnvSecretKeys, config.DataVolumePVC, config.ConfigVolumePVC)
+	nodeHandler := handlers.NewNodeHandler(
+		clientset,
+		config.ConfigMapNamespace,
+		config.CaddyImage,
+		config.EnableLoadBalancer,
+		deployedInstances,
+		mutex,
+		nil,
+		config.EnvSecretName,
+		config.EnvSecretKeys,
+		config.DataVolumePVC,
+		config.ConfigVolumePVC,
+		config.ExternalEndpoints,
+	)
 	nodeWatcher := watcher.NewNodeWatcher(clientset, config.NodeLabel, nodeHandler.Handle)
-	configHandler := handlers.NewConfigHandler(config.CommunicationMethod, clientset, config.ConfigMapNamespace, config.CaddyImage, config.EnableLoadBalancer, deployedInstances, mutex, config.EnvSecretName, config.EnvSecretKeys, config.DataVolumePVC, config.ConfigVolumePVC)
+	configHandler := handlers.NewConfigHandler(
+		config.CommunicationMethod,
+		clientset,
+		config.ConfigMapNamespace,
+		config.CaddyImage,
+		config.EnableLoadBalancer,
+		deployedInstances,
+		mutex,
+		config.EnvSecretName,
+		config.EnvSecretKeys,
+		config.DataVolumePVC,
+		config.ConfigVolumePVC,
+		config.ExternalEndpoints,
+	)
 	configWatcher := watcher.NewConfigWatcher(clientset, config.ConfigMapNamespace, config.ConfigMapName, configHandler.Handle, nodeAvailabilityCheck)
 	coordinator := NewWatcherCoordinator(nodeWatcher, configWatcher, deployedInstances)
 	nodeHandler.SetNodeChangeNotifier(coordinator.NotifyNodeChange)

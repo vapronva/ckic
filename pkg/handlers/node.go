@@ -9,12 +9,14 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	"gl.vprw.ru/vapronva/ckic/pkg/caddy"
+	"gl.vprw.ru/vapronva/ckic/pkg/utils"
 	"gl.vprw.ru/vapronva/ckic/pkg/watcher"
 )
 
 type deploymentJob struct {
-	nodeName string
-	resultCh chan *deploymentResult
+	nodeName    string
+	resultCh    chan *deploymentResult
+	externalIPs []string
 }
 
 type deploymentResult struct {
@@ -36,6 +38,7 @@ type NodeHandler struct {
 	EnvSecretKeys      []string
 	DataVolumePVC      string
 	ConfigVolumePVC    string
+	ExternalEndpoints  utils.ExternalEndpointsMap
 }
 
 func NewNodeHandler(
@@ -50,6 +53,7 @@ func NewNodeHandler(
 	envSecretKeys []string,
 	dataVolumePVC string,
 	configVolumePVC string,
+	externalEndpoints utils.ExternalEndpointsMap,
 ) *NodeHandler {
 	return &NodeHandler{
 		Clientset:          clientset,
@@ -63,6 +67,7 @@ func NewNodeHandler(
 		EnvSecretKeys:      envSecretKeys,
 		DataVolumePVC:      dataVolumePVC,
 		ConfigVolumePVC:    configVolumePVC,
+		ExternalEndpoints:  externalEndpoints,
 	}
 }
 
@@ -90,6 +95,7 @@ func (h *NodeHandler) StartWorkerPool(ctx context.Context, workerCount int) {
 						h.Namespace,
 						h.CaddyImage,
 						h.EnableLoadBalancer,
+						job.externalIPs,
 						h.EnvSecretName,
 						h.EnvSecretKeys,
 						h.DataVolumePVC,
@@ -114,9 +120,14 @@ func (h *NodeHandler) Handle(event watcher.NodeEvent) {
 	case watcher.NodeAdded:
 		logger.Info().Msg("Detected new node, deploying Caddy")
 		resultCh := make(chan *deploymentResult, 1)
+		externalIPs, exists := h.ExternalEndpoints[nodeName]
+		if exists {
+			logger.Info().Strs("externalIPs", externalIPs).Msg("Found external endpoints for node")
+		}
 		h.jobCh <- deploymentJob{
-			nodeName: nodeName,
-			resultCh: resultCh,
+			nodeName:    nodeName,
+			resultCh:    resultCh,
+			externalIPs: externalIPs,
 		}
 		go func() {
 			result := <-resultCh

@@ -11,6 +11,7 @@ import (
 
 	"gl.vprw.ru/vapronva/ckic/pkg/caddy"
 	"gl.vprw.ru/vapronva/ckic/pkg/constants"
+	"gl.vprw.ru/vapronva/ckic/pkg/utils"
 )
 
 type ConfigHandler struct {
@@ -25,6 +26,7 @@ type ConfigHandler struct {
 	EnvSecretKeys       []string
 	DataVolumePVC       string
 	ConfigVolumePVC     string
+	ExternalEndpoints   utils.ExternalEndpointsMap
 }
 
 func NewConfigHandler(
@@ -38,6 +40,7 @@ func NewConfigHandler(
 	envSecretKeys []string,
 	dataVolumePVC string,
 	configVolumePVC string,
+	externalEndpoints utils.ExternalEndpointsMap,
 ) *ConfigHandler {
 	return &ConfigHandler{
 		CommunicationMethod: method,
@@ -51,6 +54,7 @@ func NewConfigHandler(
 		EnvSecretKeys:       envSecretKeys,
 		DataVolumePVC:       dataVolumePVC,
 		ConfigVolumePVC:     configVolumePVC,
+		ExternalEndpoints:   externalEndpoints,
 	}
 }
 
@@ -115,6 +119,7 @@ func (h *ConfigHandler) Handle(configData string) {
 				logger.Error().Err(err).Str("node", nodeName).Msg("Failed to delete failed Caddy instance")
 				continue
 			}
+			externalIPs := h.ExternalEndpoints[nodeName]
 			newInstance, err := caddy.DeployCaddy(
 				context.Background(),
 				h.Clientset,
@@ -122,6 +127,7 @@ func (h *ConfigHandler) Handle(configData string) {
 				h.Namespace,
 				h.CaddyImage,
 				h.EnableLoadBalancer,
+				externalIPs,
 				h.EnvSecretName,
 				h.EnvSecretKeys,
 				h.DataVolumePVC,
