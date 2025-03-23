@@ -122,6 +122,11 @@ func (w *ConfigWatcher) Start(ctx context.Context) {
 			return
 		default:
 		}
+		if w.isPaused {
+			logger.Debug().Msg("Config watcher is paused; sleeping until resumed")
+			time.Sleep(10 * time.Second)
+			continue
+		}
 		watcher, err := w.clientset.CoreV1().ConfigMaps(w.namespace).Watch(ctx, metav1.ListOptions{
 			FieldSelector:   "metadata.name=" + w.configMapName,
 			ResourceVersion: w.lastResourceVersion,
@@ -152,7 +157,11 @@ func (w *ConfigWatcher) Start(ctx context.Context) {
 			default:
 			}
 			if event.Type == watch.Error {
-				logger.Error().Msg("Error in ConfigMap watch channel")
+				if status, ok := event.Object.(*metav1.Status); ok && status.Code == 410 {
+					logger.Debug().Int32("code", status.Code).Msg("Received watch timeout (410); restarting watch")
+				} else {
+					logger.Error().Err(err).Msg("Error in ConfigMap watch channel")
+				}
 				break
 			}
 			cm, ok := event.Object.(*corev1.ConfigMap)
