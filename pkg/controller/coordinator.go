@@ -1,0 +1,42 @@
+package controller
+
+import (
+	"sync"
+
+	"github.com/rs/zerolog/log"
+
+	"gl.vprw.ru/vapronva/ckic/pkg/caddy"
+	"gl.vprw.ru/vapronva/ckic/pkg/watcher"
+)
+
+type WatcherCoordinator struct {
+	mu                sync.RWMutex
+	nodeWatcher       *watcher.NodeWatcher
+	configWatcher     *watcher.ConfigWatcher
+	deployedInstances map[string]*caddy.Instance
+}
+
+func NewWatcherCoordinator(nodeWatcher *watcher.NodeWatcher, configWatcher *watcher.ConfigWatcher,
+	deployedInstances map[string]*caddy.Instance,
+) *WatcherCoordinator {
+	return &WatcherCoordinator{
+		nodeWatcher:       nodeWatcher,
+		configWatcher:     configWatcher,
+		deployedInstances: deployedInstances,
+	}
+}
+
+func (wc *WatcherCoordinator) HasAvailableNodes() bool {
+	wc.mu.RLock()
+	defer wc.mu.RUnlock()
+	return len(wc.deployedInstances) > 0
+}
+
+func (wc *WatcherCoordinator) NotifyNodeChange() {
+	if wc.HasAvailableNodes() {
+		wc.configWatcher.Resume()
+	} else {
+		wc.configWatcher.Pause()
+	}
+	log.Info().Msg("WatcherCoordinator notified node change")
+}

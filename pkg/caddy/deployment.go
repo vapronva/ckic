@@ -13,8 +13,9 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
-func DeployCaddy(clientset *kubernetes.Clientset, nodeName, namespace, caddyImage string, enableLoadBalancer bool) (*Instance, error) {
-	ctx := context.Background()
+func DeployCaddy(ctx context.Context, clientset *kubernetes.Clientset, nodeName, namespace, caddyImage string, enableLoadBalancer bool) (*Instance, error) {
+	deployCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
 	logger := log.With().Str("node", nodeName).Logger()
 	deploymentName := fmt.Sprintf("caddy-%s", nodeName)
 	instance := &Instance{
@@ -25,22 +26,22 @@ func DeployCaddy(clientset *kubernetes.Clientset, nodeName, namespace, caddyImag
 		FailureCount:   0,
 		KubeClient:     clientset,
 	}
-	if err := deployDeployment(ctx, clientset, instance, caddyImage); err != nil {
+	if err := deployDeployment(deployCtx, clientset, instance, caddyImage); err != nil {
 		return nil, err
 	}
-	if err := deployService(ctx, clientset, instance); err != nil {
+	if err := deployService(deployCtx, clientset, instance); err != nil {
 		return nil, err
 	}
 	if enableLoadBalancer {
-		if err := deployLoadBalancerService(ctx, clientset, instance); err != nil {
+		if err := deployLoadBalancerService(deployCtx, clientset, instance); err != nil {
 			return nil, err
 		}
 	}
-	if err := waitForDeploymentReady(ctx, clientset, namespace, deploymentName); err != nil {
+	if err := waitForDeploymentReady(deployCtx, clientset, namespace, deploymentName); err != nil {
 		cleanupDeployment(ctx, clientset, instance)
 		return nil, fmt.Errorf("deployment %s/%s did not become ready: %w", namespace, deploymentName, err)
 	}
-	pods, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+	pods, err := clientset.CoreV1().Pods(namespace).List(deployCtx, metav1.ListOptions{
 		LabelSelector: fmt.Sprintf("app=caddy,instance=%s", nodeName),
 	})
 	if err != nil || len(pods.Items) == 0 {
@@ -304,23 +305,28 @@ func waitForDeploymentReady(ctx context.Context, clientset *kubernetes.Clientset
 		Str("deployment", name).
 		Str("namespace", namespace).
 		Logger()
-	for range 24 {
-		deployment, err := clientset.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
-		if err != nil {
-			return fmt.Errorf("failed to get deployment %s: %w", name, err)
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("context deadline exceeded while waiting for deployment: %w", ctx.Err())
+		case <-ticker.C:
+			deployment, err := clientset.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to get deployment %s: %w", name, err)
+			}
+			if deployment.Status.ReadyReplicas > 0 {
+				logger.Info().Msg("Deployment is ready")
+				return nil
+			}
+			logger.Debug().
+				Int32("available", deployment.Status.AvailableReplicas).
+				Int32("ready", deployment.Status.ReadyReplicas).
+				Int32("desired", *deployment.Spec.Replicas).
+				Msg("Waiting for deployment to be ready")
 		}
-		if deployment.Status.ReadyReplicas > 0 {
-			logger.Info().Msg("Deployment is ready")
-			return nil
-		}
-		logger.Debug().
-			Int32("available", deployment.Status.AvailableReplicas).
-			Int32("ready", deployment.Status.ReadyReplicas).
-			Int32("desired", *deployment.Spec.Replicas).
-			Msg("Waiting for deployment to be ready")
-		time.Sleep(5 * time.Second)
 	}
-	return fmt.Errorf("deployment %s did not become ready within timeout", name)
 }
 
 func cleanupDeployment(ctx context.Context, clientset *kubernetes.Clientset, instance *Instance) {

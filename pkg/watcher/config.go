@@ -21,15 +21,57 @@ type ConfigWatcher struct {
 	configMapName       string
 	configHandler       ConfigHandlerFunc
 	lastResourceVersion string
+
+	nodeAvailableCheck func() bool
+	isPaused           bool
+	cachedConfig       string
+	hasCachedConfig    bool
+
+	failureCount int
+	maxFailures  int
+	resetTimeout time.Duration
+	lastSuccess  time.Time
 }
 
-func NewConfigWatcher(clientset *kubernetes.Clientset, namespace, configMapName string, handler ConfigHandlerFunc) *ConfigWatcher {
+func NewConfigWatcher(clientset *kubernetes.Clientset, namespace, configMapName string,
+	handler ConfigHandlerFunc, nodeAvailableCheck func() bool,
+) *ConfigWatcher {
 	return &ConfigWatcher{
-		clientset:     clientset,
-		namespace:     namespace,
-		configMapName: configMapName,
-		configHandler: handler,
+		clientset:          clientset,
+		namespace:          namespace,
+		configMapName:      configMapName,
+		configHandler:      handler,
+		nodeAvailableCheck: nodeAvailableCheck,
+		isPaused:           false,
+		maxFailures:        5,
+		resetTimeout:       5 * time.Minute,
+		lastSuccess:        time.Now(),
 	}
+}
+
+func (w *ConfigWatcher) Pause() {
+	if !w.isPaused {
+		w.isPaused = true
+		log.Info().Msg("ConfigMap watcher paused")
+	}
+}
+
+func (w *ConfigWatcher) Resume() {
+	if w.isPaused {
+		w.isPaused = false
+		log.Info().Msg("ConfigMap watcher resumed")
+		if w.hasCachedConfig && w.nodeAvailableCheck() {
+			w.configHandler(w.cachedConfig)
+			w.hasCachedConfig = false
+		}
+	}
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (w *ConfigWatcher) Start(ctx context.Context) {
@@ -57,10 +99,16 @@ func (w *ConfigWatcher) Start(ctx context.Context) {
 		}
 	} else {
 		if caddyfileData, exists := configMap.Data["Caddyfile"]; exists {
-			logger.Info().Msg("Initial ConfigMap loaded, notifying handlers")
-			w.configHandler(caddyfileData)
+			logger.Info().Msg("Initial ConfigMap loaded")
+			if w.nodeAvailableCheck() {
+				w.configHandler(caddyfileData)
+			} else {
+				logger.Info().Msg("No eligible nodes available, caching initial config")
+				w.cachedConfig = caddyfileData
+				w.hasCachedConfig = true
+			}
 		} else {
-			logger.Warn().Msg("ConfigMap does not contain Caddyfile key")
+			logger.Warn().Msg("ConfigMap missing Caddyfile key")
 		}
 	}
 	w.lastResourceVersion = configMap.ResourceVersion
@@ -80,9 +128,18 @@ func (w *ConfigWatcher) Start(ctx context.Context) {
 		})
 		if err != nil {
 			logger.Error().Err(err).Msg("Failed to create ConfigMap watcher, retrying")
-			w.lastResourceVersion = ""
-			time.Sleep(delay)
-			delay = min(time.Duration(float64(delay)*multiplier), maxDelay)
+			w.failureCount++
+			if w.failureCount >= w.maxFailures {
+				sleepTime := w.resetTimeout - time.Since(w.lastSuccess)
+				if sleepTime > 0 {
+					logger.Warn().Msgf("Circuit breaker open, sleeping for %v", sleepTime)
+					time.Sleep(sleepTime)
+				}
+				w.failureCount = 0
+			} else {
+				time.Sleep(delay)
+				delay = minDuration(time.Duration(float64(delay)*multiplier), maxDelay)
+			}
 			continue
 		}
 		delay = constants.ConfigMapWatcherInitialDelay
@@ -95,26 +152,38 @@ func (w *ConfigWatcher) Start(ctx context.Context) {
 			default:
 			}
 			if event.Type == watch.Error {
-				logger.Error().Msg("Error watching ConfigMap")
+				logger.Error().Msg("Error in ConfigMap watch channel")
 				break
 			}
 			cm, ok := event.Object.(*corev1.ConfigMap)
 			if !ok {
-				logger.Warn().Msg("Unexpected object type in ConfigMap watcher")
+				logger.Warn().Msg("Unexpected object in ConfigMap watch")
 				continue
 			}
 			w.lastResourceVersion = cm.ResourceVersion
 			if event.Type == watch.Added || event.Type == watch.Modified {
-				if caddyfileData, exists := cm.Data["Caddyfile"]; exists {
-					logger.Info().Str("event", string(event.Type)).Msg("ConfigMap updated, notifying handlers")
-					w.configHandler(caddyfileData)
+				if configData, exists := cm.Data["Caddyfile"]; exists {
+					if w.nodeAvailableCheck() {
+						logger.Info().Str("event", string(event.Type)).
+							Msg("ConfigMap updated, notifying handlers")
+						if !w.isPaused {
+							w.configHandler(configData)
+						}
+						w.lastSuccess = time.Now()
+						w.failureCount = 0
+					} else {
+						logger.Info().Msg("ConfigMap updated but no eligible nodes available, caching config")
+						w.cachedConfig = configData
+						w.hasCachedConfig = true
+						w.Pause()
+					}
 				} else {
-					logger.Warn().Msg("Updated ConfigMap does not contain Caddyfile key")
+					logger.Warn().Msg("Updated ConfigMap missing Caddyfile key")
 				}
 			}
 		}
-		logger.Info().Msg("ConfigMap watcher channel closed, restarting")
+		logger.Info().Msg("ConfigMap watch channel closed, restarting")
 		time.Sleep(delay)
-		delay = min(time.Duration(float64(delay)*multiplier), maxDelay)
+		delay = minDuration(time.Duration(float64(delay)*multiplier), maxDelay)
 	}
 }

@@ -36,15 +36,23 @@ type Controller struct {
 	configHandler     *handlers.ConfigHandler
 	deployedInstances map[string]*caddy.Instance
 	stateStore        *state.ConfigMapStateStore
+	coordinator       *WatcherCoordinator
 }
 
 func NewController(clientset *kubernetes.Clientset, config ControllerConfig) (*Controller, error) {
 	deployedInstances := make(map[string]*caddy.Instance)
 	mutex := &sync.RWMutex{}
-	nodeHandler := handlers.NewNodeHandler(clientset, config.ConfigMapNamespace, config.CaddyImage, config.EnableLoadBalancer, deployedInstances, mutex)
+	nodeAvailabilityCheck := func() bool {
+		mutex.RLock()
+		defer mutex.RUnlock()
+		return len(deployedInstances) > 0
+	}
+	nodeHandler := handlers.NewNodeHandler(clientset, config.ConfigMapNamespace, config.CaddyImage, config.EnableLoadBalancer, deployedInstances, mutex, nil)
 	nodeWatcher := watcher.NewNodeWatcher(clientset, config.NodeLabel, nodeHandler.Handle)
 	configHandler := handlers.NewConfigHandler(config.CommunicationMethod, clientset, config.ConfigMapNamespace, config.CaddyImage, config.EnableLoadBalancer, deployedInstances, mutex)
-	configWatcher := watcher.NewConfigWatcher(clientset, config.ConfigMapNamespace, config.ConfigMapName, configHandler.Handle)
+	configWatcher := watcher.NewConfigWatcher(clientset, config.ConfigMapNamespace, config.ConfigMapName, configHandler.Handle, nodeAvailabilityCheck)
+	coordinator := NewWatcherCoordinator(nodeWatcher, configWatcher, deployedInstances)
+	nodeHandler.SetNodeChangeNotifier(coordinator.NotifyNodeChange)
 	stateStore := state.NewConfigMapStateStore(clientset, config.ConfigMapNamespace, constants.StateConfigMapName)
 	return &Controller{
 		clientset:         clientset,
@@ -55,6 +63,7 @@ func NewController(clientset *kubernetes.Clientset, config ControllerConfig) (*C
 		configHandler:     configHandler,
 		deployedInstances: deployedInstances,
 		stateStore:        stateStore,
+		coordinator:       coordinator,
 	}, nil
 }
 
@@ -63,6 +72,7 @@ func (c *Controller) Run(ctx context.Context) error {
 		log.Error().Err(err).Msg("Reconciliation failed")
 		return err
 	}
+	c.nodeHandler.StartWorkerPool(ctx, 4)
 	go c.nodeWatcher.Start(ctx)
 	go c.configWatcher.Start(ctx)
 	<-ctx.Done()
@@ -117,7 +127,7 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 				KubeClient:     c.clientset,
 			}
 			if errID := instance.Delete(); errID != nil {
-				logger.Error().Err(err).Msgf("Failed to delete orphaned deployment on node %s", nodeName)
+				logger.Error().Err(errID).Msgf("Failed to delete orphaned deployment on node %s", nodeName)
 			} else {
 				logger.Info().Msgf("Deleted orphaned deployment on node %s", nodeName)
 			}
