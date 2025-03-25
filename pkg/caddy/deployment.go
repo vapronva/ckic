@@ -365,10 +365,11 @@ func deployLoadBalancerService(ctx context.Context, clientset *kubernetes.Client
 			Name:      loadBalancerServiceName,
 			Namespace: instance.Namespace,
 			Labels: map[string]string{
-				"app":                                  "caddy",
-				"instance":                             instance.NodeName,
-				"ckic.cmld.ru/caddy-managed":           "true",
-				"svccontroller.k3s.cattle.io/lbpool":   instance.NodeName,
+				"app":                        "caddy",
+				"instance":                   instance.NodeName,
+				"ckic.cmld.ru/caddy-managed": "true",
+			},
+			Annotations: map[string]string{
 				"io.cilium.nodeipam/match-node-labels": "kubernetes.io/hostname=" + instance.NodeName,
 			},
 		},
