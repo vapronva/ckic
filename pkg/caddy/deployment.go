@@ -365,10 +365,11 @@ func deployLoadBalancerService(ctx context.Context, clientset *kubernetes.Client
 			Name:      loadBalancerServiceName,
 			Namespace: instance.Namespace,
 			Labels: map[string]string{
-				"app":                                "caddy",
-				"instance":                           instance.NodeName,
-				"ckic.cmld.ru/caddy-managed":         "true",
-				"svccontroller.k3s.cattle.io/lbpool": instance.NodeName,
+				"app":                                  "caddy",
+				"instance":                             instance.NodeName,
+				"ckic.cmld.ru/caddy-managed":           "true",
+				"svccontroller.k3s.cattle.io/lbpool":   instance.NodeName,
+				"io.cilium.nodeipam/match-node-labels": "kubernetes.io/hostname=" + instance.NodeName,
 			},
 		},
 		Spec: corev1.ServiceSpec{
@@ -403,6 +404,7 @@ func deployLoadBalancerService(ctx context.Context, clientset *kubernetes.Client
 				},
 			},
 			Type:                  corev1.ServiceTypeLoadBalancer,
+			LoadBalancerClass:     StringPtr("io.cilium/node"),
 			ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyTypeLocal,
 		},
 	}
@@ -467,4 +469,8 @@ func cleanupDeployment(ctx context.Context, clientset *kubernetes.Clientset, ins
 
 func hostPathTypePtr(t corev1.HostPathType) *corev1.HostPathType {
 	return &t
+}
+
+func StringPtr(s string) *string {
+	return &s
 }
