@@ -19,7 +19,7 @@ include:
     inputs:
       job_name: init + format + vet
       golang_version: "1.24"
-  - component: gl.vprw.ru/ci/docker/build-buildah@2
+  - component: gl.vprw.ru/ci/docker/build-buildah@3
     inputs:
       job_name: build container image
       job_name_manifest: push oci manifest

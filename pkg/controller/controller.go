@@ -14,8 +14,8 @@ import (
 	"gl.vprw.ru/vapronva/ckic/pkg/constants"
 	"gl.vprw.ru/vapronva/ckic/pkg/handlers"
 	"gl.vprw.ru/vapronva/ckic/pkg/state"
-	"gl.vprw.ru/vapronva/ckic/pkg/watcher"
 	"gl.vprw.ru/vapronva/ckic/pkg/utils"
+	"gl.vprw.ru/vapronva/ckic/pkg/watcher"
 )
 
 type ControllerConfig struct {

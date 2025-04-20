@@ -105,6 +105,7 @@ func deployDeployment(
 			{Name: "opt-data", MountPath: "/data"},
 			{Name: "opt-config", MountPath: "/config"},
 		},
+		ImagePullPolicy: corev1.PullPolicy("Always"),
 		SecurityContext: &corev1.SecurityContext{
 			Capabilities: &corev1.Capabilities{
 				Add:  []corev1.Capability{"NET_ADMIN", "NET_BIND_SERVICE"},

@@ -43,7 +43,7 @@ config:
   configMapNamespace: caddy-system
   communicationMethod: clusterip  # or "direct"
   logLevel: info
-  caddyImage: rg.gl.vprw.ru/oss-images/zerossl-caddy/caddy:2.9.1-alpine
+  caddyImage: rg.gl.vprw.ru/oss-images/zerossl-caddy/caddy:2.10.0-alpine
   enableLoadBalancer: true
   preferSavedState: false
   secretName: caddy-env
