@@ -21,17 +21,21 @@ func main() {
 	nodeLabel := pflag.String("node-label", "ckic.cmld.ru/enabled", "Node label to watch for")
 	configMapName := pflag.String("config-map", "caddy-config", "ConfigMap containing Caddy configuration")
 	configMapNamespace := pflag.String("config-namespace", "caddy-system", "Namespace of the ConfigMap and deployments")
-	communicationMethod := pflag.String("comm-method", "clusterip", "Communication method (clusterip or direct)")
+	communicationMethod := pflag.String("comm-method", "clusterip", "Communication method (clusterip, direct, hostnetwork)")
 	logLevel := pflag.String("log-level", "info", "Log level (debug, info, warn, error)")
-	caddyImage := pflag.String("caddy-image", "rg.gl.vprw.ru/oss-images/zerossl-caddy/caddy:2.9.1-alpine", "Caddy image (format image:tag)")
+	caddyImage := pflag.String("caddy-image", "rg.gl.vprw.ru/oss-images/zerossl-caddy/caddy:2.10.0-alpine", "Caddy image (format image:tag)")
 	enableLoadBalancer := pflag.Bool("enable-loadbalancer", false, "Enable LoadBalancer service exposure")
-	preferSavedState := pflag.Bool("prefer-saved-state", false, "Prefer saved (persistent) state during reconciliation")
+	preferSavedState := pflag.Bool("prefer-saved-state", false, "Prefer saved (aka persistent) state during reconciliation")
 	secretName := pflag.String("env-secret", "", "Name of the Kubernetes Secret to use for environment variables")
 	secretEnvKeys := pflag.StringSlice("env-keys", []string{}, "Keys from the Secret to use as environment variables")
 	dataVolumePVC := pflag.String("data-pvc", "", "Name of PVC to use for the /data volume (defaults to HostPath if empty)")
 	configVolumePVC := pflag.String("config-pvc", "", "Name of PVC to use for the /config volume (defaults to HostPath if empty)")
-	externalEndpoints := pflag.StringArray("external-endpoints", []string{}, "External endpoints for nodes, format: nodeName=ip1,ip2,...")
+	externalEndpoints := pflag.StringArray("external-endpoints", []string{}, "External endpoints for nodes (format: nodeName=ip1,ip2,...)")
 	externalEndpointsFile := pflag.String("external-endpoints-file", "", "Path to JSON file containing external endpoints mapping")
+	useHostNetwork := pflag.Bool("use-host-network", false, "Use hostNetwork for Caddy pods")
+	caddyAdminOriginKey := pflag.String("caddy-admin-origin-key", "", "Origin key for Caddy admin API security")
+	httpHostPort := pflag.Int("http-host-port", 80, "Host port for HTTP when using hostNetwork")
+	httpsHostPort := pflag.Int("https-host-port", 443, "Host port for HTTPS when using hostNetwork")
 	pflag.Parse()
 	var commMethod caddy.CommunicationMethod
 	switch *communicationMethod {
@@ -39,9 +43,18 @@ func main() {
 		commMethod = caddy.CommunicationMethodClusterIP
 	case "direct":
 		commMethod = caddy.CommunicationMethodDirect
+	case "hostnetwork":
+		commMethod = caddy.CommunicationMethodHostNetwork
 	default:
 		log.Warn().Msgf("Unknown communication method %s, defaulting to clusterip", *communicationMethod)
 		commMethod = caddy.CommunicationMethodClusterIP
+	}
+	if *useHostNetwork && *enableLoadBalancer {
+		log.Fatal().Msg("Cannot use both hostNetwork and LoadBalancer at the same time")
+	}
+	if *useHostNetwork && commMethod != caddy.CommunicationMethodHostNetwork {
+		log.Info().Msg("Automatically setting communication method to \"hostnetwork\" when using hostNetwork")
+		commMethod = caddy.CommunicationMethodHostNetwork
 	}
 	level, err := zerolog.ParseLevel(*logLevel)
 	if err != nil {
@@ -70,6 +83,10 @@ func main() {
 		DataVolumePVC:       *dataVolumePVC,
 		ConfigVolumePVC:     *configVolumePVC,
 		ExternalEndpoints:   extEndpointsMap,
+		UseHostNetwork:      *useHostNetwork,
+		CaddyAdminOriginKey: *caddyAdminOriginKey,
+		HTTPHostPort:        *httpHostPort,
+		HTTPSHostPort:       *httpsHostPort,
 	}
 	ctrl, err := controller.NewController(clientset, cfg)
 	if err != nil {

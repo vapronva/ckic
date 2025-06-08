@@ -27,6 +27,10 @@ type ConfigHandler struct {
 	DataVolumePVC       string
 	ConfigVolumePVC     string
 	ExternalEndpoints   utils.ExternalEndpointsMap
+	UseHostNetwork      bool
+	CaddyAdminOriginKey string
+	HTTPHostPort        int
+	HTTPSHostPort       int
 }
 
 func NewConfigHandler(
@@ -41,6 +45,10 @@ func NewConfigHandler(
 	dataVolumePVC string,
 	configVolumePVC string,
 	externalEndpoints utils.ExternalEndpointsMap,
+	useHostNetwork bool,
+	caddyAdminOriginKey string,
+	httpHostPort int,
+	httpsHostPort int,
 ) *ConfigHandler {
 	return &ConfigHandler{
 		CommunicationMethod: method,
@@ -55,6 +63,10 @@ func NewConfigHandler(
 		DataVolumePVC:       dataVolumePVC,
 		ConfigVolumePVC:     configVolumePVC,
 		ExternalEndpoints:   externalEndpoints,
+		UseHostNetwork:      useHostNetwork,
+		CaddyAdminOriginKey: caddyAdminOriginKey,
+		HTTPHostPort:        httpHostPort,
+		HTTPSHostPort:       httpsHostPort,
 	}
 }
 
@@ -70,6 +82,12 @@ func (h *ConfigHandler) Handle(configData string) {
 	var muFailed sync.Mutex
 	var failedNodes []string
 	semaphore := make(chan struct{}, 5)
+	var apiConfig *caddy.AdminAPIConfig
+	if h.CaddyAdminOriginKey != "" {
+		apiConfig = &caddy.AdminAPIConfig{
+			OriginKey: h.CaddyAdminOriginKey,
+		}
+	}
 	for nodeName, instance := range instancesCopy {
 		wg.Add(1)
 		go func(nodeName string, instance *caddy.Instance) {
@@ -84,7 +102,7 @@ func (h *ConfigHandler) Handle(configData string) {
 					instanceLogger.Info().Int("retry", retry).Msg("Retrying configuration update")
 					time.Sleep(time.Duration(retry*2) * time.Second)
 				}
-				err = instance.UpdateConfig(configData, h.CommunicationMethod)
+				err = instance.UpdateConfig(configData, h.CommunicationMethod, apiConfig)
 				if err == nil {
 					break
 				}
@@ -132,6 +150,9 @@ func (h *ConfigHandler) Handle(configData string) {
 				h.EnvSecretKeys,
 				h.DataVolumePVC,
 				h.ConfigVolumePVC,
+				h.UseHostNetwork,
+				h.HTTPHostPort,
+				h.HTTPSHostPort,
 			)
 			if err != nil {
 				logger.Error().Err(err).Str("node", nodeName).Msg("Failed to redeploy Caddy instance")

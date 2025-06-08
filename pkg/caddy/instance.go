@@ -22,10 +22,7 @@ type Instance struct {
 
 func (i *Instance) Delete() error {
 	ctx := context.Background()
-	logger := log.With().
-		Str("node", i.NodeName).
-		Str("deployment", i.DeploymentName).
-		Logger()
+	logger := log.With().Str("node", i.NodeName).Str("deployment", i.DeploymentName).Logger()
 	if err := i.KubeClient.CoreV1().Services(i.Namespace).Delete(
 		ctx, i.ServiceName, metav1.DeleteOptions{}); err != nil {
 		logger.Warn().Err(err).Msg("Failed to delete ClusterIP Caddy service")

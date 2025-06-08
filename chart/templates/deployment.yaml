@@ -47,11 +47,21 @@ spec:
             {{- range .Values.config.secretEnvKeys }}
             - "--env-keys={{ . }}"
             {{- end }}
+            {{- if .Values.config.dataVolumePVC }}
             - "--data-pvc={{ .Values.config.dataVolumePVC }}"
+            {{- end }}
+            {{- if .Values.config.configVolumePVC }}
             - "--config-pvc={{ .Values.config.configVolumePVC }}"
+            {{- end }}
             {{- range .Values.config.externalEndpoints }}
             - "--external-endpoints={{ . }}"
             {{- end }}
+            - "--use-host-network={{ .Values.config.useHostNetwork }}"
+            {{- if .Values.config.caddyAdminOriginKey }}
+            - "--caddy-admin-origin-key={{ .Values.config.caddyAdminOriginKey }}"
+            {{- end }}
+            - "--http-host-port={{ .Values.config.httpHostPort }}"
+            - "--https-host-port={{ .Values.config.httpsHostPort }}"
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       {{- with .Values.nodeSelector }}

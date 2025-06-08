@@ -16,7 +16,12 @@ data:
       {{- end }}
       http_port 80
       https_port 443
-      admin :2019
+      admin :2019 {
+        {{- if $.Values.config.caddyAdminOriginKey }}
+        origins http://{{ $.Values.config.caddyAdminOriginKey }}.caddy-admin-api.ckic.cmld.ru
+        enforce_origin
+        {{- end }}
+      }
       log {
         output stdout
         format json
@@ -40,8 +45,12 @@ data:
       {{ .global_optional | nindent 6 }}
     }
 
-    :8000 {
+    :8170 {
       handle / {
+        header {
+          X-Petrushka "PETRUSHKA V2.2.3-f1"
+          X-Petrushka-Via {env.CKIC_POD_NAME}
+        }
         respond "OK"
       }
     }

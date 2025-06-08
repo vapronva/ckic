@@ -97,11 +97,7 @@ func (w *ConfigWatcher) refreshResourceVersion(ctx context.Context, logger zerol
 }
 
 func (w *ConfigWatcher) Start(ctx context.Context) {
-	logger := log.With().
-		Str("component", "config_watcher").
-		Str("namespace", w.namespace).
-		Str("configmap", w.configMapName).
-		Logger()
+	logger := log.With().Str("component", "config_watcher").Str("namespace", w.namespace).Str("configmap", w.configMapName).Logger()
 	logger.Info().Msg("Starting config watcher")
 	configMap, err := w.clientset.CoreV1().ConfigMaps(w.namespace).Get(ctx, w.configMapName, metav1.GetOptions{})
 	if err != nil {

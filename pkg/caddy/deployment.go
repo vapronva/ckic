@@ -28,6 +28,9 @@ func DeployCaddy(
 	envSecretKeys []string,
 	dataVolumePVC string,
 	configVolumePVC string,
+	useHostNetwork bool,
+	httpHostPort int,
+	httpsHostPort int,
 ) (*Instance, error) {
 	deployCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()
@@ -51,16 +54,23 @@ func DeployCaddy(
 		envSecretKeys,
 		dataVolumePVC,
 		configVolumePVC,
+		useHostNetwork,
+		httpHostPort,
+		httpsHostPort,
 	); err != nil {
 		return nil, err
 	}
-	if err := deployService(deployCtx, clientset, instance); err != nil {
-		return nil, err
-	}
-	if enableLoadBalancer {
-		if err := deployLoadBalancerService(deployCtx, clientset, instance); err != nil {
+	if !useHostNetwork {
+		if err := deployService(deployCtx, clientset, instance); err != nil {
 			return nil, err
 		}
+		if enableLoadBalancer {
+			if err := deployLoadBalancerService(deployCtx, clientset, instance); err != nil {
+				return nil, err
+			}
+		}
+	} else {
+		logger.Info().Msg("Skipping service creation due to hostNetwork mode")
 	}
 	if err := waitForDeploymentReady(deployCtx, clientset, namespace, deploymentName); err != nil {
 		cleanupDeployment(ctx, clientset, instance)
@@ -87,6 +97,9 @@ func deployDeployment(
 	envSecretKeys []string,
 	dataVolumePVC string,
 	configVolumePVC string,
+	useHostNetwork bool,
+	httpHostPort int,
+	httpsHostPort int,
 ) error {
 	logger := log.With().Str("deployment", instance.DeploymentName).Logger()
 	replicas := int32(1)
@@ -94,10 +107,6 @@ func deployDeployment(
 		Name:  "caddy",
 		Image: caddyImage,
 		Ports: []corev1.ContainerPort{
-			{Name: "http-tcp", ContainerPort: 80, Protocol: corev1.ProtocolTCP},
-			{Name: "http-udp", ContainerPort: 80, Protocol: corev1.ProtocolUDP},
-			{Name: "https-tcp", ContainerPort: 443, Protocol: corev1.ProtocolTCP},
-			{Name: "https-udp", ContainerPort: 443, Protocol: corev1.ProtocolUDP},
 			{Name: "admin", ContainerPort: 2019, Protocol: corev1.ProtocolTCP},
 		},
 		VolumeMounts: []corev1.VolumeMount{
@@ -112,6 +121,42 @@ func deployDeployment(
 				Drop: []corev1.Capability{"ALL"},
 			},
 		},
+	}
+	if useHostNetwork {
+		logger.Info().Int("httpPort", httpHostPort).Int("httpsPort", httpsHostPort).Msg("Configuring hostNetwork with host ports")
+		caddyContainer.Ports = append(caddyContainer.Ports,
+			corev1.ContainerPort{
+				Name:          "http-tcp",
+				ContainerPort: 80,
+				Protocol:      corev1.ProtocolTCP,
+				HostPort:      int32(httpHostPort),
+			},
+			corev1.ContainerPort{
+				Name:          "http-udp",
+				ContainerPort: 80,
+				Protocol:      corev1.ProtocolUDP,
+				HostPort:      int32(httpHostPort),
+			},
+			corev1.ContainerPort{
+				Name:          "https-tcp",
+				ContainerPort: 443,
+				Protocol:      corev1.ProtocolTCP,
+				HostPort:      int32(httpsHostPort),
+			},
+			corev1.ContainerPort{
+				Name:          "https-udp",
+				ContainerPort: 443,
+				Protocol:      corev1.ProtocolUDP,
+				HostPort:      int32(httpsHostPort),
+			},
+		)
+	} else {
+		caddyContainer.Ports = append(caddyContainer.Ports,
+			corev1.ContainerPort{Name: "http-tcp", ContainerPort: 80, Protocol: corev1.ProtocolTCP},
+			corev1.ContainerPort{Name: "http-udp", ContainerPort: 80, Protocol: corev1.ProtocolUDP},
+			corev1.ContainerPort{Name: "https-tcp", ContainerPort: 443, Protocol: corev1.ProtocolTCP},
+			corev1.ContainerPort{Name: "https-udp", ContainerPort: 443, Protocol: corev1.ProtocolUDP},
+		)
 	}
 	podDisruptionBudget := &policyv1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{
@@ -133,12 +178,9 @@ func deployDeployment(
 			},
 		},
 	}
+	var envVars []corev1.EnvVar
 	if envSecretName != "" && len(envSecretKeys) > 0 {
-		logger.Info().
-			Str("secret", envSecretName).
-			Strs("keys", envSecretKeys).
-			Msg("Configuring environment variables from secret")
-		var envVars []corev1.EnvVar
+		logger.Info().Str("secret", envSecretName).Strs("keys", envSecretKeys).Msg("Configuring environment variables from secret")
 		for _, key := range envSecretKeys {
 			envVars = append(envVars, corev1.EnvVar{
 				Name: key,
@@ -152,8 +194,32 @@ func deployDeployment(
 				},
 			})
 		}
-		caddyContainer.Env = envVars
 	}
+	envVars = append(envVars, corev1.EnvVar{
+		Name: "CKIC_POD_NAME",
+		ValueFrom: &corev1.EnvVarSource{
+			FieldRef: &corev1.ObjectFieldSelector{
+				FieldPath: "metadata.name",
+			},
+		},
+	})
+	envVars = append(envVars, corev1.EnvVar{
+		Name: "CKIC_NODE_NAME",
+		ValueFrom: &corev1.EnvVarSource{
+			FieldRef: &corev1.ObjectFieldSelector{
+				FieldPath: "spec.nodeName",
+			},
+		},
+	})
+	envVars = append(envVars, corev1.EnvVar{
+		Name: "CKIC_POD_IP",
+		ValueFrom: &corev1.EnvVarSource{
+			FieldRef: &corev1.ObjectFieldSelector{
+				FieldPath: "status.podIP",
+			},
+		},
+	})
+	caddyContainer.Env = envVars
 	volumes := []corev1.Volume{
 		{
 			Name: "caddy-config",
@@ -213,6 +279,18 @@ func deployDeployment(
 			},
 		})
 	}
+	podSpec := corev1.PodSpec{
+		NodeSelector: map[string]string{
+			"kubernetes.io/hostname": instance.NodeName,
+		},
+		Containers: []corev1.Container{caddyContainer},
+		Volumes:    volumes,
+	}
+	if useHostNetwork {
+		podSpec.HostNetwork = true
+		podSpec.DNSPolicy = corev1.DNSClusterFirstWithHostNet
+		logger.Info().Msg("Enabled hostNetwork mode")
+	}
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      instance.DeploymentName,
@@ -239,13 +317,7 @@ func deployDeployment(
 						"ckic.cmld.ru/caddy-managed": "true",
 					},
 				},
-				Spec: corev1.PodSpec{
-					NodeSelector: map[string]string{
-						"kubernetes.io/hostname": instance.NodeName,
-					},
-					Containers: []corev1.Container{caddyContainer},
-					Volumes:    volumes,
-				},
+				Spec: podSpec,
 			},
 		},
 	}
@@ -435,10 +507,7 @@ func deployLoadBalancerService(ctx context.Context, clientset *kubernetes.Client
 }
 
 func waitForDeploymentReady(ctx context.Context, clientset *kubernetes.Clientset, namespace, name string) error {
-	logger := log.With().
-		Str("deployment", name).
-		Str("namespace", namespace).
-		Logger()
+	logger := log.With().Str("deployment", name).Str("namespace", namespace).Logger()
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {

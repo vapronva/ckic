@@ -23,8 +23,5 @@ func SetupLogger(level zerolog.Level) {
 }
 
 func NodeLogger(nodeName string) zerolog.Logger {
-	return log.With().
-		Str("component", "node").
-		Str("node", nodeName).
-		Logger()
+	return log.With().Str("component", "node").Str("node", nodeName).Logger()
 }

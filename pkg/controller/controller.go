@@ -32,6 +32,10 @@ type ControllerConfig struct {
 	DataVolumePVC       string
 	ConfigVolumePVC     string
 	ExternalEndpoints   utils.ExternalEndpointsMap
+	UseHostNetwork      bool
+	CaddyAdminOriginKey string
+	HTTPHostPort        int
+	HTTPSHostPort       int
 }
 
 type Controller struct {
@@ -67,6 +71,9 @@ func NewController(clientset *kubernetes.Clientset, config ControllerConfig) (*C
 		config.DataVolumePVC,
 		config.ConfigVolumePVC,
 		config.ExternalEndpoints,
+		config.UseHostNetwork,
+		config.HTTPHostPort,
+		config.HTTPSHostPort,
 	)
 	nodeWatcher := watcher.NewNodeWatcher(clientset, config.NodeLabel, nodeHandler.Handle)
 	configHandler := handlers.NewConfigHandler(
@@ -82,6 +89,10 @@ func NewController(clientset *kubernetes.Clientset, config ControllerConfig) (*C
 		config.DataVolumePVC,
 		config.ConfigVolumePVC,
 		config.ExternalEndpoints,
+		config.UseHostNetwork,
+		config.CaddyAdminOriginKey,
+		config.HTTPHostPort,
+		config.HTTPSHostPort,
 	)
 	configWatcher := watcher.NewConfigWatcher(clientset, config.ConfigMapNamespace, config.ConfigMapName, configHandler.Handle, nodeAvailabilityCheck)
 	coordinator := NewWatcherCoordinator(nodeWatcher, configWatcher, deployedInstances)

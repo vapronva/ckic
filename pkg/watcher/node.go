@@ -49,8 +49,7 @@ func NewNodeWatcher(clientset *kubernetes.Clientset, labelSelector string, handl
 }
 
 func (w *NodeWatcher) Start(ctx context.Context) {
-	logger := log.With().Str("component", "node_watcher").
-		Str("label", w.labelKey+":"+w.labelValue).Logger()
+	logger := log.With().Str("component", "node_watcher").Str("label", w.labelKey+":"+w.labelValue).Logger()
 	logger.Info().Msg("Starting node watcher")
 	for {
 		select {

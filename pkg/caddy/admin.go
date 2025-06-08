@@ -20,9 +20,14 @@ type CommunicationMethod int
 const (
 	CommunicationMethodClusterIP CommunicationMethod = iota
 	CommunicationMethodDirect
+	CommunicationMethodHostNetwork
 )
 
-func waitForCaddyAPIReady(adminURL string) error {
+type AdminAPIConfig struct {
+	OriginKey string
+}
+
+func waitForCaddyAPIReady(adminURL string, apiConfig *AdminAPIConfig) error {
 	initialDelay := constants.CaddyAPIInitialDelay
 	maxDelay := constants.CaddyAPIMaxDelay
 	delay := initialDelay
@@ -32,6 +37,9 @@ func waitForCaddyAPIReady(adminURL string) error {
 		req, err := http.NewRequest("GET", adminURL, nil)
 		if err != nil {
 			return fmt.Errorf("failed to create readiness request: %w", err)
+		}
+		if apiConfig != nil && apiConfig.OriginKey != "" {
+			req.Header.Set("Origin", fmt.Sprintf("http://%s.caddy-admin-api.ckic.cmld.ru", apiConfig.OriginKey))
 		}
 		resp, err := client.Do(req)
 		if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 500 {
@@ -47,13 +55,9 @@ func waitForCaddyAPIReady(adminURL string) error {
 	}
 }
 
-func (i *Instance) UpdateConfig(configData string, method CommunicationMethod) error {
+func (i *Instance) UpdateConfig(configData string, method CommunicationMethod, apiConfig *AdminAPIConfig) error {
 	var adminURL string
-	logger := log.With().
-		Str("node", i.NodeName).
-		Str("pod", i.PodName).
-		Str("method", fmt.Sprintf("%d", method)).
-		Logger()
+	logger := log.With().Str("node", i.NodeName).Str("pod", i.PodName).Str("method", fmt.Sprintf("%d", method)).Logger()
 	logger.Debug().Msg("Updating Caddy configuration")
 	switch method {
 	case CommunicationMethodClusterIP:
@@ -81,6 +85,43 @@ func (i *Instance) UpdateConfig(configData string, method CommunicationMethod) e
 			}
 		}
 		adminURL = fmt.Sprintf("http://%s:2019/load", podIP)
+	case CommunicationMethodHostNetwork:
+		node, err := i.KubeClient.CoreV1().Nodes().Get(context.Background(), i.NodeName, metav1.GetOptions{})
+		if err != nil {
+			logger.Error().Err(err).Msg("Failed to get node information")
+			i.FailureCount++
+			return &errors.ErrConfigurationFailed{
+				NodeName: i.NodeName,
+				Reason:   "failed to get node info",
+				Err:      err,
+			}
+		}
+		var nodeIP string
+		for _, addr := range node.Status.Addresses {
+			if addr.Type == "InternalIP" {
+				nodeIP = addr.Address
+				break
+			}
+		}
+		if nodeIP == "" {
+			for _, addr := range node.Status.Addresses {
+				if addr.Type == "ExternalIP" {
+					nodeIP = addr.Address
+					break
+				}
+			}
+		}
+		if nodeIP == "" {
+			err := fmt.Errorf("no IP address found for node")
+			logger.Error().Err(err).Msg("Cannot get node IP for hostNetwork communication")
+			i.FailureCount++
+			return &errors.ErrConfigurationFailed{
+				NodeName: i.NodeName,
+				Reason:   "node IP not found",
+				Err:      err,
+			}
+		}
+		adminURL = fmt.Sprintf("http://%s:2019/load", nodeIP)
 	default:
 		err := fmt.Errorf("unknown communication method: %d", method)
 		logger.Error().Err(err).Msg("Invalid communication method")
@@ -91,7 +132,7 @@ func (i *Instance) UpdateConfig(configData string, method CommunicationMethod) e
 			Err:      err,
 		}
 	}
-	if err := waitForCaddyAPIReady(adminURL); err != nil {
+	if err := waitForCaddyAPIReady(adminURL, apiConfig); err != nil {
 		logger.Error().Err(err).Msg("Caddy Admin API not ready")
 		i.FailureCount++
 		return &errors.ErrConfigurationFailed{
@@ -114,6 +155,10 @@ func (i *Instance) UpdateConfig(configData string, method CommunicationMethod) e
 		}
 	}
 	req.Header.Set("Content-Type", "text/caddyfile")
+	if apiConfig != nil && apiConfig.OriginKey != "" {
+		req.Header.Set("Origin", fmt.Sprintf("http://%s.caddy-admin-api.ckic.cmld.ru", apiConfig.OriginKey))
+		logger.Debug().Str("origin", req.Header.Get("Origin")).Msg("Added Origin header for admin API security")
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		logger.Error().Err(err).Msg("Failed to send configuration to Caddy")

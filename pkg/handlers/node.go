@@ -39,6 +39,9 @@ type NodeHandler struct {
 	DataVolumePVC      string
 	ConfigVolumePVC    string
 	ExternalEndpoints  utils.ExternalEndpointsMap
+	UseHostNetwork     bool
+	HTTPHostPort       int
+	HTTPSHostPort      int
 }
 
 func NewNodeHandler(
@@ -54,6 +57,9 @@ func NewNodeHandler(
 	dataVolumePVC string,
 	configVolumePVC string,
 	externalEndpoints utils.ExternalEndpointsMap,
+	useHostNetwork bool,
+	httpHostPort int,
+	httpsHostPort int,
 ) *NodeHandler {
 	return &NodeHandler{
 		Clientset:          clientset,
@@ -68,6 +74,9 @@ func NewNodeHandler(
 		DataVolumePVC:      dataVolumePVC,
 		ConfigVolumePVC:    configVolumePVC,
 		ExternalEndpoints:  externalEndpoints,
+		UseHostNetwork:     useHostNetwork,
+		HTTPHostPort:       httpHostPort,
+		HTTPSHostPort:      httpsHostPort,
 	}
 }
 
@@ -100,6 +109,9 @@ func (h *NodeHandler) StartWorkerPool(ctx context.Context, workerCount int) {
 						h.EnvSecretKeys,
 						h.DataVolumePVC,
 						h.ConfigVolumePVC,
+						h.UseHostNetwork,
+						h.HTTPHostPort,
+						h.HTTPSHostPort,
 					)
 					cancel()
 					job.resultCh <- &deploymentResult{
