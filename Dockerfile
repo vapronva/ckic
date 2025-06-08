@@ -1,17 +1,28 @@
-FROM ot.cmld.ru/docker.io/library/golang:1.24-alpine AS build
+FROM docker-registry.selectel.ru/library/golang:1.24-alpine AS build
 
-COPY . /usr/src/app/ckic
+WORKDIR /usr/src/app/ckic
 
-WORKDIR /usr/src/app/ckic/cmd/manager
+RUN apk update && \
+    apk upgrade && \
+    apk add git ca-certificates tzdata && \
+    rm -rf /var/cache/apk/*
 
-RUN set -ex && \
-    go build -o /usr/bin/ckic-manager && \
-    chmod +x /usr/bin/ckic-manager
+COPY go.mod go.sum ./
 
-FROM ot.cmld.ru/docker.io/library/alpine:3
+RUN go mod download
 
-COPY --from=build /usr/bin/ckic-manager /usr/bin/ckic-manager
+COPY . .
 
-USER nobody
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o ckic-manager ./cmd/manager && \
+    chmod +x ckic-manager
+
+FROM docker-registry.selectel.ru/library/alpine:3
+
+RUN apk update && \
+    apk upgrade && \
+    apk add ca-certificates tzdata && \
+    rm -rf /var/cache/apk/*
+
+COPY --from=build /usr/src/app/ckic/ckic-manager /usr/bin/ckic-manager
 
 ENTRYPOINT ["/usr/bin/ckic-manager"]
