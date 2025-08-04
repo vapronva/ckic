@@ -6,7 +6,7 @@ stages:
   - publish
 
 variables:
-  CT_IMAGE: ot.cmld.ru/quay.io/helmpack/chart-testing:v3.12.0
+  CT_IMAGE: ot.cmld.ru/quay.io/helmpack/chart-testing:v3.13.0
 
 include:
   - component: gl.vprw.ru/ci/sast/sast@1
