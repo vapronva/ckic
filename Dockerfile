@@ -13,7 +13,7 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o ckic-manager ./cmd/manager && \
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -a -o ckic-manager ./cmd/manager && \
     chmod +x ckic-manager
 
 FROM docker-registry.selectel.ru/library/alpine:3
