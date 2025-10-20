@@ -2,7 +2,7 @@ module gl.vprw.ru/vapronva/ckic
 
 go 1.25
 
-toolchain go1.25.2
+toolchain go1.25.3
 
 require (
 	github.com/rs/zerolog v1.34.0
