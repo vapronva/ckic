@@ -62,6 +62,19 @@ spec:
             {{- end }}
             - "--http-host-port={{ .Values.config.httpHostPort }}"
             - "--https-host-port={{ .Values.config.httpsHostPort }}"
+            - "--external-enable={{ .Values.config.external.enable }}"
+            {{- if .Values.config.external.enable }}
+            - "--external-label={{ .Values.config.external.label }}"
+            - "--external-ns-mode={{ .Values.config.external.nsMode }}"
+            {{- if .Values.config.external.allowNamespaces }}
+            - "--external-allow-namespaces={{ join "," .Values.config.external.allowNamespaces }}"
+            {{- end }}
+            {{- if .Values.config.external.denyNamespaces }}
+            - "--external-deny-namespaces={{ join "," .Values.config.external.denyNamespaces }}"
+            {{- end }}
+            - "--external-publish-aggregated={{ .Values.config.external.publishAggregated }}"
+            - "--external-aggregated-config-name={{ .Values.config.external.aggregatedConfigName }}"
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       {{- with .Values.nodeSelector }}

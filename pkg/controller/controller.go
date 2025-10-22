@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"maps"
 	"sync"
 	"time"
 
@@ -10,6 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
+	"gl.vprw.ru/vapronva/ckic/pkg/aggregator"
 	"gl.vprw.ru/vapronva/ckic/pkg/caddy"
 	"gl.vprw.ru/vapronva/ckic/pkg/constants"
 	"gl.vprw.ru/vapronva/ckic/pkg/handlers"
@@ -19,23 +21,30 @@ import (
 )
 
 type ControllerConfig struct {
-	Kubeconfig          string
-	NodeLabel           string
-	ConfigMapName       string
-	ConfigMapNamespace  string
-	CommunicationMethod caddy.CommunicationMethod
-	CaddyImage          string
-	EnableLoadBalancer  bool
-	PreferSavedState    bool
-	EnvSecretName       string
-	EnvSecretKeys       []string
-	DataVolumePVC       string
-	ConfigVolumePVC     string
-	ExternalEndpoints   utils.ExternalEndpointsMap
-	UseHostNetwork      bool
-	CaddyAdminOriginKey string
-	HTTPHostPort        int
-	HTTPSHostPort       int
+	Kubeconfig                   string
+	NodeLabel                    string
+	ConfigMapName                string
+	ConfigMapNamespace           string
+	CommunicationMethod          caddy.CommunicationMethod
+	CaddyImage                   string
+	EnableLoadBalancer           bool
+	PreferSavedState             bool
+	EnvSecretName                string
+	EnvSecretKeys                []string
+	DataVolumePVC                string
+	ConfigVolumePVC              string
+	ExternalEndpoints            utils.ExternalEndpointsMap
+	UseHostNetwork               bool
+	CaddyAdminOriginKey          string
+	HTTPHostPort                 int
+	HTTPSHostPort                int
+	ExternalEnable               bool
+	ExternalLabel                string
+	ExternalNsMode               string
+	ExternalAllowNamespaces      string
+	ExternalDenyNamespaces       string
+	ExternalPublishAggregated    bool
+	ExternalAggregatedConfigName string
 }
 
 type Controller struct {
@@ -43,11 +52,14 @@ type Controller struct {
 	config            ControllerConfig
 	nodeWatcher       *watcher.NodeWatcher
 	configWatcher     *watcher.ConfigWatcher
+	externalWatcher   *watcher.ExternalConfigWatcher
 	nodeHandler       *handlers.NodeHandler
 	configHandler     *handlers.ConfigHandler
 	deployedInstances map[string]*caddy.Instance
+	instancesMutex    *sync.RWMutex
 	stateStore        *state.ConfigMapStateStore
 	coordinator       *WatcherCoordinator
+	aggregator        any
 }
 
 func NewController(clientset *kubernetes.Clientset, config ControllerConfig) (*Controller, error) {
@@ -94,21 +106,65 @@ func NewController(clientset *kubernetes.Clientset, config ControllerConfig) (*C
 		config.HTTPHostPort,
 		config.HTTPSHostPort,
 	)
-	configWatcher := watcher.NewConfigWatcher(clientset, config.ConfigMapNamespace, config.ConfigMapName, configHandler.Handle, nodeAvailabilityCheck)
+	var configWatcher *watcher.ConfigWatcher
+	var externalWatcher *watcher.ExternalConfigWatcher
+	var agg *aggregator.NamespaceAggregator
+	if config.ExternalEnable {
+		agg = aggregator.NewNamespaceAggregator(
+			clientset,
+			config.ConfigMapNamespace,
+			config.ExternalPublishAggregated,
+			config.ExternalAggregatedConfigName,
+			configHandler.Handle,
+			nodeAvailabilityCheck,
+		)
+		configWatcher = watcher.NewConfigWatcher(
+			clientset,
+			config.ConfigMapNamespace,
+			config.ConfigMapName,
+			agg.UpdateBase,
+			nodeAvailabilityCheck,
+		)
+		externalWatcher = watcher.NewExternalConfigWatcher(
+			clientset,
+			config.ConfigMapNamespace,
+			config.ConfigMapName,
+			config.ExternalLabel,
+			config.ExternalNsMode,
+			config.ExternalAllowNamespaces,
+			config.ExternalDenyNamespaces,
+			agg.SetExternal,
+			agg.RemoveExternal,
+		)
+	} else {
+		configWatcher = watcher.NewConfigWatcher(
+			clientset,
+			config.ConfigMapNamespace,
+			config.ConfigMapName,
+			configHandler.Handle,
+			nodeAvailabilityCheck,
+		)
+	}
 	coordinator := NewWatcherCoordinator(nodeWatcher, configWatcher, deployedInstances)
 	nodeHandler.SetNodeChangeNotifier(coordinator.NotifyNodeChange)
 	stateStore := state.NewConfigMapStateStore(clientset, config.ConfigMapNamespace, constants.StateConfigMapName)
-	return &Controller{
+	ctrl := &Controller{
 		clientset:         clientset,
 		config:            config,
 		nodeWatcher:       nodeWatcher,
 		configWatcher:     configWatcher,
+		externalWatcher:   externalWatcher,
 		nodeHandler:       nodeHandler,
 		configHandler:     configHandler,
 		deployedInstances: deployedInstances,
+		instancesMutex:    mutex,
 		stateStore:        stateStore,
 		coordinator:       coordinator,
-	}, nil
+	}
+	if agg != nil {
+		ctrl.aggregator = agg
+	}
+	return ctrl, nil
 }
 
 func (c *Controller) Run(ctx context.Context) error {
@@ -119,6 +175,10 @@ func (c *Controller) Run(ctx context.Context) error {
 	c.nodeHandler.StartWorkerPool(ctx, 4)
 	go c.nodeWatcher.Start(ctx)
 	go c.configWatcher.Start(ctx)
+	if c.config.ExternalEnable && c.externalWatcher != nil {
+		log.Info().Msg("Starting external ConfigMap watcher")
+		go c.externalWatcher.Start(ctx)
+	}
 	go c.runPeriodicConfigReconciliation(ctx)
 	<-ctx.Done()
 	log.Info().Msg("Controller shutting down")
@@ -192,9 +252,36 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 	} else {
 		logger.Info().Msg("Using discovered state")
 	}
-	c.deployedInstances = discovered
+	c.instancesMutex.Lock()
+	for node := range c.deployedInstances {
+		delete(c.deployedInstances, node)
+	}
+	maps.Copy(c.deployedInstances, discovered)
+	c.instancesMutex.Unlock()
 	if err := c.stateStore.SaveState(c.deployedInstances); err != nil {
 		logger.Error().Err(err).Msg("Failed to persist state")
+	}
+	if len(c.deployedInstances) > 0 {
+		logger.Info().Msg("Pushing initial configuration to discovered instances")
+		configMap, err := c.clientset.CoreV1().ConfigMaps(c.config.ConfigMapNamespace).Get(
+			ctx, c.config.ConfigMapName, metav1.GetOptions{})
+		if err != nil {
+			logger.Error().Err(err).Msg("Failed to get ConfigMap for initial config push")
+		} else if configData, exists := configMap.Data["Caddyfile"]; exists {
+			if c.config.ExternalEnable {
+				if c.aggregator == nil {
+					logger.Error().Msg("External aggregation enabled but aggregator is nil, skipping initial config push")
+				} else if agg, ok := c.aggregator.(*aggregator.NamespaceAggregator); ok {
+					agg.UpdateBase(configData)
+				} else {
+					logger.Error().Msg("Failed to assert aggregator type, skipping initial config push")
+				}
+			} else {
+				c.configHandler.Handle(configData)
+			}
+		} else {
+			logger.Warn().Msg("ConfigMap missing Caddyfile key, skipping initial config push")
+		}
 	}
 	logger.Info().Msg("Reconciliation process completed")
 	return nil
@@ -221,7 +308,20 @@ func (c *Controller) runPeriodicConfigReconciliation(ctx context.Context) {
 				logger.Warn().Msg("ConfigMap missing Caddyfile key during reconciliation")
 				continue
 			}
-			c.configHandler.Handle(configData)
+			if c.config.ExternalEnable {
+				if c.aggregator == nil {
+					logger.Error().Msg("External aggregation enabled but aggregator is nil, skipping reconciliation to prevent configuration drift")
+					continue
+				}
+				if agg, ok := c.aggregator.(*aggregator.NamespaceAggregator); ok {
+					agg.UpdateBase(configData)
+				} else {
+					logger.Error().Msg("Failed to assert aggregator type, skipping reconciliation to prevent configuration drift")
+					continue
+				}
+			} else {
+				c.configHandler.Handle(configData)
+			}
 			logger.Info().Msg("Periodic configuration reconciliation completed")
 		}
 	}

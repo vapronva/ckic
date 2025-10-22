@@ -36,6 +36,13 @@ func main() {
 	caddyAdminOriginKey := pflag.String("caddy-admin-origin-key", "", "Origin key for Caddy admin API security")
 	httpHostPort := pflag.Int("http-host-port", 80, "Host port for HTTP when using hostNetwork")
 	httpsHostPort := pflag.Int("https-host-port", 443, "Host port for HTTPS when using hostNetwork")
+	externalEnable := pflag.Bool("external-enable", false, "Enable external namespace ConfigMap aggregation")
+	externalLabel := pflag.String("external-label", "ckic.cmld.ru/aggregate=true", "Label selector for external ConfigMaps")
+	externalNsMode := pflag.String("external-ns-mode", "all", "Namespace mode: all, allow, or deny")
+	externalAllowNamespaces := pflag.String("external-allow-namespaces", "", "Comma-separated list of allowed namespaces (for allow mode)")
+	externalDenyNamespaces := pflag.String("external-deny-namespaces", "", "Comma-separated list of denied namespaces (for deny mode)")
+	externalPublishAggregated := pflag.Bool("external-publish-aggregated", true, "Publish aggregated Caddyfile to a mirror ConfigMap")
+	externalAggregatedConfigName := pflag.String("external-aggregated-config-name", "ckic-caddy-config-working", "Name of the mirror ConfigMap for aggregated config")
 	pflag.Parse()
 	var commMethod caddy.CommunicationMethod
 	switch *communicationMethod {
@@ -70,23 +77,30 @@ func main() {
 		log.Fatal().Err(err).Msg("Failed to parse external endpoints")
 	}
 	cfg := controller.ControllerConfig{
-		Kubeconfig:          *kubeconfigPath,
-		NodeLabel:           *nodeLabel,
-		ConfigMapName:       *configMapName,
-		ConfigMapNamespace:  *configMapNamespace,
-		CommunicationMethod: commMethod,
-		CaddyImage:          *caddyImage,
-		EnableLoadBalancer:  *enableLoadBalancer,
-		PreferSavedState:    *preferSavedState,
-		EnvSecretName:       *secretName,
-		EnvSecretKeys:       *secretEnvKeys,
-		DataVolumePVC:       *dataVolumePVC,
-		ConfigVolumePVC:     *configVolumePVC,
-		ExternalEndpoints:   extEndpointsMap,
-		UseHostNetwork:      *useHostNetwork,
-		CaddyAdminOriginKey: *caddyAdminOriginKey,
-		HTTPHostPort:        *httpHostPort,
-		HTTPSHostPort:       *httpsHostPort,
+		Kubeconfig:                   *kubeconfigPath,
+		NodeLabel:                    *nodeLabel,
+		ConfigMapName:                *configMapName,
+		ConfigMapNamespace:           *configMapNamespace,
+		CommunicationMethod:          commMethod,
+		CaddyImage:                   *caddyImage,
+		EnableLoadBalancer:           *enableLoadBalancer,
+		PreferSavedState:             *preferSavedState,
+		EnvSecretName:                *secretName,
+		EnvSecretKeys:                *secretEnvKeys,
+		DataVolumePVC:                *dataVolumePVC,
+		ConfigVolumePVC:              *configVolumePVC,
+		ExternalEndpoints:            extEndpointsMap,
+		UseHostNetwork:               *useHostNetwork,
+		CaddyAdminOriginKey:          *caddyAdminOriginKey,
+		HTTPHostPort:                 *httpHostPort,
+		HTTPSHostPort:                *httpsHostPort,
+		ExternalEnable:               *externalEnable,
+		ExternalLabel:                *externalLabel,
+		ExternalNsMode:               *externalNsMode,
+		ExternalAllowNamespaces:      *externalAllowNamespaces,
+		ExternalDenyNamespaces:       *externalDenyNamespaces,
+		ExternalPublishAggregated:    *externalPublishAggregated,
+		ExternalAggregatedConfigName: *externalAggregatedConfigName,
 	}
 	ctrl, err := controller.NewController(clientset, cfg)
 	if err != nil {

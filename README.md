@@ -32,7 +32,12 @@ flowchart LR
     InstanceRegistry[("<code>map[string]*caddy.Instance</code>")] --> |"Get instances for update"| ConfigHandler
 
     ConfigWatcher["<code>pkg/watcher/config</code>"] <--> |"Watch <code>ConfigMap</code> events"| K8sAPI
-    ConfigWatcher --> |"Config changed"| ConfigHandler
+    ConfigWatcher --> |"Base config changed"| Aggregator
+    ExternalConfigWatcher["<code>pkg/watcher/external</code>"] <--> |"Watch cluster-wide <code>ConfigMap</code> with label"| K8sAPI
+    ExternalConfigWatcher --> |"External fragment changed"| Aggregator
+    Aggregator["<code>pkg/aggregator</code>"] --> |"Merge base + externals"| MirrorConfigMap
+    Aggregator --> |"Push merged config"| ConfigHandler
+    MirrorConfigMap[("<code>ckic-caddy-config-working</code>")] --> |"Write merged <code>Caddyfile</code>"| K8sAPI
     ConfigHandler["<code>pkg/handlers/config</code>"] --> |"Process update"| ConfigUpdateDispatcher
     ConfigUpdateDispatcher[("Config update dispatcher")] --> |"Concurrent updates"| CaddyAdminClient
 
@@ -40,6 +45,8 @@ flowchart LR
 
     WatcherCoordinator["<code>pkg/controller/coordinator</code>"] -.-> |"Pause when no nodes"| ConfigWatcher
     WatcherCoordinator -.-> |"Resume when nodes available"| ConfigWatcher
+
+    CLIFlags --> |"<code>external-*</code> flags"| ExternalConfigWatcher
 
     ExternalIPParser["<code>pkg/utils/external</code>"] --> |"Map node to IP"| InstanceRegistry
     ExternalIPParser --> |"Set <code>externalIPs</code>"| K8sLoadBalancer
@@ -73,6 +80,9 @@ flowchart LR
 
     subgraph ConfigManagement
         ConfigWatcher
+        ExternalConfigWatcher
+        Aggregator
+        MirrorConfigMap
         ConfigHandler
         ConfigUpdateDispatcher
         CaddyAdminClient
