@@ -113,7 +113,7 @@ func (w *ExternalConfigWatcher) Start(ctx context.Context) {
 		}
 		watchOptions := metav1.ListOptions{
 			LabelSelector:   w.labelSelector,
-			ResourceVersion: w.lastResourceVersion,
+			ResourceVersion: "",
 		}
 		watcher, err := w.clientset.CoreV1().ConfigMaps("").Watch(ctx, watchOptions)
 		if err != nil {
@@ -144,7 +144,7 @@ func (w *ExternalConfigWatcher) Start(ctx context.Context) {
 			}
 			if event.Type == watch.Error {
 				if status, ok := event.Object.(*metav1.Status); ok && status.Code == 410 {
-					logger.Info().Int32("code", status.Code).Msg("Received watch timeout (410); restarting watch")
+					logger.Info().Int32("code", status.Code).Msg("Received watch timeout (410); ignoring because we restart with an empty resourceVersion")
 				} else {
 					logger.Error().Msg("Error in external ConfigMap watch channel")
 				}
