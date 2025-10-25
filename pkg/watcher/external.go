@@ -2,6 +2,7 @@ package watcher
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -163,22 +164,25 @@ func (w *ExternalConfigWatcher) Start(ctx context.Context) {
 			switch event.Type {
 			case watch.Added, watch.Modified:
 				if fragment, exists := cm.Data["Caddyfile"]; exists {
+					sourceKey := fmt.Sprintf("%s/%s", cm.Namespace, cm.Name)
 					logger.Info().
 						Str("event", string(event.Type)).
 						Str("namespace", cm.Namespace).
+						Str("name", cm.Name).
 						Msg("External ConfigMap updated")
 					if w.onUpdate != nil {
-						w.onUpdate(cm.Namespace, fragment)
+						w.onUpdate(sourceKey, fragment)
 					}
 					w.lastSuccess = time.Now()
 					w.failureCount = 0
 				} else {
-					logger.Warn().Str("namespace", cm.Namespace).Msg("External ConfigMap missing 'Caddyfile' key")
+					logger.Warn().Str("namespace", cm.Namespace).Str("name", cm.Name).Msg("External ConfigMap missing 'Caddyfile' key")
 				}
 			case watch.Deleted:
-				logger.Info().Str("namespace", cm.Namespace).Msg("External ConfigMap deleted")
+				sourceKey := fmt.Sprintf("%s/%s", cm.Namespace, cm.Name)
+				logger.Info().Str("namespace", cm.Namespace).Str("name", cm.Name).Msg("External ConfigMap deleted")
 				if w.onRemove != nil {
-					w.onRemove(cm.Namespace)
+					w.onRemove(sourceKey)
 				}
 				w.lastSuccess = time.Now()
 				w.failureCount = 0
@@ -206,9 +210,10 @@ func (w *ExternalConfigWatcher) initialList(ctx context.Context, logger zerolog.
 			continue
 		}
 		if fragment, exists := cm.Data["Caddyfile"]; exists {
-			logger.Info().Str("namespace", cm.Namespace).Msg("Loading initial external ConfigMap")
+			sourceKey := fmt.Sprintf("%s/%s", cm.Namespace, cm.Name)
+			logger.Info().Str("namespace", cm.Namespace).Str("name", cm.Name).Msg("Loading initial external ConfigMap")
 			if w.onUpdate != nil {
-				w.onUpdate(cm.Namespace, fragment)
+				w.onUpdate(sourceKey, fragment)
 			}
 		}
 	}
