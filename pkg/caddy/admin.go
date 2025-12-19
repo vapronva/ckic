@@ -66,7 +66,6 @@ func (i *Instance) UpdateConfig(configData string, method CommunicationMethod, a
 		pod, err := i.KubeClient.CoreV1().Pods(i.Namespace).Get(context.Background(), i.PodName, metav1.GetOptions{})
 		if err != nil {
 			logger.Error().Err(err).Msg("Failed to get pod information")
-			i.FailureCount++
 			return &errors.ErrConfigurationFailed{
 				NodeName: i.NodeName,
 				Reason:   "failed to get pod info",
@@ -77,7 +76,6 @@ func (i *Instance) UpdateConfig(configData string, method CommunicationMethod, a
 		if podIP == "" {
 			err := fmt.Errorf("pod IP is empty")
 			logger.Error().Err(err).Msg("Cannot get pod IP for direct communication")
-			i.FailureCount++
 			return &errors.ErrConfigurationFailed{
 				NodeName: i.NodeName,
 				Reason:   "pod IP is empty",
@@ -89,7 +87,6 @@ func (i *Instance) UpdateConfig(configData string, method CommunicationMethod, a
 		node, err := i.KubeClient.CoreV1().Nodes().Get(context.Background(), i.NodeName, metav1.GetOptions{})
 		if err != nil {
 			logger.Error().Err(err).Msg("Failed to get node information")
-			i.FailureCount++
 			return &errors.ErrConfigurationFailed{
 				NodeName: i.NodeName,
 				Reason:   "failed to get node info",
@@ -114,7 +111,6 @@ func (i *Instance) UpdateConfig(configData string, method CommunicationMethod, a
 		if nodeIP == "" {
 			err := fmt.Errorf("no IP address found for node")
 			logger.Error().Err(err).Msg("Cannot get node IP for hostNetwork communication")
-			i.FailureCount++
 			return &errors.ErrConfigurationFailed{
 				NodeName: i.NodeName,
 				Reason:   "node IP not found",
@@ -125,7 +121,6 @@ func (i *Instance) UpdateConfig(configData string, method CommunicationMethod, a
 	default:
 		err := fmt.Errorf("unknown communication method: %d", method)
 		logger.Error().Err(err).Msg("Invalid communication method")
-		i.FailureCount++
 		return &errors.ErrConfigurationFailed{
 			NodeName: i.NodeName,
 			Reason:   "unknown communication method",
@@ -134,7 +129,6 @@ func (i *Instance) UpdateConfig(configData string, method CommunicationMethod, a
 	}
 	if err := waitForCaddyAPIReady(adminURL, apiConfig); err != nil {
 		logger.Error().Err(err).Msg("Caddy Admin API not ready")
-		i.FailureCount++
 		return &errors.ErrConfigurationFailed{
 			NodeName: i.NodeName,
 			Reason:   "admin API not ready",
@@ -147,7 +141,6 @@ func (i *Instance) UpdateConfig(configData string, method CommunicationMethod, a
 	req, err := http.NewRequest("POST", adminURL, bytes.NewBufferString(configData))
 	if err != nil {
 		logger.Error().Err(err).Msg("Failed to create HTTP request")
-		i.FailureCount++
 		return &errors.ErrConfigurationFailed{
 			NodeName: i.NodeName,
 			Reason:   "failed to create HTTP request",
@@ -162,7 +155,6 @@ func (i *Instance) UpdateConfig(configData string, method CommunicationMethod, a
 	resp, err := client.Do(req)
 	if err != nil {
 		logger.Error().Err(err).Msg("Failed to send configuration to Caddy")
-		i.FailureCount++
 		return &errors.ErrConfigurationFailed{
 			NodeName: i.NodeName,
 			Reason:   "failed to send configuration",
@@ -173,7 +165,6 @@ func (i *Instance) UpdateConfig(configData string, method CommunicationMethod, a
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		logger.Error().Err(err).Msg("Failed to read response body")
-		i.FailureCount++
 		return &errors.ErrConfigurationFailed{
 			NodeName: i.NodeName,
 			Reason:   "failed to read response",
@@ -187,7 +178,6 @@ func (i *Instance) UpdateConfig(configData string, method CommunicationMethod, a
 		} else {
 			logger.Error().Err(err).Int("status", resp.StatusCode).Msg("Caddy configuration update failed")
 		}
-		i.FailureCount++
 		return &errors.ErrConfigurationFailed{
 			NodeName: i.NodeName,
 			Reason:   "non-2xx response",
@@ -195,6 +185,5 @@ func (i *Instance) UpdateConfig(configData string, method CommunicationMethod, a
 		}
 	}
 	logger.Info().Msg("Successfully updated Caddy configuration")
-	i.FailureCount = 0
 	return nil
 }

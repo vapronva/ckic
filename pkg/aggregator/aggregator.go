@@ -49,8 +49,8 @@ func (a *NamespaceAggregator) UpdateBase(base string) {
 	logger := log.With().Str("component", "aggregator").Logger()
 	a.mu.Lock()
 	a.base = base
+	merged := a.currentMergedLocked()
 	a.mu.Unlock()
-	merged := a.CurrentMerged()
 	if a.publishAggregated {
 		if err := a.publishMirrorConfigMap(merged); err != nil {
 			logger.Error().Err(err).Msg("Failed to publish aggregated ConfigMap")
@@ -69,9 +69,9 @@ func (a *NamespaceAggregator) SetExternal(namespace, fragment string) {
 	logger := log.With().Str("component", "aggregator").Str("namespace", namespace).Logger()
 	a.mu.Lock()
 	a.externals[namespace] = fragment
+	merged := a.currentMergedLocked()
 	a.mu.Unlock()
 	logger.Info().Msg("External fragment updated")
-	merged := a.CurrentMerged()
 	if a.publishAggregated {
 		if err := a.publishMirrorConfigMap(merged); err != nil {
 			logger.Error().Err(err).Msg("Failed to publish aggregated ConfigMap")
@@ -90,9 +90,9 @@ func (a *NamespaceAggregator) RemoveExternal(namespace string) {
 	logger := log.With().Str("component", "aggregator").Str("namespace", namespace).Logger()
 	a.mu.Lock()
 	delete(a.externals, namespace)
+	merged := a.currentMergedLocked()
 	a.mu.Unlock()
 	logger.Info().Msg("External fragment removed")
-	merged := a.CurrentMerged()
 	if a.publishAggregated {
 		if err := a.publishMirrorConfigMap(merged); err != nil {
 			logger.Error().Err(err).Msg("Failed to publish aggregated ConfigMap")
@@ -107,9 +107,7 @@ func (a *NamespaceAggregator) RemoveExternal(namespace string) {
 	}
 }
 
-func (a *NamespaceAggregator) CurrentMerged() string {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
+func (a *NamespaceAggregator) currentMergedLocked() string {
 	merged := a.base
 	if !strings.HasSuffix(merged, "\n") {
 		merged += "\n"
@@ -129,6 +127,12 @@ func (a *NamespaceAggregator) CurrentMerged() string {
 		merged += fmt.Sprintf("\n# ---- End external from %s ----\n", ns)
 	}
 	return merged
+}
+
+func (a *NamespaceAggregator) CurrentMerged() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.currentMergedLocked()
 }
 
 func (a *NamespaceAggregator) publishMirrorConfigMap(mergedConfig string) error {

@@ -17,18 +17,21 @@ func ParseExternalEndpoints(endpoints []string, endpointsFile string) (ExternalE
 		if err != nil {
 			return nil, fmt.Errorf("failed to read external endpoints file: %w", err)
 		}
-		if err := json.Unmarshal(fileData, &result); err != nil {
+		var rawResult map[string][]string
+		if err := json.Unmarshal(fileData, &rawResult); err != nil {
 			return nil, fmt.Errorf("failed to parse external endpoints JSON: %w", err)
 		}
-		for nodeName, ips := range result {
-			if strings.TrimSpace(nodeName) == "" {
+		for nodeName, ips := range rawResult {
+			trimmedNodeName := strings.TrimSpace(nodeName)
+			if trimmedNodeName == "" {
 				return nil, fmt.Errorf("node name cannot be empty in external endpoints file")
 			}
 			for _, ip := range ips {
 				if !isValidIP(ip) {
-					return nil, fmt.Errorf("invalid IP address in file for node %s: %s", nodeName, ip)
+					return nil, fmt.Errorf("invalid IP address in file for node %s: %s", trimmedNodeName, ip)
 				}
 			}
+			result[trimmedNodeName] = ips
 		}
 	}
 	for _, endpoint := range endpoints {

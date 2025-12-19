@@ -10,16 +10,17 @@ import (
 )
 
 type WatcherCoordinator struct {
-	mu                sync.RWMutex
+	mu                *sync.RWMutex
 	nodeWatcher       *watcher.NodeWatcher
 	configWatcher     *watcher.ConfigWatcher
 	deployedInstances map[string]*caddy.Instance
 }
 
 func NewWatcherCoordinator(nodeWatcher *watcher.NodeWatcher, configWatcher *watcher.ConfigWatcher,
-	deployedInstances map[string]*caddy.Instance,
+	deployedInstances map[string]*caddy.Instance, mu *sync.RWMutex,
 ) *WatcherCoordinator {
 	return &WatcherCoordinator{
+		mu:                mu,
 		nodeWatcher:       nodeWatcher,
 		configWatcher:     configWatcher,
 		deployedInstances: deployedInstances,

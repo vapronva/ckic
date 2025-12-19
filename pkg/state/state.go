@@ -83,5 +83,10 @@ func (s *ConfigMapStateStore) LoadState() (map[string]*caddy.Instance, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to unmarshal state: %w", err)
 	}
+	for _, instance := range stateMap {
+		if clientset, ok := s.Client.(*kubernetes.Clientset); ok {
+			instance.KubeClient = clientset
+		}
+	}
 	return stateMap, nil
 }

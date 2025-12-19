@@ -74,7 +74,7 @@ func (w *NodeWatcher) Start(ctx context.Context) {
 				})
 			}
 			watcher, err := w.clientset.CoreV1().Nodes().Watch(ctx, metav1.ListOptions{
-				Watch: true,
+				LabelSelector: w.labelKey + "=" + w.labelValue,
 			})
 			if err != nil {
 				logger.Error().Err(err).Msg("Failed to create node watcher")
@@ -98,8 +98,18 @@ func (w *NodeWatcher) Start(ctx context.Context) {
 					logger.Warn().Msg("Unexpected object type in node watcher")
 					continue
 				}
-				hasLabel := node.Labels[w.labelKey] == w.labelValue
 				wasTracked := currentNodes[node.Name]
+				if event.Type == watch.Deleted {
+					if wasTracked {
+						delete(currentNodes, node.Name)
+						w.nodeHandler(NodeEvent{
+							Type:     NodeRemoved,
+							NodeName: node.Name,
+						})
+					}
+					continue
+				}
+				hasLabel := node.Labels[w.labelKey] == w.labelValue
 				if hasLabel && !wasTracked {
 					currentNodes[node.Name] = true
 					w.nodeHandler(NodeEvent{

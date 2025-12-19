@@ -127,7 +127,6 @@ func (w *ExternalConfigWatcher) Start(ctx context.Context) {
 					time.Sleep(sleepTime)
 				}
 				w.failureCount = 0
-				w.initialList(ctx, logger)
 			} else {
 				time.Sleep(delay)
 				delay = minExternalDuration(time.Duration(float64(delay)*multiplier), maxDelay)

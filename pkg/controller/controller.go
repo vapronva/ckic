@@ -145,7 +145,7 @@ func NewController(clientset *kubernetes.Clientset, config ControllerConfig) (*C
 			nodeAvailabilityCheck,
 		)
 	}
-	coordinator := NewWatcherCoordinator(nodeWatcher, configWatcher, deployedInstances)
+	coordinator := NewWatcherCoordinator(nodeWatcher, configWatcher, deployedInstances, mutex)
 	nodeHandler.SetNodeChangeNotifier(coordinator.NotifyNodeChange)
 	stateStore := state.NewConfigMapStateStore(clientset, config.ConfigMapNamespace, constants.StateConfigMapName)
 	ctrl := &Controller{
@@ -244,10 +244,8 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 	}
 	if c.config.PreferSavedState && len(savedState) > 0 {
 		logger.Info().Msg("PreferSavedState is enabled. Merging saved state with discovered state, preferring saved state")
-		for node := range discovered {
-			if savedInst, exists := savedState[node]; exists {
-				discovered[node] = savedInst
-			}
+		for node, savedInst := range savedState {
+			discovered[node] = savedInst
 		}
 	} else {
 		logger.Info().Msg("Using discovered state")

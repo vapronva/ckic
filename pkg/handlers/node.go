@@ -42,6 +42,8 @@ type NodeHandler struct {
 	UseHostNetwork     bool
 	HTTPHostPort       int
 	HTTPSHostPort      int
+	inProgressNodes    map[string]struct{}
+	inProgressNodesMu  sync.Mutex
 }
 
 func NewNodeHandler(
@@ -77,6 +79,7 @@ func NewNodeHandler(
 		UseHostNetwork:     useHostNetwork,
 		HTTPHostPort:       httpHostPort,
 		HTTPSHostPort:      httpsHostPort,
+		inProgressNodes:    make(map[string]struct{}),
 	}
 }
 
@@ -130,6 +133,21 @@ func (h *NodeHandler) Handle(event watcher.NodeEvent) {
 	logger := log.With().Str("node", nodeName).Logger()
 	switch event.Type {
 	case watcher.NodeAdded:
+		h.Mu.RLock()
+		_, alreadyDeployed := h.DeployedInstances[nodeName]
+		h.Mu.RUnlock()
+		if alreadyDeployed {
+			logger.Debug().Msg("Node already has a Caddy deployment, skipping")
+			return
+		}
+		h.inProgressNodesMu.Lock()
+		if _, inProgress := h.inProgressNodes[nodeName]; inProgress {
+			h.inProgressNodesMu.Unlock()
+			logger.Debug().Msg("Deployment already in progress for node, skipping")
+			return
+		}
+		h.inProgressNodes[nodeName] = struct{}{}
+		h.inProgressNodesMu.Unlock()
 		logger.Info().Msg("Detected new node, deploying Caddy")
 		resultCh := make(chan *deploymentResult, 1)
 		externalIPs, exists := h.ExternalEndpoints[nodeName]
@@ -143,6 +161,9 @@ func (h *NodeHandler) Handle(event watcher.NodeEvent) {
 		}
 		go func() {
 			result := <-resultCh
+			h.inProgressNodesMu.Lock()
+			delete(h.inProgressNodes, nodeName)
+			h.inProgressNodesMu.Unlock()
 			if result.err != nil {
 				logger.Error().Err(result.err).Msg("Failed to deploy Caddy instance")
 				return
@@ -156,8 +177,8 @@ func (h *NodeHandler) Handle(event watcher.NodeEvent) {
 			}
 		}()
 	case watcher.NodeRemoved:
+		var shouldNotify bool
 		h.Mu.Lock()
-		defer h.Mu.Unlock()
 		if instance, exists := h.DeployedInstances[nodeName]; exists {
 			logger.Info().Msg("Node removed, cleaning up Caddy instance")
 			if err := instance.Delete(); err != nil {
@@ -166,9 +187,11 @@ func (h *NodeHandler) Handle(event watcher.NodeEvent) {
 				delete(h.DeployedInstances, nodeName)
 				logger.Info().Msg("Successfully removed Caddy instance")
 			}
-			if h.nodeChangeNotifier != nil {
-				h.nodeChangeNotifier()
-			}
+			shouldNotify = h.nodeChangeNotifier != nil
+		}
+		h.Mu.Unlock()
+		if shouldNotify {
+			h.nodeChangeNotifier()
 		}
 	}
 }

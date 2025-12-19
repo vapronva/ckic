@@ -180,8 +180,10 @@ func (w *ConfigWatcher) Start(ctx context.Context) {
 			if event.Type == watch.Error {
 				if status, ok := event.Object.(*metav1.Status); ok && status.Code == 410 {
 					logger.Info().Int32("code", status.Code).Msg("Received watch timeout (410); ignoring because we restart with an empty resourceVersion")
+				} else if status, ok := event.Object.(*metav1.Status); ok {
+					logger.Error().Int32("code", status.Code).Str("reason", string(status.Reason)).Str("message", status.Message).Msg("Error in ConfigMap watch channel")
 				} else {
-					logger.Error().Err(err).Msg("Error in ConfigMap watch channel")
+					logger.Error().Msg("Error in ConfigMap watch channel")
 				}
 				break
 			}
