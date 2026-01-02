@@ -4,7 +4,7 @@ replicaCount: 1
 image:
   repository: rg.gl.vprw.ru
   image: vapronva/ckic/manager
-  tag: 0.13.0
+  tag: 0.13.1
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
