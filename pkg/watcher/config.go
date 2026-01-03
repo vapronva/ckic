@@ -23,10 +23,11 @@ type ConfigWatcher struct {
 	configHandler       ConfigHandlerFunc
 	lastResourceVersion string
 
-	nodeAvailableCheck func() bool
-	isPaused           bool
-	cachedConfig       string
-	hasCachedConfig    bool
+	nodeAvailableCheck  func() bool
+	isPaused            bool
+	cachedConfig        string
+	hasCachedConfig     bool
+	lastProcessedConfig string
 
 	failureCount int
 	maxFailures  int
@@ -62,7 +63,12 @@ func (w *ConfigWatcher) Resume() {
 		w.isPaused = false
 		log.Info().Msg("ConfigMap watcher resumed")
 		if w.hasCachedConfig && w.nodeAvailableCheck() {
-			w.configHandler(w.cachedConfig)
+			if w.cachedConfig != w.lastProcessedConfig {
+				w.configHandler(w.cachedConfig)
+				w.lastProcessedConfig = w.cachedConfig
+			} else {
+				log.Debug().Msg("Cached config unchanged, skipping handler on resume")
+			}
 			w.hasCachedConfig = false
 		}
 	}
@@ -83,9 +89,14 @@ func (w *ConfigWatcher) refreshResourceVersion(ctx context.Context, logger zerol
 	w.lastResourceVersion = cm.ResourceVersion
 	logger.Info().Str("resourceVersion", w.lastResourceVersion).Msg("Resource version refreshed")
 	if configData, exists := cm.Data["Caddyfile"]; exists {
+		if configData == w.lastProcessedConfig {
+			logger.Debug().Msg("Refreshed ConfigMap content unchanged, skipping handler")
+			return nil
+		}
 		if w.nodeAvailableCheck() {
 			logger.Info().Msg("Refreshed ConfigMap loaded, updating configuration")
 			w.configHandler(configData)
+			w.lastProcessedConfig = configData
 			w.lastSuccess = time.Now()
 		} else {
 			logger.Info().Msg("Refreshed ConfigMap loaded but no eligible nodes, caching config")
@@ -120,6 +131,7 @@ func (w *ConfigWatcher) Start(ctx context.Context) {
 			logger.Info().Msg("Initial ConfigMap loaded")
 			if w.nodeAvailableCheck() {
 				w.configHandler(configData)
+				w.lastProcessedConfig = configData
 			} else {
 				logger.Info().Msg("No eligible nodes available, caching initial config")
 				w.cachedConfig = configData
@@ -194,12 +206,15 @@ func (w *ConfigWatcher) Start(ctx context.Context) {
 			}
 			if event.Type == watch.Added || event.Type == watch.Modified {
 				if configData, exists := cm.Data["Caddyfile"]; exists {
+					if configData == w.lastProcessedConfig {
+						logger.Debug().Str("event", string(event.Type)).Msg("ConfigMap content unchanged, skipping handler")
+						continue
+					}
 					if w.nodeAvailableCheck() {
 						logger.Info().Str("event", string(event.Type)).
 							Msg("ConfigMap updated, notifying handlers")
-						if !w.isPaused {
-							w.configHandler(configData)
-						}
+						w.configHandler(configData)
+						w.lastProcessedConfig = configData
 						w.lastSuccess = time.Now()
 						w.failureCount = 0
 					} else {

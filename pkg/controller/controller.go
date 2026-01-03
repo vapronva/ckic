@@ -244,8 +244,11 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 	}
 	if c.config.PreferSavedState && len(savedState) > 0 {
 		logger.Info().Msg("PreferSavedState is enabled. Merging saved state with discovered state, preferring saved state")
-		for node, savedInst := range savedState {
-			discovered[node] = savedInst
+		for node := range discovered {
+			if savedInst, exists := savedState[node]; exists {
+				discovered[node].FailureCount = savedInst.FailureCount
+				logger.Debug().Str("node", node).Int("failureCount", savedInst.FailureCount).Msg("Restored FailureCount from saved state")
+			}
 		}
 	} else {
 		logger.Info().Msg("Using discovered state")

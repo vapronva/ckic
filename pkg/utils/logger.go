@@ -16,10 +16,7 @@ func SetupLogger(level zerolog.Level) {
 			TimeFormat: time.RFC3339,
 		})
 	}
-	log.Logger = log.With().
-		Str("service", "ckic-manager").
-		Timestamp().
-		Logger()
+	log.Logger = log.With().Str("service", "ckic-manager").Logger()
 }
 
 func NodeLogger(nodeName string) zerolog.Logger {

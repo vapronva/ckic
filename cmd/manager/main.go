@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -110,12 +109,11 @@ func main() {
 	defer cancel()
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 	go func() {
 		sig := <-sigCh
 		log.Info().Str("signal", sig.String()).Msg("Received termination signal, shutting down")
 		cancel()
-		time.Sleep(5 * time.Second)
-		os.Exit(0)
 	}()
 	log.Info().Msg("Starting CKIC manager")
 	if err := ctrl.Run(ctx); err != nil {

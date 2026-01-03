@@ -34,7 +34,10 @@ func (wc *WatcherCoordinator) HasAvailableNodes() bool {
 }
 
 func (wc *WatcherCoordinator) NotifyNodeChange() {
-	if wc.HasAvailableNodes() {
+	wc.mu.RLock()
+	hasNodes := len(wc.deployedInstances) > 0
+	wc.mu.RUnlock()
+	if hasNodes {
 		wc.configWatcher.Resume()
 	} else {
 		wc.configWatcher.Pause()

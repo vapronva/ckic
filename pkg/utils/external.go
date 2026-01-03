@@ -31,7 +31,7 @@ func ParseExternalEndpoints(endpoints []string, endpointsFile string) (ExternalE
 					return nil, fmt.Errorf("invalid IP address in file for node %s: %s", trimmedNodeName, ip)
 				}
 			}
-			result[trimmedNodeName] = ips
+			result[trimmedNodeName] = append(result[trimmedNodeName], ips...)
 		}
 	}
 	for _, endpoint := range endpoints {

@@ -21,20 +21,21 @@ type ExternalConfigUpdateFunc func(namespace, fragment string)
 type ExternalConfigRemoveFunc func(namespace string)
 
 type ExternalConfigWatcher struct {
-	clientset           *kubernetes.Clientset
-	ownNamespace        string
-	configMapName       string
-	labelSelector       string
-	nsMode              string
-	allowedNamespaces   map[string]bool
-	deniedNamespaces    map[string]bool
-	onUpdate            ExternalConfigUpdateFunc
-	onRemove            ExternalConfigRemoveFunc
-	lastResourceVersion string
-	failureCount        int
-	maxFailures         int
-	resetTimeout        time.Duration
-	lastSuccess         time.Time
+	clientset            *kubernetes.Clientset
+	ownNamespace         string
+	configMapName        string
+	labelSelector        string
+	nsMode               string
+	allowedNamespaces    map[string]bool
+	deniedNamespaces     map[string]bool
+	onUpdate             ExternalConfigUpdateFunc
+	onRemove             ExternalConfigRemoveFunc
+	lastResourceVersion  string
+	lastProcessedConfigs map[string]string
+	failureCount         int
+	maxFailures          int
+	resetTimeout         time.Duration
+	lastSuccess          time.Time
 }
 
 func NewExternalConfigWatcher(
@@ -67,18 +68,19 @@ func NewExternalConfigWatcher(
 		}
 	}
 	return &ExternalConfigWatcher{
-		clientset:         clientset,
-		ownNamespace:      ownNamespace,
-		configMapName:     configMapName,
-		labelSelector:     labelSelector,
-		nsMode:            nsMode,
-		allowedNamespaces: allowedNs,
-		deniedNamespaces:  deniedNs,
-		onUpdate:          onUpdate,
-		onRemove:          onRemove,
-		maxFailures:       5,
-		resetTimeout:      5 * time.Minute,
-		lastSuccess:       time.Now(),
+		clientset:            clientset,
+		ownNamespace:         ownNamespace,
+		configMapName:        configMapName,
+		labelSelector:        labelSelector,
+		nsMode:               nsMode,
+		allowedNamespaces:    allowedNs,
+		deniedNamespaces:     deniedNs,
+		onUpdate:             onUpdate,
+		onRemove:             onRemove,
+		lastProcessedConfigs: make(map[string]string),
+		maxFailures:          5,
+		resetTimeout:         5 * time.Minute,
+		lastSuccess:          time.Now(),
 	}
 }
 
@@ -88,7 +90,7 @@ func (w *ExternalConfigWatcher) isNamespaceAllowed(namespace string) bool {
 	}
 	switch w.nsMode {
 	case "all":
-		return !w.deniedNamespaces[namespace]
+		return true
 	case "allow":
 		return w.allowedNamespaces[namespace]
 	case "deny":
@@ -164,6 +166,10 @@ func (w *ExternalConfigWatcher) Start(ctx context.Context) {
 			case watch.Added, watch.Modified:
 				if fragment, exists := cm.Data["Caddyfile"]; exists {
 					sourceKey := fmt.Sprintf("%s/%s", cm.Namespace, cm.Name)
+					if w.lastProcessedConfigs[sourceKey] == fragment {
+						logger.Debug().Str("event", string(event.Type)).Str("namespace", cm.Namespace).Str("name", cm.Name).Msg("External ConfigMap content unchanged, skipping")
+						continue
+					}
 					logger.Info().
 						Str("event", string(event.Type)).
 						Str("namespace", cm.Namespace).
@@ -172,6 +178,7 @@ func (w *ExternalConfigWatcher) Start(ctx context.Context) {
 					if w.onUpdate != nil {
 						w.onUpdate(sourceKey, fragment)
 					}
+					w.lastProcessedConfigs[sourceKey] = fragment
 					w.lastSuccess = time.Now()
 					w.failureCount = 0
 				} else {
@@ -183,6 +190,7 @@ func (w *ExternalConfigWatcher) Start(ctx context.Context) {
 				if w.onRemove != nil {
 					w.onRemove(sourceKey)
 				}
+				delete(w.lastProcessedConfigs, sourceKey)
 				w.lastSuccess = time.Now()
 				w.failureCount = 0
 			}
@@ -214,6 +222,7 @@ func (w *ExternalConfigWatcher) initialList(ctx context.Context, logger zerolog.
 			if w.onUpdate != nil {
 				w.onUpdate(sourceKey, fragment)
 			}
+			w.lastProcessedConfigs[sourceKey] = fragment
 		}
 	}
 	w.lastSuccess = time.Now()

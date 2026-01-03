@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
@@ -62,6 +63,23 @@ func (s *ConfigMapStateStore) SaveState(state map[string]*caddy.Instance) error 
 		_, err = s.Client.CoreV1().ConfigMaps(s.Namespace).Create(
 			context.Background(), cm, metav1.CreateOptions{})
 		if err != nil {
+			if apierrors.IsAlreadyExists(err) {
+				cm, getErr := s.Client.CoreV1().ConfigMaps(s.Namespace).Get(
+					context.Background(), s.Name, metav1.GetOptions{})
+				if getErr != nil {
+					return fmt.Errorf("failed to get state ConfigMap after create conflict: %w", getErr)
+				}
+				if cm.Data == nil {
+					cm.Data = make(map[string]string)
+				}
+				cm.Data[constants.StateKey] = string(data)
+				_, err = s.Client.CoreV1().ConfigMaps(s.Namespace).Update(
+					context.Background(), cm, metav1.UpdateOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to update state ConfigMap after create conflict: %w", err)
+				}
+				return nil
+			}
 			return fmt.Errorf("failed to create state ConfigMap: %w", err)
 		}
 	}

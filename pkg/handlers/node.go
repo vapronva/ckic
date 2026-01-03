@@ -44,6 +44,7 @@ type NodeHandler struct {
 	HTTPSHostPort      int
 	inProgressNodes    map[string]struct{}
 	inProgressNodesMu  sync.Mutex
+	removedNodes       map[string]struct{}
 }
 
 func NewNodeHandler(
@@ -80,6 +81,7 @@ func NewNodeHandler(
 		HTTPHostPort:       httpHostPort,
 		HTTPSHostPort:      httpsHostPort,
 		inProgressNodes:    make(map[string]struct{}),
+		removedNodes:       make(map[string]struct{}),
 	}
 }
 
@@ -142,8 +144,9 @@ func (h *NodeHandler) Handle(event watcher.NodeEvent) {
 		}
 		h.inProgressNodesMu.Lock()
 		if _, inProgress := h.inProgressNodes[nodeName]; inProgress {
+			delete(h.removedNodes, nodeName)
 			h.inProgressNodesMu.Unlock()
-			logger.Debug().Msg("Deployment already in progress for node, skipping")
+			logger.Debug().Msg("Deployment already in progress for node, cleared removal flag")
 			return
 		}
 		h.inProgressNodes[nodeName] = struct{}{}
@@ -163,9 +166,20 @@ func (h *NodeHandler) Handle(event watcher.NodeEvent) {
 			result := <-resultCh
 			h.inProgressNodesMu.Lock()
 			delete(h.inProgressNodes, nodeName)
+			_, wasRemoved := h.removedNodes[nodeName]
+			if wasRemoved {
+				delete(h.removedNodes, nodeName)
+			}
 			h.inProgressNodesMu.Unlock()
 			if result.err != nil {
 				logger.Error().Err(result.err).Msg("Failed to deploy Caddy instance")
+				return
+			}
+			if wasRemoved {
+				logger.Info().Msg("Node was removed during deployment, cleaning up")
+				if err := result.instance.Delete(); err != nil {
+					logger.Error().Err(err).Msg("Failed to delete Caddy instance after removal")
+				}
 				return
 			}
 			h.Mu.Lock()
@@ -178,6 +192,14 @@ func (h *NodeHandler) Handle(event watcher.NodeEvent) {
 		}()
 	case watcher.NodeRemoved:
 		var shouldNotify bool
+		h.inProgressNodesMu.Lock()
+		if _, inProgress := h.inProgressNodes[nodeName]; inProgress {
+			h.removedNodes[nodeName] = struct{}{}
+			h.inProgressNodesMu.Unlock()
+			logger.Info().Msg("Node removed while deployment in progress, marking for cleanup")
+			return
+		}
+		h.inProgressNodesMu.Unlock()
 		h.Mu.Lock()
 		if instance, exists := h.DeployedInstances[nodeName]; exists {
 			logger.Info().Msg("Node removed, cleaning up Caddy instance")
