@@ -1,4 +1,4 @@
-FROM docker-registry.selectel.ru/library/golang:1.25-alpine AS build
+FROM docker-registry.selectel.ru/library/golang:1.26rc1-alpine AS build
 
 WORKDIR /usr/src/app/ckic
 

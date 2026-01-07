@@ -18,6 +18,7 @@ include:
   - component: gl.vprw.ru/ci/golang/init-vet@1
     inputs:
       job_name: init + format + vet
+      golang_version: 1.26rc1
   - component: gl.vprw.ru/ci/docker/build-buildah@3
     inputs:
       job_name: build container image
@@ -25,6 +26,7 @@ include:
       ci_image_name: manager
       ci_image_tags: latest,$CI_COMMIT_REF_NAME
       dockerfile_path: Dockerfile
+      golang_version: 1.26rc1
   - component: gl.vprw.ru/ci/container-scanning/cs@1
     inputs:
       job_name: container scanning (latest)
@@ -38,7 +40,7 @@ include:
 
 go test:
   stage: test
-  image: docker-registry.selectel.ru/library/golang:1.25
+  image: docker-registry.selectel.ru/library/golang:1.26rc1
   needs:
     - job: init + format + vet
       artifacts: true
