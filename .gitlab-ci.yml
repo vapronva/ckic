@@ -26,7 +26,6 @@ include:
       ci_image_name: manager
       ci_image_tags: latest,$CI_COMMIT_REF_NAME
       dockerfile_path: Dockerfile
-      golang_version: 1.26rc1
   - component: gl.vprw.ru/ci/container-scanning/cs@1
     inputs:
       job_name: container scanning (latest)
@@ -37,6 +36,7 @@ include:
     inputs:
       job_name: compile binaries
       working_dir: cmd/manager
+      golang_version: 1.26rc1
 
 go test:
   stage: test
