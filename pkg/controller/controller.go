@@ -210,6 +210,7 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 				LabelSelector: "app=caddy,instance=" + nodeName,
 			})
 			if errPL != nil || len(podList.Items) == 0 {
+				// bearer:disable go_lang_logger_leak
 				logger.Warn().Msgf("No pods found for healthy deployment on node %s", nodeName)
 				continue
 			}
@@ -222,8 +223,10 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 				KubeClient:     c.clientset,
 			}
 			discovered[nodeName] = instance
+			// bearer:disable go_lang_logger_leak
 			logger.Info().Msgf("Adopted existing healthy deployment on node %s", nodeName)
 		} else {
+			// bearer:disable go_lang_logger_leak
 			logger.Warn().Msgf("Deployment on node %s is not healthy, deleting orphaned deployment", nodeName)
 			instance := &caddy.Instance{
 				NodeName:       nodeName,
@@ -233,8 +236,10 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 				KubeClient:     c.clientset,
 			}
 			if errID := instance.Delete(); errID != nil {
+				// bearer:disable go_lang_logger_leak
 				logger.Error().Err(errID).Msgf("Failed to delete orphaned deployment on node %s", nodeName)
 			} else {
+				// bearer:disable go_lang_logger_leak
 				logger.Info().Msgf("Deleted orphaned deployment on node %s", nodeName)
 			}
 		}

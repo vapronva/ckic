@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -13,7 +14,11 @@ type ExternalEndpointsMap map[string][]string
 func ParseExternalEndpoints(endpoints []string, endpointsFile string) (ExternalEndpointsMap, error) {
 	result := make(ExternalEndpointsMap)
 	if endpointsFile != "" {
-		fileData, err := os.ReadFile(endpointsFile)
+		cleanPath := filepath.Clean(endpointsFile)
+		if !filepath.IsAbs(cleanPath) {
+			return nil, fmt.Errorf("external endpoints file must be an absolute path: %s", endpointsFile)
+		}
+		fileData, err := os.ReadFile(cleanPath) // #nosec G304
 		if err != nil {
 			return nil, fmt.Errorf("failed to read external endpoints file: %w", err)
 		}

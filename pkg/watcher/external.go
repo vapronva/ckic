@@ -125,6 +125,7 @@ func (w *ExternalConfigWatcher) Start(ctx context.Context) {
 			if w.failureCount >= w.maxFailures {
 				sleepTime := w.resetTimeout - time.Since(w.lastSuccess)
 				if sleepTime > 0 {
+					// bearer:disable go_lang_logger_leak
 					logger.Warn().Msgf("Circuit breaker open, sleeping for %v", sleepTime)
 					time.Sleep(sleepTime)
 				}

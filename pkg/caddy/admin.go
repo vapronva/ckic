@@ -49,11 +49,11 @@ func waitForCaddyAPIReady(ctx context.Context, adminURL string, apiConfig *Admin
 			}
 			resp, err := client.Do(req)
 			if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 500 {
-				resp.Body.Close()
+				_ = resp.Body.Close()
 				return nil
 			}
 			if err == nil {
-				resp.Body.Close()
+				_ = resp.Body.Close()
 			}
 			log.Debug().Str("adminURL", adminURL).Msgf("Caddy Admin API not ready, retrying in %v", delay)
 			delay = min(time.Duration(float64(delay)*multiplier), maxDelay)
@@ -147,7 +147,8 @@ func (i *Instance) UpdateConfig(ctx context.Context, configData string, method C
 	client := &http.Client{
 		Timeout: 30 * time.Second,
 	}
-	req, err := http.NewRequest("POST", adminURL, bytes.NewBufferString(configData))
+	// #nosec G107
+	req, err := http.NewRequestWithContext(ctx, "POST", adminURL, bytes.NewBufferString(configData))
 	if err != nil {
 		logger.Error().Err(err).Msg("Failed to create HTTP request")
 		return &errors.ErrConfigurationFailed{
@@ -170,7 +171,7 @@ func (i *Instance) UpdateConfig(ctx context.Context, configData string, method C
 			Err:      err,
 		}
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		logger.Error().Err(err).Msg("Failed to read response body")

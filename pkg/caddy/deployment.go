@@ -494,8 +494,12 @@ func waitForDeploymentReady(ctx context.Context, clientset *kubernetes.Clientset
 
 func cleanupDeployment(ctx context.Context, clientset *kubernetes.Clientset, instance *Instance) {
 	log.Warn().Str("deployment", instance.DeploymentName).Msg("Cleaning up failed deployment")
-	clientset.CoreV1().Services(instance.Namespace).Delete(ctx, instance.ServiceName, metav1.DeleteOptions{})
-	clientset.AppsV1().Deployments(instance.Namespace).Delete(ctx, instance.DeploymentName, metav1.DeleteOptions{})
+	if err := clientset.CoreV1().Services(instance.Namespace).Delete(ctx, instance.ServiceName, metav1.DeleteOptions{}); err != nil {
+		log.Debug().Err(err).Str("service", instance.ServiceName).Msg("Failed to delete service during cleanup")
+	}
+	if err := clientset.AppsV1().Deployments(instance.Namespace).Delete(ctx, instance.DeploymentName, metav1.DeleteOptions{}); err != nil {
+		log.Debug().Err(err).Str("deployment", instance.DeploymentName).Msg("Failed to delete deployment during cleanup")
+	}
 }
 
 func hostPathTypePtr(t corev1.HostPathType) *corev1.HostPathType {

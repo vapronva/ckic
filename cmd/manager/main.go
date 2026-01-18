@@ -52,6 +52,7 @@ func main() {
 	case "hostnetwork":
 		commMethod = caddy.CommunicationMethodHostNetwork
 	default:
+		// bearer:disable go_lang_logger_leak
 		log.Warn().Msgf("Unknown communication method %s, defaulting to clusterip", *communicationMethod)
 		commMethod = caddy.CommunicationMethodClusterIP
 	}

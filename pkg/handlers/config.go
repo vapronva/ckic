@@ -124,6 +124,7 @@ func (h *ConfigHandler) Handle(configData string) {
 	}
 	wg.Wait()
 	if len(failedNodes) > 0 {
+		// bearer:disable go_lang_logger_leak
 		logger.Info().Msgf("Redeploying %d failed instances", len(failedNodes))
 		for _, nodeName := range failedNodes {
 			h.Mu.RLock()
