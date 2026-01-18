@@ -180,8 +180,10 @@ func (c *Controller) Run(ctx context.Context) error {
 		go c.externalWatcher.Start(ctx)
 	}
 	go c.runPeriodicConfigReconciliation(ctx)
+	go c.runPeriodicStatePersistence(ctx)
 	<-ctx.Done()
 	log.Info().Msg("Controller shutting down")
+	c.persistStateOnShutdown()
 	return nil
 }
 
@@ -217,7 +219,6 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 				DeploymentName: dep.Name,
 				ServiceName:    dep.Name,
 				PodName:        podList.Items[0].Name,
-				FailureCount:   0,
 				KubeClient:     c.clientset,
 			}
 			discovered[nodeName] = instance
@@ -246,8 +247,8 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 		logger.Info().Msg("PreferSavedState is enabled. Merging saved state with discovered state, preferring saved state")
 		for node := range discovered {
 			if savedInst, exists := savedState[node]; exists {
-				discovered[node].FailureCount = savedInst.FailureCount
-				logger.Debug().Str("node", node).Int("failureCount", savedInst.FailureCount).Msg("Restored FailureCount from saved state")
+				discovered[node].FailureCount.Store(savedInst.FailureCount.Load())
+				logger.Debug().Str("node", node).Int32("failureCount", savedInst.FailureCount.Load()).Msg("Restored FailureCount from saved state")
 			}
 		}
 	} else {
@@ -325,5 +326,48 @@ func (c *Controller) runPeriodicConfigReconciliation(ctx context.Context) {
 			}
 			logger.Info().Msg("Periodic configuration reconciliation completed")
 		}
+	}
+}
+
+func (c *Controller) runPeriodicStatePersistence(ctx context.Context) {
+	ticker := time.NewTicker(2 * time.Minute)
+	defer ticker.Stop()
+	logger := log.With().Str("component", "state_persistence").Logger()
+	logger.Info().Msg("Starting periodic state persistence (every 2 minutes)")
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			c.instancesMutex.RLock()
+			instanceCount := len(c.deployedInstances)
+			c.instancesMutex.RUnlock()
+			if instanceCount == 0 {
+				logger.Debug().Msg("No deployed instances, skipping state persistence")
+				continue
+			}
+			if err := c.stateStore.SaveState(c.deployedInstances); err != nil {
+				logger.Error().Err(err).Msg("Failed to persist state during periodic save")
+			} else {
+				logger.Debug().Int("instances", instanceCount).Msg("Periodic state persistence completed")
+			}
+		}
+	}
+}
+
+func (c *Controller) persistStateOnShutdown() {
+	logger := log.With().Str("component", "state_persistence").Logger()
+	logger.Info().Msg("Persisting state before shutdown")
+	c.instancesMutex.RLock()
+	instanceCount := len(c.deployedInstances)
+	c.instancesMutex.RUnlock()
+	if instanceCount == 0 {
+		logger.Info().Msg("No deployed instances, skipping shutdown state persistence")
+		return
+	}
+	if err := c.stateStore.SaveState(c.deployedInstances); err != nil {
+		logger.Error().Err(err).Msg("Failed to persist state during shutdown")
+	} else {
+		logger.Info().Int("instances", instanceCount).Msg("State persisted successfully before shutdown")
 	}
 }

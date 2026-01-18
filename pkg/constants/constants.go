@@ -17,4 +17,5 @@ const (
 
 	CaddyAPIInitialDelay = 5 * time.Second
 	CaddyAPIMaxDelay     = 600 * time.Second
+	CaddyAPIReadyTimeout = 5 * time.Minute
 )

@@ -27,35 +27,42 @@ type AdminAPIConfig struct {
 	OriginKey string
 }
 
-func waitForCaddyAPIReady(adminURL string, apiConfig *AdminAPIConfig) error {
+func waitForCaddyAPIReady(ctx context.Context, adminURL string, apiConfig *AdminAPIConfig) error {
 	initialDelay := constants.CaddyAPIInitialDelay
 	maxDelay := constants.CaddyAPIMaxDelay
 	delay := initialDelay
 	multiplier := 1.5
 	client := &http.Client{Timeout: 10 * time.Second}
+	ticker := time.NewTicker(delay)
+	defer ticker.Stop()
 	for {
-		req, err := http.NewRequest("GET", adminURL, nil)
-		if err != nil {
-			return fmt.Errorf("failed to create readiness request: %w", err)
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("context deadline exceeded while waiting for Caddy API: %w", ctx.Err())
+		case <-ticker.C:
+			req, err := http.NewRequestWithContext(ctx, "GET", adminURL, nil)
+			if err != nil {
+				return fmt.Errorf("failed to create readiness request: %w", err)
+			}
+			if apiConfig != nil && apiConfig.OriginKey != "" {
+				req.Header.Set("Origin", fmt.Sprintf("http://%s.caddy-admin-api.ckic.cmld.ru", apiConfig.OriginKey))
+			}
+			resp, err := client.Do(req)
+			if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 500 {
+				resp.Body.Close()
+				return nil
+			}
+			if err == nil {
+				resp.Body.Close()
+			}
+			log.Debug().Str("adminURL", adminURL).Msgf("Caddy Admin API not ready, retrying in %v", delay)
+			delay = min(time.Duration(float64(delay)*multiplier), maxDelay)
+			ticker.Reset(delay)
 		}
-		if apiConfig != nil && apiConfig.OriginKey != "" {
-			req.Header.Set("Origin", fmt.Sprintf("http://%s.caddy-admin-api.ckic.cmld.ru", apiConfig.OriginKey))
-		}
-		resp, err := client.Do(req)
-		if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 500 {
-			resp.Body.Close()
-			return nil
-		}
-		if err == nil {
-			resp.Body.Close()
-		}
-		log.Debug().Str("adminURL", adminURL).Msgf("Caddy Admin API not ready, retrying in %v", delay)
-		time.Sleep(delay)
-		delay = min(time.Duration(float64(delay)*multiplier), maxDelay)
 	}
 }
 
-func (i *Instance) UpdateConfig(configData string, method CommunicationMethod, apiConfig *AdminAPIConfig) error {
+func (i *Instance) UpdateConfig(ctx context.Context, configData string, method CommunicationMethod, apiConfig *AdminAPIConfig) error {
 	var adminURL string
 	logger := log.With().Str("node", i.NodeName).Str("pod", i.PodName).Str("method", fmt.Sprintf("%d", method)).Logger()
 	logger.Debug().Msg("Updating Caddy configuration")
@@ -63,7 +70,7 @@ func (i *Instance) UpdateConfig(configData string, method CommunicationMethod, a
 	case CommunicationMethodClusterIP:
 		adminURL = fmt.Sprintf("http://%s.%s.svc.cluster.local:2019/load", i.ServiceName, i.Namespace)
 	case CommunicationMethodDirect:
-		pod, err := i.KubeClient.CoreV1().Pods(i.Namespace).Get(context.Background(), i.PodName, metav1.GetOptions{})
+		pod, err := i.KubeClient.CoreV1().Pods(i.Namespace).Get(ctx, i.PodName, metav1.GetOptions{})
 		if err != nil {
 			logger.Error().Err(err).Msg("Failed to get pod information")
 			return &errors.ErrConfigurationFailed{
@@ -84,7 +91,7 @@ func (i *Instance) UpdateConfig(configData string, method CommunicationMethod, a
 		}
 		adminURL = fmt.Sprintf("http://%s:2019/load", podIP)
 	case CommunicationMethodHostNetwork:
-		node, err := i.KubeClient.CoreV1().Nodes().Get(context.Background(), i.NodeName, metav1.GetOptions{})
+		node, err := i.KubeClient.CoreV1().Nodes().Get(ctx, i.NodeName, metav1.GetOptions{})
 		if err != nil {
 			logger.Error().Err(err).Msg("Failed to get node information")
 			return &errors.ErrConfigurationFailed{
@@ -127,7 +134,9 @@ func (i *Instance) UpdateConfig(configData string, method CommunicationMethod, a
 			Err:      err,
 		}
 	}
-	if err := waitForCaddyAPIReady(adminURL, apiConfig); err != nil {
+	readyCtx, cancel := context.WithTimeout(ctx, constants.CaddyAPIReadyTimeout)
+	defer cancel()
+	if err := waitForCaddyAPIReady(readyCtx, adminURL, apiConfig); err != nil {
 		logger.Error().Err(err).Msg("Caddy Admin API not ready")
 		return &errors.ErrConfigurationFailed{
 			NodeName: i.NodeName,

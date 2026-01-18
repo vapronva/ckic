@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"io"
 	"os"
 	"time"
 
@@ -10,13 +11,14 @@ import (
 
 func SetupLogger(level zerolog.Level) {
 	zerolog.SetGlobalLevel(level)
+	var output io.Writer = os.Stdout
 	if os.Getenv("LOG_FORMAT") != "json" {
-		log.Logger = log.Output(zerolog.ConsoleWriter{
+		output = zerolog.ConsoleWriter{
 			Out:        os.Stdout,
 			TimeFormat: time.RFC3339,
-		})
+		}
 	}
-	log.Logger = log.With().Str("service", "ckic-manager").Logger()
+	log.Logger = log.Output(output).With().Str("service", "ckic-manager").Logger()
 }
 
 func NodeLogger(nodeName string) zerolog.Logger {

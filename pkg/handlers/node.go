@@ -164,25 +164,29 @@ func (h *NodeHandler) Handle(event watcher.NodeEvent) {
 		}
 		go func() {
 			result := <-resultCh
+			if result.err != nil {
+				h.inProgressNodesMu.Lock()
+				delete(h.inProgressNodes, nodeName)
+				h.inProgressNodesMu.Unlock()
+				logger.Error().Err(result.err).Msg("Failed to deploy Caddy instance")
+				return
+			}
 			h.inProgressNodesMu.Lock()
+			h.Mu.Lock()
 			delete(h.inProgressNodes, nodeName)
 			_, wasRemoved := h.removedNodes[nodeName]
 			if wasRemoved {
 				delete(h.removedNodes, nodeName)
 			}
 			h.inProgressNodesMu.Unlock()
-			if result.err != nil {
-				logger.Error().Err(result.err).Msg("Failed to deploy Caddy instance")
-				return
-			}
 			if wasRemoved {
+				h.Mu.Unlock()
 				logger.Info().Msg("Node was removed during deployment, cleaning up")
 				if err := result.instance.Delete(); err != nil {
 					logger.Error().Err(err).Msg("Failed to delete Caddy instance after removal")
 				}
 				return
 			}
-			h.Mu.Lock()
 			h.DeployedInstances[nodeName] = result.instance
 			h.Mu.Unlock()
 			logger.Info().Msg("Successfully deployed Caddy instance")

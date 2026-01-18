@@ -102,15 +102,15 @@ func (h *ConfigHandler) Handle(configData string) {
 					instanceLogger.Info().Int("retry", retry).Msg("Retrying configuration update")
 					time.Sleep(time.Duration(retry*2) * time.Second)
 				}
-				err = instance.UpdateConfig(configData, h.CommunicationMethod, apiConfig)
+				err = instance.UpdateConfig(context.Background(), configData, h.CommunicationMethod, apiConfig)
 				if err == nil {
 					break
 				}
 			}
 			if err != nil {
 				instanceLogger.Error().Err(err).Msg("Failed to update Caddy configuration")
-				instance.FailureCount++
-				if instance.FailureCount >= 5 {
+				newCount := instance.FailureCount.Add(1)
+				if newCount >= 5 {
 					instanceLogger.Warn().Msg("Too many update failures, marking for redeployment")
 					muFailed.Lock()
 					failedNodes = append(failedNodes, nodeName)
@@ -118,7 +118,7 @@ func (h *ConfigHandler) Handle(configData string) {
 				}
 			} else {
 				instanceLogger.Info().Msg("Successfully updated Caddy configuration")
-				instance.FailureCount = 0
+				instance.FailureCount.Store(0)
 			}
 		}(nodeName, instance)
 	}

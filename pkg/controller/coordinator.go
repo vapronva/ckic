@@ -11,6 +11,7 @@ import (
 
 type WatcherCoordinator struct {
 	mu                *sync.RWMutex
+	notifyMu          sync.Mutex
 	nodeWatcher       *watcher.NodeWatcher
 	configWatcher     *watcher.ConfigWatcher
 	deployedInstances map[string]*caddy.Instance
@@ -34,6 +35,8 @@ func (wc *WatcherCoordinator) HasAvailableNodes() bool {
 }
 
 func (wc *WatcherCoordinator) NotifyNodeChange() {
+	wc.notifyMu.Lock()
+	defer wc.notifyMu.Unlock()
 	wc.mu.RLock()
 	hasNodes := len(wc.deployedInstances) > 0
 	wc.mu.RUnlock()

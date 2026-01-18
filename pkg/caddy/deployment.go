@@ -8,7 +8,6 @@ import (
 	"github.com/rs/zerolog/log"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
@@ -41,7 +40,6 @@ func DeployCaddy(
 		Namespace:      namespace,
 		DeploymentName: deploymentName,
 		ServiceName:    deploymentName,
-		FailureCount:   0,
 		ExternalIPs:    externalIPs,
 		KubeClient:     clientset,
 	}
@@ -157,26 +155,6 @@ func deployDeployment(
 			corev1.ContainerPort{Name: "https-tcp", ContainerPort: 443, Protocol: corev1.ProtocolTCP},
 			corev1.ContainerPort{Name: "https-udp", ContainerPort: 443, Protocol: corev1.ProtocolUDP},
 		)
-	}
-	podDisruptionBudget := &policyv1.PodDisruptionBudget{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      instance.DeploymentName,
-			Namespace: instance.Namespace,
-			Labels: map[string]string{
-				"app":                        "caddy",
-				"instance":                   instance.NodeName,
-				"ckic.cmld.ru/caddy-managed": "true",
-			},
-		},
-		Spec: policyv1.PodDisruptionBudgetSpec{
-			MinAvailable: &intstr.IntOrString{Type: intstr.Int, IntVal: 1},
-			Selector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					"app":      "caddy",
-					"instance": instance.NodeName,
-				},
-			},
-		},
 	}
 	var envVars []corev1.EnvVar
 	if envSecretName != "" && len(envSecretKeys) > 0 {
@@ -338,22 +316,8 @@ func deployDeployment(
 		}
 		logger.Info().Msg("Created Caddy deployment")
 	}
-	existingPDB, err := clientset.PolicyV1().PodDisruptionBudgets(instance.Namespace).Get(ctx, instance.DeploymentName, metav1.GetOptions{})
-	if err == nil {
-		podDisruptionBudget.ResourceVersion = existingPDB.ResourceVersion
-		_, err = clientset.PolicyV1().PodDisruptionBudgets(instance.Namespace).Update(ctx, podDisruptionBudget, metav1.UpdateOptions{})
-		if err != nil {
-			logger.Error().Err(err).Msg("Failed to update existing Caddy PodDisruptionBudget")
-			return fmt.Errorf("failed to update PodDisruptionBudget %s: %w", instance.DeploymentName, err)
-		}
-		logger.Info().Msg("Updated existing Caddy PodDisruptionBudget")
-	} else {
-		_, err = clientset.PolicyV1().PodDisruptionBudgets(instance.Namespace).Create(ctx, podDisruptionBudget, metav1.CreateOptions{})
-		if err != nil {
-			logger.Error().Err(err).Msg("Failed to create Caddy PodDisruptionBudget")
-			return fmt.Errorf("failed to create PodDisruptionBudget %s: %w", instance.DeploymentName, err)
-		}
-		logger.Info().Msg("Created Caddy PodDisruptionBudget")
+	if err := clientset.PolicyV1().PodDisruptionBudgets(instance.Namespace).Delete(ctx, instance.DeploymentName, metav1.DeleteOptions{}); err == nil {
+		logger.Info().Msg("Deleted legacy PodDisruptionBudget")
 	}
 	return nil
 }
@@ -523,11 +487,7 @@ func waitForDeploymentReady(ctx context.Context, clientset *kubernetes.Clientset
 				logger.Info().Msg("Deployment is ready")
 				return nil
 			}
-			logger.Debug().
-				Int32("available", deployment.Status.AvailableReplicas).
-				Int32("ready", deployment.Status.ReadyReplicas).
-				Int32("desired", *deployment.Spec.Replicas).
-				Msg("Waiting for deployment to be ready")
+			logger.Debug().Int32("available", deployment.Status.AvailableReplicas).Int32("ready", deployment.Status.ReadyReplicas).Int32("desired", *deployment.Spec.Replicas).Msg("Waiting for deployment to be ready")
 		}
 	}
 }

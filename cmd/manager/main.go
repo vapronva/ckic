@@ -62,6 +62,9 @@ func main() {
 		log.Info().Msg("Automatically setting communication method to \"hostnetwork\" when using hostNetwork")
 		commMethod = caddy.CommunicationMethodHostNetwork
 	}
+	if commMethod == caddy.CommunicationMethodHostNetwork && !*useHostNetwork {
+		log.Fatal().Msg("Communication method 'hostnetwork' requires --use-host-network=true")
+	}
 	level, err := zerolog.ParseLevel(*logLevel)
 	if err != nil {
 		level = zerolog.InfoLevel
