@@ -268,24 +268,43 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 	if err := c.stateStore.SaveState(c.deployedInstances); err != nil {
 		logger.Error().Err(err).Msg("Failed to persist state")
 	}
-	if len(c.deployedInstances) > 0 {
+	if c.config.ExternalEnable {
+		if c.aggregator == nil {
+			logger.Error().Msg("External aggregation enabled but aggregator is nil, skipping initial config setup")
+		} else if agg, ok := c.aggregator.(*aggregator.NamespaceAggregator); ok {
+			if c.externalWatcher != nil {
+				externals, errBatch := c.externalWatcher.InitialListBatch(ctx)
+				if errBatch != nil {
+					logger.Error().Err(errBatch).Msg("Failed to batch load external ConfigMaps")
+				} else if len(externals) > 0 {
+					agg.SetExternalBatch(externals)
+				}
+			}
+			configMap, err := c.clientset.CoreV1().ConfigMaps(c.config.ConfigMapNamespace).Get(ctx, c.config.ConfigMapName, metav1.GetOptions{})
+			if err != nil {
+				logger.Error().Err(err).Msg("Failed to get ConfigMap for initial config push")
+			} else if configData, exists := configMap.Data["Caddyfile"]; exists {
+				agg.UpdateBase(configData)
+			} else {
+				logger.Warn().Msg("ConfigMap missing Caddyfile key, skipping base config setup")
+			}
+			agg.MarkInitialized()
+			if len(c.deployedInstances) > 0 {
+				logger.Info().Msg("Initial configuration pushed to discovered instances")
+			} else {
+				logger.Info().Msg("Aggregator initialized (no instances to push to yet)")
+			}
+		} else {
+			logger.Error().Msg("Failed to assert aggregator type, skipping initial config setup")
+		}
+	} else if len(c.deployedInstances) > 0 {
 		logger.Info().Msg("Pushing initial configuration to discovered instances")
 		configMap, err := c.clientset.CoreV1().ConfigMaps(c.config.ConfigMapNamespace).Get(
 			ctx, c.config.ConfigMapName, metav1.GetOptions{})
 		if err != nil {
 			logger.Error().Err(err).Msg("Failed to get ConfigMap for initial config push")
 		} else if configData, exists := configMap.Data["Caddyfile"]; exists {
-			if c.config.ExternalEnable {
-				if c.aggregator == nil {
-					logger.Error().Msg("External aggregation enabled but aggregator is nil, skipping initial config push")
-				} else if agg, ok := c.aggregator.(*aggregator.NamespaceAggregator); ok {
-					agg.UpdateBase(configData)
-				} else {
-					logger.Error().Msg("Failed to assert aggregator type, skipping initial config push")
-				}
-			} else {
-				c.configHandler.Handle(configData)
-			}
+			c.configHandler.Handle(configData)
 		} else {
 			logger.Warn().Msg("ConfigMap missing Caddyfile key, skipping initial config push")
 		}

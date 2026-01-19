@@ -36,6 +36,7 @@ type ExternalConfigWatcher struct {
 	maxFailures          int
 	resetTimeout         time.Duration
 	lastSuccess          time.Time
+	batchInitialized     bool
 }
 
 func NewExternalConfigWatcher(
@@ -103,7 +104,11 @@ func (w *ExternalConfigWatcher) isNamespaceAllowed(namespace string) bool {
 func (w *ExternalConfigWatcher) Start(ctx context.Context) {
 	logger := log.With().Str("component", "external_config_watcher").Logger()
 	logger.Info().Str("label", w.labelSelector).Str("mode", w.nsMode).Msg("Starting external config watcher")
-	w.initialList(ctx, logger)
+	if !w.batchInitialized {
+		w.initialList(ctx, logger)
+	} else {
+		logger.Info().Msg("Skipping initial list, batch initialization already performed")
+	}
 	delay := constants.ConfigMapWatcherInitialDelay
 	maxDelay := constants.ConfigMapWatcherMaxDelay
 	multiplier := 1.5
@@ -228,6 +233,34 @@ func (w *ExternalConfigWatcher) initialList(ctx context.Context, logger zerolog.
 		}
 	}
 	w.lastSuccess = time.Now()
+}
+
+func (w *ExternalConfigWatcher) InitialListBatch(ctx context.Context) (map[string]string, error) {
+	logger := log.With().Str("component", "external_config_watcher").Logger()
+	listOptions := metav1.ListOptions{
+		LabelSelector: w.labelSelector,
+	}
+	configMaps, err := w.clientset.CoreV1().ConfigMaps("").List(ctx, listOptions)
+	if err != nil {
+		logger.Error().Err(err).Msg("Failed to list external ConfigMaps for batch initialization")
+		return nil, fmt.Errorf("failed to list external ConfigMaps: %w", err)
+	}
+	w.lastResourceVersion = configMaps.ResourceVersion
+	externals := make(map[string]string)
+	for _, cm := range configMaps.Items {
+		if !w.isNamespaceAllowed(cm.Namespace) {
+			continue
+		}
+		if fragment, exists := cm.Data["Caddyfile"]; exists {
+			sourceKey := fmt.Sprintf("%s/%s", cm.Namespace, cm.Name)
+			externals[sourceKey] = fragment
+			w.lastProcessedConfigs[sourceKey] = fragment
+		}
+	}
+	w.batchInitialized = true
+	w.lastSuccess = time.Now()
+	logger.Info().Int("count", len(externals)).Str("resourceVersion", w.lastResourceVersion).Msg("Batch loaded external ConfigMaps")
+	return externals, nil
 }
 
 func minExternalDuration(a, b time.Duration) time.Duration {

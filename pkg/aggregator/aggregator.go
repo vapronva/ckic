@@ -3,6 +3,7 @@ package aggregator
 import (
 	"context"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 	"sync"
@@ -27,6 +28,7 @@ type NamespaceAggregator struct {
 	aggregatedConfigMapName string
 	configUpdateHandler     func(string)
 	nodeAvailabilityCheck   func() bool
+	initializing            bool
 }
 
 func NewNamespaceAggregator(
@@ -45,6 +47,7 @@ func NewNamespaceAggregator(
 		aggregatedConfigMapName: aggregatedConfigMapName,
 		configUpdateHandler:     configUpdateHandler,
 		nodeAvailabilityCheck:   nodeAvailabilityCheck,
+		initializing:            true,
 	}
 }
 
@@ -52,10 +55,15 @@ func (a *NamespaceAggregator) UpdateBase(base string) {
 	logger := log.With().Str("component", "aggregator").Logger()
 	a.mu.Lock()
 	a.base = base
+	initializing := a.initializing
 	merged := a.currentMergedLocked()
 	mirrorUnchanged := merged == a.lastPublishedToMirror
 	nodeUnchanged := merged == a.lastPushedMerged
 	a.mu.Unlock()
+	if initializing {
+		logger.Debug().Msg("Base updated during initialization, deferring push")
+		return
+	}
 	if a.publishAggregated && !mirrorUnchanged {
 		a.publishMu.Lock()
 		if err := a.publishMirrorConfigMap(merged); err != nil {
@@ -87,10 +95,15 @@ func (a *NamespaceAggregator) SetExternal(namespace, fragment string) {
 	logger := log.With().Str("component", "aggregator").Str("namespace", namespace).Logger()
 	a.mu.Lock()
 	a.externals[namespace] = fragment
+	initializing := a.initializing
 	merged := a.currentMergedLocked()
 	mirrorUnchanged := merged == a.lastPublishedToMirror
 	nodeUnchanged := merged == a.lastPushedMerged
 	a.mu.Unlock()
+	if initializing {
+		logger.Debug().Msg("External fragment updated during initialization, deferring push")
+		return
+	}
 	if a.publishAggregated && !mirrorUnchanged {
 		logger.Info().Msg("External fragment updated, publishing to mirror")
 		a.publishMu.Lock()
@@ -110,6 +123,50 @@ func (a *NamespaceAggregator) SetExternal(namespace, fragment string) {
 	logger.Info().Msg("External fragment updated, pushing to nodes")
 	if a.nodeAvailabilityCheck != nil && !a.nodeAvailabilityCheck() {
 		logger.Info().Msg("External updated but no nodes available, skipping config push")
+		return
+	}
+	if a.configUpdateHandler != nil {
+		a.configUpdateHandler(merged)
+		a.mu.Lock()
+		a.lastPushedMerged = merged
+		a.mu.Unlock()
+	}
+}
+
+func (a *NamespaceAggregator) SetExternalBatch(externals map[string]string) {
+	logger := log.With().Str("component", "aggregator").Logger()
+	a.mu.Lock()
+	maps.Copy(a.externals, externals)
+	a.mu.Unlock()
+	logger.Info().Int("count", len(externals)).Msg("Batch loaded external fragments during initialization")
+}
+
+func (a *NamespaceAggregator) MarkInitialized() {
+	logger := log.With().Str("component", "aggregator").Logger()
+	a.mu.Lock()
+	a.initializing = false
+	merged := a.currentMergedLocked()
+	mirrorUnchanged := merged == a.lastPublishedToMirror
+	nodeUnchanged := merged == a.lastPushedMerged
+	a.mu.Unlock()
+	logger.Info().Msg("Aggregator initialization complete, performing initial push")
+	if a.publishAggregated && !mirrorUnchanged {
+		a.publishMu.Lock()
+		if err := a.publishMirrorConfigMap(merged); err != nil {
+			logger.Error().Err(err).Msg("Failed to publish aggregated ConfigMap on initialization")
+		} else {
+			a.mu.Lock()
+			a.lastPublishedToMirror = merged
+			a.mu.Unlock()
+		}
+		a.publishMu.Unlock()
+	}
+	if nodeUnchanged {
+		logger.Debug().Msg("Merged config unchanged for nodes after initialization, skipping push")
+		return
+	}
+	if a.nodeAvailabilityCheck != nil && !a.nodeAvailabilityCheck() {
+		logger.Info().Msg("Initialization complete but no nodes available, skipping config push")
 		return
 	}
 	if a.configUpdateHandler != nil {
