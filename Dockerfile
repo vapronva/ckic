@@ -1,4 +1,4 @@
-FROM docker-registry.selectel.ru/library/golang:1.25-alpine AS build
+FROM docker.io/library/golang:1.25-alpine AS build
 
 WORKDIR /usr/src/app/ckic
 
@@ -16,7 +16,7 @@ COPY . .
 RUN CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -a -o ckic-manager ./cmd/manager && \
     chmod +x ckic-manager
 
-FROM docker-registry.selectel.ru/library/alpine:3
+FROM docker.io/library/alpine:3
 
 RUN apk update && \
     apk upgrade && \
