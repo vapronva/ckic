@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -32,6 +33,10 @@ func waitForCaddyAPIReady(ctx context.Context, adminURL string, apiConfig *Admin
 	maxDelay := constants.CaddyAPIMaxDelay
 	delay := initialDelay
 	multiplier := 1.5
+	readyURL := adminURL
+	if before, ok := strings.CutSuffix(adminURL, "/load"); ok {
+		readyURL = before + "/config/"
+	}
 	client := &http.Client{Timeout: 10 * time.Second}
 	ticker := time.NewTicker(delay)
 	defer ticker.Stop()
@@ -40,7 +45,7 @@ func waitForCaddyAPIReady(ctx context.Context, adminURL string, apiConfig *Admin
 		case <-ctx.Done():
 			return fmt.Errorf("context deadline exceeded while waiting for Caddy API: %w", ctx.Err())
 		case <-ticker.C:
-			req, err := http.NewRequestWithContext(ctx, "GET", adminURL, nil)
+			req, err := http.NewRequestWithContext(ctx, "GET", readyURL, nil)
 			if err != nil {
 				return fmt.Errorf("failed to create readiness request: %w", err)
 			}
@@ -55,7 +60,7 @@ func waitForCaddyAPIReady(ctx context.Context, adminURL string, apiConfig *Admin
 			if err == nil {
 				_ = resp.Body.Close()
 			}
-			log.Debug().Str("adminURL", adminURL).Msgf("Caddy Admin API not ready, retrying in %v", delay)
+			log.Debug().Str("adminURL", adminURL).Str("readyURL", readyURL).Msgf("Caddy Admin API not ready, retrying in %v", delay)
 			delay = min(time.Duration(float64(delay)*multiplier), maxDelay)
 			ticker.Reset(delay)
 		}
