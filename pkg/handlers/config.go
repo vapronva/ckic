@@ -26,6 +26,7 @@ type ConfigHandler struct {
 	EnvSecretKeys       []string
 	DataVolumePVC       string
 	ConfigVolumePVC     string
+	ConfigMapName       string
 	ExternalEndpoints   utils.ExternalEndpointsMap
 	UseHostNetwork      bool
 	CaddyAdminOriginKey string
@@ -44,6 +45,7 @@ func NewConfigHandler(
 	envSecretKeys []string,
 	dataVolumePVC string,
 	configVolumePVC string,
+	configMapName string,
 	externalEndpoints utils.ExternalEndpointsMap,
 	useHostNetwork bool,
 	caddyAdminOriginKey string,
@@ -62,6 +64,7 @@ func NewConfigHandler(
 		EnvSecretKeys:       envSecretKeys,
 		DataVolumePVC:       dataVolumePVC,
 		ConfigVolumePVC:     configVolumePVC,
+		ConfigMapName:       configMapName,
 		ExternalEndpoints:   externalEndpoints,
 		UseHostNetwork:      useHostNetwork,
 		CaddyAdminOriginKey: caddyAdminOriginKey,
@@ -109,7 +112,17 @@ func (h *ConfigHandler) Handle(configData string) {
 			}
 			if err != nil {
 				instanceLogger.Error().Err(err).Msg("Failed to update Caddy configuration")
-				newCount := instance.FailureCount.Add(1)
+				var newCount int32
+				h.Mu.RLock()
+				current := h.DeployedInstances[nodeName] == instance
+				if current {
+					newCount = instance.FailureCount.Add(1)
+				}
+				h.Mu.RUnlock()
+				if !current {
+					instanceLogger.Debug().Msg("Instance replaced during update, skipping failure tracking")
+					return
+				}
 				if newCount >= 5 {
 					instanceLogger.Warn().Msg("Too many update failures, marking for redeployment")
 					muFailed.Lock()
@@ -118,7 +131,15 @@ func (h *ConfigHandler) Handle(configData string) {
 				}
 			} else {
 				instanceLogger.Info().Msg("Successfully updated Caddy configuration")
-				instance.FailureCount.Store(0)
+				h.Mu.RLock()
+				current := h.DeployedInstances[nodeName] == instance
+				if current {
+					instance.FailureCount.Store(0)
+				}
+				h.Mu.RUnlock()
+				if !current {
+					instanceLogger.Debug().Msg("Instance replaced during update, skipping failure reset")
+				}
 			}
 		}(nodeName, instance)
 	}
@@ -151,6 +172,7 @@ func (h *ConfigHandler) Handle(configData string) {
 				h.EnvSecretKeys,
 				h.DataVolumePVC,
 				h.ConfigVolumePVC,
+				h.ConfigMapName,
 				h.UseHostNetwork,
 				h.HTTPHostPort,
 				h.HTTPSHostPort,

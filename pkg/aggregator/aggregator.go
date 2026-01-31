@@ -18,6 +18,7 @@ import (
 type NamespaceAggregator struct {
 	mu                      sync.RWMutex
 	publishMu               sync.Mutex
+	nodePushMu              sync.Mutex
 	base                    string
 	externals               map[string]string
 	lastPushedMerged        string
@@ -84,10 +85,12 @@ func (a *NamespaceAggregator) UpdateBase(base string) {
 		return
 	}
 	if a.configUpdateHandler != nil {
+		a.nodePushMu.Lock()
 		a.configUpdateHandler(merged)
 		a.mu.Lock()
 		a.lastPushedMerged = merged
 		a.mu.Unlock()
+		a.nodePushMu.Unlock()
 	}
 }
 
@@ -126,10 +129,12 @@ func (a *NamespaceAggregator) SetExternal(namespace, fragment string) {
 		return
 	}
 	if a.configUpdateHandler != nil {
+		a.nodePushMu.Lock()
 		a.configUpdateHandler(merged)
 		a.mu.Lock()
 		a.lastPushedMerged = merged
 		a.mu.Unlock()
+		a.nodePushMu.Unlock()
 	}
 }
 
@@ -170,10 +175,12 @@ func (a *NamespaceAggregator) MarkInitialized() {
 		return
 	}
 	if a.configUpdateHandler != nil {
+		a.nodePushMu.Lock()
 		a.configUpdateHandler(merged)
 		a.mu.Lock()
 		a.lastPushedMerged = merged
 		a.mu.Unlock()
+		a.nodePushMu.Unlock()
 	}
 }
 
@@ -207,10 +214,12 @@ func (a *NamespaceAggregator) RemoveExternal(namespace string) {
 		return
 	}
 	if a.configUpdateHandler != nil {
+		a.nodePushMu.Lock()
 		a.configUpdateHandler(merged)
 		a.mu.Lock()
 		a.lastPushedMerged = merged
 		a.mu.Unlock()
+		a.nodePushMu.Unlock()
 	}
 }
 

@@ -3,6 +3,7 @@ package watcher
 import (
 	"context"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -27,10 +28,12 @@ type NodeEvent struct {
 type NodeHandler func(NodeEvent)
 
 type NodeWatcher struct {
-	clientset   *kubernetes.Clientset
-	labelKey    string
-	labelValue  string
-	nodeHandler NodeHandler
+	clientset    *kubernetes.Clientset
+	labelKey     string
+	labelValue   string
+	nodeHandler  NodeHandler
+	mu           sync.RWMutex
+	currentNodes map[string]bool
 }
 
 func NewNodeWatcher(clientset *kubernetes.Clientset, labelSelector string, handler NodeHandler) *NodeWatcher {
@@ -41,10 +44,11 @@ func NewNodeWatcher(clientset *kubernetes.Clientset, labelSelector string, handl
 		labelValue = strings.Trim(parts[1], "\"' ")
 	}
 	return &NodeWatcher{
-		clientset:   clientset,
-		labelKey:    labelKey,
-		labelValue:  labelValue,
-		nodeHandler: handler,
+		clientset:    clientset,
+		labelKey:     labelKey,
+		labelValue:   labelValue,
+		nodeHandler:  handler,
+		currentNodes: make(map[string]bool),
 	}
 }
 
@@ -65,12 +69,38 @@ func (w *NodeWatcher) Start(ctx context.Context) {
 				time.Sleep(10 * time.Second)
 				continue
 			}
-			currentNodes := make(map[string]bool)
+			var addedNodes []string
+			var removedNodes []string
+			newNodes := make(map[string]bool, len(nodes.Items))
 			for _, node := range nodes.Items {
-				currentNodes[node.Name] = true
+				newNodes[node.Name] = true
+			}
+			w.mu.Lock()
+			if w.currentNodes == nil {
+				w.currentNodes = make(map[string]bool)
+			}
+			for nodeName := range newNodes {
+				if !w.currentNodes[nodeName] {
+					addedNodes = append(addedNodes, nodeName)
+				}
+			}
+			for nodeName := range w.currentNodes {
+				if !newNodes[nodeName] {
+					removedNodes = append(removedNodes, nodeName)
+				}
+			}
+			w.currentNodes = newNodes
+			w.mu.Unlock()
+			for _, nodeName := range addedNodes {
 				w.nodeHandler(NodeEvent{
 					Type:     NodeAdded,
-					NodeName: node.Name,
+					NodeName: nodeName,
+				})
+			}
+			for _, nodeName := range removedNodes {
+				w.nodeHandler(NodeEvent{
+					Type:     NodeRemoved,
+					NodeName: nodeName,
 				})
 			}
 			watcher, err := w.clientset.CoreV1().Nodes().Watch(ctx, metav1.ListOptions{
@@ -98,10 +128,20 @@ func (w *NodeWatcher) Start(ctx context.Context) {
 					logger.Warn().Msg("Unexpected object type in node watcher")
 					continue
 				}
-				wasTracked := currentNodes[node.Name]
+				var notifyAdd bool
+				var notifyRemove bool
+				w.mu.Lock()
+				if w.currentNodes == nil {
+					w.currentNodes = make(map[string]bool)
+				}
+				wasTracked := w.currentNodes[node.Name]
 				if event.Type == watch.Deleted {
 					if wasTracked {
-						delete(currentNodes, node.Name)
+						delete(w.currentNodes, node.Name)
+						notifyRemove = true
+					}
+					w.mu.Unlock()
+					if notifyRemove {
 						w.nodeHandler(NodeEvent{
 							Type:     NodeRemoved,
 							NodeName: node.Name,
@@ -111,13 +151,20 @@ func (w *NodeWatcher) Start(ctx context.Context) {
 				}
 				hasLabel := node.Labels[w.labelKey] == w.labelValue
 				if hasLabel && !wasTracked {
-					currentNodes[node.Name] = true
+					w.currentNodes[node.Name] = true
+					notifyAdd = true
+				} else if !hasLabel && wasTracked {
+					delete(w.currentNodes, node.Name)
+					notifyRemove = true
+				}
+				w.mu.Unlock()
+				if notifyAdd {
 					w.nodeHandler(NodeEvent{
 						Type:     NodeAdded,
 						NodeName: node.Name,
 					})
-				} else if !hasLabel && wasTracked {
-					delete(currentNodes, node.Name)
+				}
+				if notifyRemove {
 					w.nodeHandler(NodeEvent{
 						Type:     NodeRemoved,
 						NodeName: node.Name,

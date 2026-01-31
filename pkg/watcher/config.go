@@ -209,7 +209,6 @@ func (w *ConfigWatcher) Start(ctx context.Context) {
 				}
 				w.mu.Lock()
 				w.failureCount = 0
-				w.lastSuccess = time.Now()
 				w.mu.Unlock()
 				if errRV := w.refreshResourceVersion(ctx, logger); errRV != nil {
 					logger.Error().Err(errRV).Msg("Failed to refresh resource version")

@@ -11,8 +11,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
-
-	"gl.vprw.ru/vapronva/ckic/pkg/constants"
 )
 
 func DeployCaddy(
@@ -27,6 +25,7 @@ func DeployCaddy(
 	envSecretKeys []string,
 	dataVolumePVC string,
 	configVolumePVC string,
+	configMapName string,
 	useHostNetwork bool,
 	httpHostPort int,
 	httpsHostPort int,
@@ -52,6 +51,7 @@ func DeployCaddy(
 		envSecretKeys,
 		dataVolumePVC,
 		configVolumePVC,
+		configMapName,
 		useHostNetwork,
 		httpHostPort,
 		httpsHostPort,
@@ -95,6 +95,7 @@ func deployDeployment(
 	envSecretKeys []string,
 	dataVolumePVC string,
 	configVolumePVC string,
+	configMapName string,
 	useHostNetwork bool,
 	httpHostPort int,
 	httpsHostPort int,
@@ -204,7 +205,7 @@ func deployDeployment(
 			VolumeSource: corev1.VolumeSource{
 				ConfigMap: &corev1.ConfigMapVolumeSource{
 					LocalObjectReference: corev1.LocalObjectReference{
-						Name: constants.DefaultConfigMapName,
+						Name: configMapName,
 					},
 					Items: []corev1.KeyToPath{
 						{Key: "Caddyfile", Path: "Caddyfile"},

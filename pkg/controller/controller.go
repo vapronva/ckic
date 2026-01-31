@@ -82,6 +82,7 @@ func NewController(clientset *kubernetes.Clientset, config ControllerConfig) (*C
 		config.EnvSecretKeys,
 		config.DataVolumePVC,
 		config.ConfigVolumePVC,
+		config.ConfigMapName,
 		config.ExternalEndpoints,
 		config.UseHostNetwork,
 		config.HTTPHostPort,
@@ -100,6 +101,7 @@ func NewController(clientset *kubernetes.Clientset, config ControllerConfig) (*C
 		config.EnvSecretKeys,
 		config.DataVolumePVC,
 		config.ConfigVolumePVC,
+		config.ConfigMapName,
 		config.ExternalEndpoints,
 		config.UseHostNetwork,
 		config.CaddyAdminOriginKey,
@@ -264,8 +266,10 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 		delete(c.deployedInstances, node)
 	}
 	maps.Copy(c.deployedInstances, discovered)
+	instancesCopy := make(map[string]*caddy.Instance, len(c.deployedInstances))
+	maps.Copy(instancesCopy, c.deployedInstances)
 	c.instancesMutex.Unlock()
-	if err := c.stateStore.SaveState(c.deployedInstances); err != nil {
+	if err := c.stateStore.SaveState(instancesCopy); err != nil {
 		logger.Error().Err(err).Msg("Failed to persist state")
 	}
 	if c.config.ExternalEnable {
@@ -365,12 +369,15 @@ func (c *Controller) runPeriodicStatePersistence(ctx context.Context) {
 		case <-ticker.C:
 			c.instancesMutex.RLock()
 			instanceCount := len(c.deployedInstances)
-			c.instancesMutex.RUnlock()
 			if instanceCount == 0 {
+				c.instancesMutex.RUnlock()
 				logger.Debug().Msg("No deployed instances, skipping state persistence")
 				continue
 			}
-			if err := c.stateStore.SaveState(c.deployedInstances); err != nil {
+			instancesCopy := make(map[string]*caddy.Instance, instanceCount)
+			maps.Copy(instancesCopy, c.deployedInstances)
+			c.instancesMutex.RUnlock()
+			if err := c.stateStore.SaveState(instancesCopy); err != nil {
 				logger.Error().Err(err).Msg("Failed to persist state during periodic save")
 			} else {
 				logger.Debug().Int("instances", instanceCount).Msg("Periodic state persistence completed")
@@ -384,12 +391,15 @@ func (c *Controller) persistStateOnShutdown() {
 	logger.Info().Msg("Persisting state before shutdown")
 	c.instancesMutex.RLock()
 	instanceCount := len(c.deployedInstances)
-	c.instancesMutex.RUnlock()
 	if instanceCount == 0 {
+		c.instancesMutex.RUnlock()
 		logger.Info().Msg("No deployed instances, skipping shutdown state persistence")
 		return
 	}
-	if err := c.stateStore.SaveState(c.deployedInstances); err != nil {
+	instancesCopy := make(map[string]*caddy.Instance, instanceCount)
+	maps.Copy(instancesCopy, c.deployedInstances)
+	c.instancesMutex.RUnlock()
+	if err := c.stateStore.SaveState(instancesCopy); err != nil {
 		logger.Error().Err(err).Msg("Failed to persist state during shutdown")
 	} else {
 		logger.Info().Int("instances", instanceCount).Msg("State persisted successfully before shutdown")

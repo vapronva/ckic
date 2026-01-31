@@ -48,7 +48,7 @@ func waitForCaddyAPIReady(ctx context.Context, adminURL string, apiConfig *Admin
 				req.Header.Set("Origin", fmt.Sprintf("http://%s.caddy-admin-api.ckic.cmld.ru", apiConfig.OriginKey))
 			}
 			resp, err := client.Do(req)
-			if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 500 {
+			if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 				_ = resp.Body.Close()
 				return nil
 			}
