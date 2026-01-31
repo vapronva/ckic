@@ -7,10 +7,14 @@ flowchart LR
     Main["<code>cmd/manager</code>"] --> |"Initialize"| Controller
     CLIFlags["CLI flags"] --> |"Parse"| Controller
     CLIFlags --> |"<code>node-label</code>"| NodeWatcher
-    CLIFlags --> |"<code>config-map</code>"| ConfigWatcher
+    CLIFlags --> |"<code>config-map</code> & <code>config-namespace</code>"| ConfigWatcher
     CLIFlags --> |"<code>env-secret</code> & <code>env-keys</code>"| SecretEnvVars
     CLIFlags --> |"<code>data-pvc</code> & <code>config-pvc</code>"| VolumeManager
-    CLIFlags --> |"<code>external-endpoints</code>"| ExternalIPParser
+    CLIFlags --> |"<code>external-endpoints</code> & <code>external-endpoints-file</code>"| ExternalIPParser
+    CLIFlags --> |"<code>comm-method</code>"| ConfigHandler
+    CLIFlags --> |"<code>caddy-admin-origin-key</code>"| CaddyAdminClient
+    CLIFlags --> |"<code>use-host-network</code> & <code>enable-loadbalancer</code>"| CaddyDeployer
+    CLIFlags --> |"<code>prefer-saved-state</code>"| StateReconciliation
 
     Controller["<code>pkg/controller/controller</code>"] --> |"Run"| StateReconciliation
     Controller --> |"Start workers"| NodeHandler
@@ -24,9 +28,9 @@ flowchart LR
     NodeHandler --> |"Notify node changes"| WatcherCoordinator
 
     DeploymentWorkerPool[("Node deployment worker pool")] --> |"Deploy concurrently"| CaddyDeployer
-    CaddyDeployer["<code>pkg/caddy/deployment</code>"] --> |"Create <code>Deployment</code>"| K8sAPI
-    CaddyDeployer --> |"Create <code>Service</code>"| K8sAPI
-    CaddyDeployer --> |"Create <code>PodDisruptionBudget</code>"| K8sAPI
+    CaddyDeployer["<code>pkg/caddy/deployment</code>"] --> |"Create/Update <code>Deployment</code>"| K8sAPI
+    CaddyDeployer --> |"Create/Update <code>Service</code>"| K8sAPI
+    CaddyDeployer --> |"Create/Update <code>LoadBalancer</code> service <i>(optional)</i>"| K8sAPI
 
     CaddyDeployer --> |"Register instance"| InstanceRegistry
     InstanceRegistry[("<code>map[string]*caddy.Instance</code>")] --> |"Get instances for update"| ConfigHandler
