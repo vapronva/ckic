@@ -22,7 +22,7 @@ func main() {
 	configMapNamespace := pflag.String("config-namespace", "caddy-system", "Namespace of the ConfigMap and deployments")
 	communicationMethod := pflag.String("comm-method", "clusterip", "Communication method (clusterip, direct, hostnetwork)")
 	logLevel := pflag.String("log-level", "info", "Log level (debug, info, warn, error)")
-	caddyImage := pflag.String("caddy-image", "rg.gl.vprw.ru/oss-images/zerossl-caddy/caddy:2.10.2-alpine", "Caddy image (format image:tag)")
+	caddyImage := pflag.String("caddy-image", "docker.horse/oss-images/zerossl-caddy/caddy:2.10.2-alpine", "Caddy image (format image:tag)")
 	enableLoadBalancer := pflag.Bool("enable-loadbalancer", false, "Enable LoadBalancer service exposure")
 	preferSavedState := pflag.Bool("prefer-saved-state", false, "Prefer saved (aka persistent) state during reconciliation")
 	secretName := pflag.String("env-secret", "", "Name of the Kubernetes Secret to use for environment variables")

@@ -2,7 +2,7 @@
 replicaCount: 1
 
 image:
-  repository: rg.gl.vprw.ru
+  repository: docker.horse
   image: vapronva/ckic/manager
   tag: 0.17.1
   pullPolicy: IfNotPresent
@@ -43,7 +43,7 @@ config:
   configMapNamespace: caddy-system
   communicationMethod: clusterip
   logLevel: info
-  caddyImage: rg.gl.vprw.ru/oss-images/zerossl-caddy/caddy:2.10.2-alpine
+  caddyImage: docker.horse/oss-images/zerossl-caddy/caddy:2.10.2-alpine
   enableLoadBalancer: true
   useHostNetwork: false
   httpHostPort: 80
