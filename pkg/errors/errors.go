@@ -15,8 +15,7 @@ func (e *ErrConfigurationFailed) Error() string {
 	if e.Err == nil {
 		return fmt.Sprintf("failed to update configuration on node %s: %s", e.NodeName, e.Reason)
 	}
-	return fmt.Sprintf("failed to update configuration on node %s: %s: %v",
-		e.NodeName, e.Reason, e.Err)
+	return fmt.Sprintf("failed to update configuration on node %s: %s: %v", e.NodeName, e.Reason, e.Err)
 }
 
 func (e *ErrConfigurationFailed) Unwrap() error {

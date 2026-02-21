@@ -24,17 +24,15 @@ type ConfigWatcher struct {
 	configMapName       string
 	configHandler       ConfigHandlerFunc
 	lastResourceVersion string
-
 	nodeAvailableCheck  func() bool
 	isPaused            bool
 	cachedConfig        string
 	hasCachedConfig     bool
 	lastProcessedConfig string
-
-	failureCount int
-	maxFailures  int
-	resetTimeout time.Duration
-	lastSuccess  time.Time
+	failureCount        int
+	maxFailures         int
+	resetTimeout        time.Duration
+	lastSuccess         time.Time
 }
 
 func NewConfigWatcher(clientset *kubernetes.Clientset, namespace, configMapName string,
