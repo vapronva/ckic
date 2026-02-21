@@ -19,6 +19,9 @@ type NamespaceAggregator struct {
 	mu                      sync.RWMutex
 	publishMu               sync.Mutex
 	nodePushMu              sync.Mutex
+	stateVersion            uint64
+	lastPushedVersion       uint64
+	lastPublishedVersion    uint64
 	base                    string
 	externals               map[string]string
 	lastPushedMerged        string
@@ -55,11 +58,16 @@ func NewNamespaceAggregator(
 func (a *NamespaceAggregator) UpdateBase(base string) {
 	logger := log.With().Str("component", "aggregator").Logger()
 	a.mu.Lock()
+	changed := a.base != base
 	a.base = base
+	if changed {
+		a.stateVersion++
+	}
+	version := a.stateVersion
 	initializing := a.initializing
 	merged := a.currentMergedLocked()
-	mirrorUnchanged := merged == a.lastPublishedToMirror
-	nodeUnchanged := merged == a.lastPushedMerged
+	mirrorUnchanged := version <= a.lastPublishedVersion
+	nodeUnchanged := version <= a.lastPushedVersion
 	a.mu.Unlock()
 	if initializing {
 		logger.Debug().Msg("Base updated during initialization, deferring push")
@@ -67,12 +75,22 @@ func (a *NamespaceAggregator) UpdateBase(base string) {
 	}
 	if a.publishAggregated && !mirrorUnchanged {
 		a.publishMu.Lock()
-		if err := a.publishMirrorConfigMap(merged); err != nil {
-			logger.Error().Err(err).Msg("Failed to publish aggregated ConfigMap")
+		a.mu.Lock()
+		stalePublish := version < a.stateVersion || version <= a.lastPublishedVersion
+		a.mu.Unlock()
+		if stalePublish {
+			logger.Debug().Msg("Skipping stale mirror publish for base update")
 		} else {
-			a.mu.Lock()
-			a.lastPublishedToMirror = merged
-			a.mu.Unlock()
+			if err := a.publishMirrorConfigMap(merged); err != nil {
+				logger.Error().Err(err).Msg("Failed to publish aggregated ConfigMap")
+			} else {
+				a.mu.Lock()
+				if version > a.lastPublishedVersion {
+					a.lastPublishedToMirror = merged
+					a.lastPublishedVersion = version
+				}
+				a.mu.Unlock()
+			}
 		}
 		a.publishMu.Unlock()
 	}
@@ -86,10 +104,20 @@ func (a *NamespaceAggregator) UpdateBase(base string) {
 	}
 	if a.configUpdateHandler != nil {
 		a.nodePushMu.Lock()
-		a.configUpdateHandler(merged)
 		a.mu.Lock()
-		a.lastPushedMerged = merged
+		stalePush := version < a.stateVersion || version <= a.lastPushedVersion
 		a.mu.Unlock()
+		if stalePush {
+			logger.Debug().Msg("Skipping stale node push for base update")
+		} else {
+			a.configUpdateHandler(merged)
+			a.mu.Lock()
+			if version > a.lastPushedVersion {
+				a.lastPushedMerged = merged
+				a.lastPushedVersion = version
+			}
+			a.mu.Unlock()
+		}
 		a.nodePushMu.Unlock()
 	}
 }
@@ -97,11 +125,16 @@ func (a *NamespaceAggregator) UpdateBase(base string) {
 func (a *NamespaceAggregator) SetExternal(namespace, fragment string) {
 	logger := log.With().Str("component", "aggregator").Str("namespace", namespace).Logger()
 	a.mu.Lock()
+	changed := a.externals[namespace] != fragment
 	a.externals[namespace] = fragment
+	if changed {
+		a.stateVersion++
+	}
+	version := a.stateVersion
 	initializing := a.initializing
 	merged := a.currentMergedLocked()
-	mirrorUnchanged := merged == a.lastPublishedToMirror
-	nodeUnchanged := merged == a.lastPushedMerged
+	mirrorUnchanged := version <= a.lastPublishedVersion
+	nodeUnchanged := version <= a.lastPushedVersion
 	a.mu.Unlock()
 	if initializing {
 		logger.Debug().Msg("External fragment updated during initialization, deferring push")
@@ -110,12 +143,22 @@ func (a *NamespaceAggregator) SetExternal(namespace, fragment string) {
 	if a.publishAggregated && !mirrorUnchanged {
 		logger.Info().Msg("External fragment updated, publishing to mirror")
 		a.publishMu.Lock()
-		if err := a.publishMirrorConfigMap(merged); err != nil {
-			logger.Error().Err(err).Msg("Failed to publish aggregated ConfigMap")
+		a.mu.Lock()
+		stalePublish := version < a.stateVersion || version <= a.lastPublishedVersion
+		a.mu.Unlock()
+		if stalePublish {
+			logger.Debug().Msg("Skipping stale mirror publish for external update")
 		} else {
-			a.mu.Lock()
-			a.lastPublishedToMirror = merged
-			a.mu.Unlock()
+			if err := a.publishMirrorConfigMap(merged); err != nil {
+				logger.Error().Err(err).Msg("Failed to publish aggregated ConfigMap")
+			} else {
+				a.mu.Lock()
+				if version > a.lastPublishedVersion {
+					a.lastPublishedToMirror = merged
+					a.lastPublishedVersion = version
+				}
+				a.mu.Unlock()
+			}
 		}
 		a.publishMu.Unlock()
 	}
@@ -130,10 +173,20 @@ func (a *NamespaceAggregator) SetExternal(namespace, fragment string) {
 	}
 	if a.configUpdateHandler != nil {
 		a.nodePushMu.Lock()
-		a.configUpdateHandler(merged)
 		a.mu.Lock()
-		a.lastPushedMerged = merged
+		stalePush := version < a.stateVersion || version <= a.lastPushedVersion
 		a.mu.Unlock()
+		if stalePush {
+			logger.Debug().Msg("Skipping stale node push for external update")
+		} else {
+			a.configUpdateHandler(merged)
+			a.mu.Lock()
+			if version > a.lastPushedVersion {
+				a.lastPushedMerged = merged
+				a.lastPushedVersion = version
+			}
+			a.mu.Unlock()
+		}
 		a.nodePushMu.Unlock()
 	}
 }
@@ -141,7 +194,17 @@ func (a *NamespaceAggregator) SetExternal(namespace, fragment string) {
 func (a *NamespaceAggregator) SetExternalBatch(externals map[string]string) {
 	logger := log.With().Str("component", "aggregator").Logger()
 	a.mu.Lock()
+	changed := false
+	for namespace, fragment := range externals {
+		if a.externals[namespace] != fragment {
+			changed = true
+			break
+		}
+	}
 	maps.Copy(a.externals, externals)
+	if changed {
+		a.stateVersion++
+	}
 	a.mu.Unlock()
 	logger.Info().Int("count", len(externals)).Msg("Batch loaded external fragments during initialization")
 }
@@ -149,20 +212,35 @@ func (a *NamespaceAggregator) SetExternalBatch(externals map[string]string) {
 func (a *NamespaceAggregator) MarkInitialized() {
 	logger := log.With().Str("component", "aggregator").Logger()
 	a.mu.Lock()
+	changed := a.initializing
 	a.initializing = false
+	if changed {
+		a.stateVersion++
+	}
+	version := a.stateVersion
 	merged := a.currentMergedLocked()
-	mirrorUnchanged := merged == a.lastPublishedToMirror
-	nodeUnchanged := merged == a.lastPushedMerged
+	mirrorUnchanged := version <= a.lastPublishedVersion
+	nodeUnchanged := version <= a.lastPushedVersion
 	a.mu.Unlock()
 	logger.Info().Msg("Aggregator initialization complete, performing initial push")
 	if a.publishAggregated && !mirrorUnchanged {
 		a.publishMu.Lock()
-		if err := a.publishMirrorConfigMap(merged); err != nil {
-			logger.Error().Err(err).Msg("Failed to publish aggregated ConfigMap on initialization")
+		a.mu.Lock()
+		stalePublish := version < a.stateVersion || version <= a.lastPublishedVersion
+		a.mu.Unlock()
+		if stalePublish {
+			logger.Debug().Msg("Skipping stale mirror publish on initialization")
 		} else {
-			a.mu.Lock()
-			a.lastPublishedToMirror = merged
-			a.mu.Unlock()
+			if err := a.publishMirrorConfigMap(merged); err != nil {
+				logger.Error().Err(err).Msg("Failed to publish aggregated ConfigMap on initialization")
+			} else {
+				a.mu.Lock()
+				if version > a.lastPublishedVersion {
+					a.lastPublishedToMirror = merged
+					a.lastPublishedVersion = version
+				}
+				a.mu.Unlock()
+			}
 		}
 		a.publishMu.Unlock()
 	}
@@ -176,10 +254,20 @@ func (a *NamespaceAggregator) MarkInitialized() {
 	}
 	if a.configUpdateHandler != nil {
 		a.nodePushMu.Lock()
-		a.configUpdateHandler(merged)
 		a.mu.Lock()
-		a.lastPushedMerged = merged
+		stalePush := version < a.stateVersion || version <= a.lastPushedVersion
 		a.mu.Unlock()
+		if stalePush {
+			logger.Debug().Msg("Skipping stale node push on initialization")
+		} else {
+			a.configUpdateHandler(merged)
+			a.mu.Lock()
+			if version > a.lastPushedVersion {
+				a.lastPushedMerged = merged
+				a.lastPushedVersion = version
+			}
+			a.mu.Unlock()
+		}
 		a.nodePushMu.Unlock()
 	}
 }
@@ -187,20 +275,35 @@ func (a *NamespaceAggregator) MarkInitialized() {
 func (a *NamespaceAggregator) RemoveExternal(namespace string) {
 	logger := log.With().Str("component", "aggregator").Str("namespace", namespace).Logger()
 	a.mu.Lock()
-	delete(a.externals, namespace)
+	_, changed := a.externals[namespace]
+	if changed {
+		delete(a.externals, namespace)
+		a.stateVersion++
+	}
+	version := a.stateVersion
 	merged := a.currentMergedLocked()
-	mirrorUnchanged := merged == a.lastPublishedToMirror
-	nodeUnchanged := merged == a.lastPushedMerged
+	mirrorUnchanged := version <= a.lastPublishedVersion
+	nodeUnchanged := version <= a.lastPushedVersion
 	a.mu.Unlock()
 	if a.publishAggregated && !mirrorUnchanged {
 		logger.Info().Msg("External fragment removed, publishing to mirror")
 		a.publishMu.Lock()
-		if err := a.publishMirrorConfigMap(merged); err != nil {
-			logger.Error().Err(err).Msg("Failed to publish aggregated ConfigMap")
+		a.mu.Lock()
+		stalePublish := version < a.stateVersion || version <= a.lastPublishedVersion
+		a.mu.Unlock()
+		if stalePublish {
+			logger.Debug().Msg("Skipping stale mirror publish for external removal")
 		} else {
-			a.mu.Lock()
-			a.lastPublishedToMirror = merged
-			a.mu.Unlock()
+			if err := a.publishMirrorConfigMap(merged); err != nil {
+				logger.Error().Err(err).Msg("Failed to publish aggregated ConfigMap")
+			} else {
+				a.mu.Lock()
+				if version > a.lastPublishedVersion {
+					a.lastPublishedToMirror = merged
+					a.lastPublishedVersion = version
+				}
+				a.mu.Unlock()
+			}
 		}
 		a.publishMu.Unlock()
 	}
@@ -215,10 +318,20 @@ func (a *NamespaceAggregator) RemoveExternal(namespace string) {
 	}
 	if a.configUpdateHandler != nil {
 		a.nodePushMu.Lock()
-		a.configUpdateHandler(merged)
 		a.mu.Lock()
-		a.lastPushedMerged = merged
+		stalePush := version < a.stateVersion || version <= a.lastPushedVersion
 		a.mu.Unlock()
+		if stalePush {
+			logger.Debug().Msg("Skipping stale node push for external removal")
+		} else {
+			a.configUpdateHandler(merged)
+			a.mu.Lock()
+			if version > a.lastPushedVersion {
+				a.lastPushedMerged = merged
+				a.lastPushedVersion = version
+			}
+			a.mu.Unlock()
+		}
 		a.nodePushMu.Unlock()
 	}
 }
