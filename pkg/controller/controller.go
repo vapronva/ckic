@@ -127,6 +127,7 @@ func NewController(clientset *kubernetes.Clientset, config ControllerConfig) (*C
 			agg.UpdateBase,
 			nodeAvailabilityCheck,
 		)
+		configWatcher.SetForceSyncHandler(agg.EnsureNodeSync)
 		externalWatcher = watcher.NewExternalConfigWatcher(
 			clientset,
 			config.ConfigMapNamespace,

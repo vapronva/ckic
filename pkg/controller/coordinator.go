@@ -13,13 +13,16 @@ type WatcherCoordinator struct {
 	mu                *sync.RWMutex
 	notifyMu          sync.Mutex
 	nodeWatcher       *watcher.NodeWatcher
-	configWatcher     *watcher.ConfigWatcher
+	configWatcher     coordinatedConfigWatcher
 	deployedInstances map[string]*caddy.Instance
 }
 
-func NewWatcherCoordinator(nodeWatcher *watcher.NodeWatcher, configWatcher *watcher.ConfigWatcher,
-	deployedInstances map[string]*caddy.Instance, mu *sync.RWMutex,
-) *WatcherCoordinator {
+type coordinatedConfigWatcher interface {
+	EnsureSync()
+	Pause()
+}
+
+func NewWatcherCoordinator(nodeWatcher *watcher.NodeWatcher, configWatcher coordinatedConfigWatcher, deployedInstances map[string]*caddy.Instance, mu *sync.RWMutex) *WatcherCoordinator {
 	return &WatcherCoordinator{
 		mu:                mu,
 		nodeWatcher:       nodeWatcher,
@@ -41,7 +44,7 @@ func (wc *WatcherCoordinator) NotifyNodeChange() {
 	hasNodes := len(wc.deployedInstances) > 0
 	wc.mu.RUnlock()
 	if hasNodes {
-		wc.configWatcher.Resume()
+		wc.configWatcher.EnsureSync()
 	} else {
 		wc.configWatcher.Pause()
 	}

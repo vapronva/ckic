@@ -364,6 +364,32 @@ func (a *NamespaceAggregator) CurrentMerged() string {
 	return a.currentMergedLocked()
 }
 
+func (a *NamespaceAggregator) EnsureNodeSync() {
+	logger := log.With().Str("component", "aggregator").Logger()
+	if a.nodeAvailabilityCheck != nil && !a.nodeAvailabilityCheck() {
+		logger.Debug().Msg("Forced node sync requested but no nodes available, skipping push")
+		return
+	}
+	a.nodePushMu.Lock()
+	defer a.nodePushMu.Unlock()
+	a.mu.RLock()
+	version := a.stateVersion
+	merged := a.currentMergedLocked()
+	handler := a.configUpdateHandler
+	a.mu.RUnlock()
+	if handler == nil {
+		return
+	}
+	handler(merged)
+	a.mu.Lock()
+	a.lastPushedMerged = merged
+	if version > a.lastPushedVersion {
+		a.lastPushedVersion = version
+	}
+	a.mu.Unlock()
+	logger.Info().Msg("Forced sync pushed current merged config to nodes")
+}
+
 func (a *NamespaceAggregator) publishMirrorConfigMap(mergedConfig string) error {
 	logger := log.With().Str("component", "aggregator").Str("configmap", a.aggregatedConfigMapName).Logger()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

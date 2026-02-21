@@ -23,6 +23,7 @@ type ConfigWatcher struct {
 	namespace           string
 	configMapName       string
 	configHandler       ConfigHandlerFunc
+	forceSyncHandler    func()
 	lastResourceVersion string
 	nodeAvailableCheck  func() bool
 	isPaused            bool
@@ -87,6 +88,57 @@ func (w *ConfigWatcher) Resume() {
 		w.lastProcessedConfig = configToProcess
 		w.mu.Unlock()
 	}
+}
+
+func (w *ConfigWatcher) SetForceSyncHandler(handler func()) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.forceSyncHandler = handler
+}
+
+func (w *ConfigWatcher) EnsureSync() {
+	w.mu.Lock()
+	if w.isPaused {
+		w.isPaused = false
+		log.Info().Msg("ConfigMap watcher resumed")
+	}
+	shouldProcessCached := w.hasCachedConfig && w.nodeAvailableCheck != nil && w.nodeAvailableCheck()
+	var cachedConfig string
+	if shouldProcessCached {
+		cachedConfig = w.cachedConfig
+		w.hasCachedConfig = false
+	}
+	lastProcessed := w.lastProcessedConfig
+	forceSyncHandler := w.forceSyncHandler
+	configHandler := w.configHandler
+	nodeAvailableCheck := w.nodeAvailableCheck
+	w.mu.Unlock()
+	if shouldProcessCached && cachedConfig != "" && configHandler != nil {
+		configHandler(cachedConfig)
+		w.mu.Lock()
+		w.lastProcessedConfig = cachedConfig
+		w.lastSuccess = time.Now()
+		w.failureCount = 0
+		w.mu.Unlock()
+		if forceSyncHandler == nil {
+			return
+		}
+	}
+	if nodeAvailableCheck != nil && !nodeAvailableCheck() {
+		return
+	}
+	if forceSyncHandler != nil {
+		forceSyncHandler()
+		return
+	}
+	if shouldProcessCached || lastProcessed == "" || configHandler == nil {
+		return
+	}
+	configHandler(lastProcessed)
+	w.mu.Lock()
+	w.lastSuccess = time.Now()
+	w.failureCount = 0
+	w.mu.Unlock()
 }
 
 func minDuration(a, b time.Duration) time.Duration {
