@@ -38,7 +38,7 @@ type NodeWatcher struct {
 	currentNodes map[string]bool
 }
 
-func parseLabelSelector(labelSelector string) (string, string) {
+func ParseLabelSelector(labelSelector string) (string, string) {
 	selector := strings.TrimSpace(labelSelector)
 	if selector == "" {
 		return "", "true"
@@ -67,7 +67,7 @@ func parseLabelSelector(labelSelector string) (string, string) {
 }
 
 func NewNodeWatcher(clientset *kubernetes.Clientset, labelSelector string, handler NodeHandler) *NodeWatcher {
-	labelKey, labelValue := parseLabelSelector(labelSelector)
+	labelKey, labelValue := ParseLabelSelector(labelSelector)
 	return &NodeWatcher{
 		clientset:    clientset,
 		labelKey:     labelKey,

@@ -193,6 +193,21 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 	logger := log.With().Str("component", "reconcile").Logger()
 	logger.Info().Msg("Starting reconciliation process")
 	discovered := make(map[string]*caddy.Instance)
+	nodeLabelKey, nodeLabelValue := watcher.ParseLabelSelector(c.config.NodeLabel)
+	if nodeLabelKey == "" {
+		return fmt.Errorf("node label selector is empty")
+	}
+	nodeSelector := nodeLabelKey + "=" + nodeLabelValue
+	nodes, err := c.clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{
+		LabelSelector: nodeSelector,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to list nodes for reconciliation selector %q: %w", nodeSelector, err)
+	}
+	eligibleNodes := make(map[string]struct{}, len(nodes.Items))
+	for _, node := range nodes.Items {
+		eligibleNodes[node.Name] = struct{}{}
+	}
 	deployments, err := c.clientset.AppsV1().Deployments(c.config.ConfigMapNamespace).List(
 		ctx, metav1.ListOptions{
 			LabelSelector: "ckic.cmld.ru/caddy-managed=true",
@@ -205,6 +220,10 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 		nodeName, ok := dep.Labels["instance"]
 		if !ok || nodeName == "" {
 			logger.Warn().Msg("Deployment missing instance label, skipping")
+			continue
+		}
+		if _, matchesSelector := eligibleNodes[nodeName]; !matchesSelector {
+			logger.Debug().Str("node", nodeName).Str("selector", nodeSelector).Msg("Skipping managed deployment outside NodeLabel selector scope")
 			continue
 		}
 		if dep.Status.ReadyReplicas > 0 {
