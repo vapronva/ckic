@@ -60,10 +60,12 @@ func DeployCaddy(
 	}
 	if !useHostNetwork {
 		if err := deployService(deployCtx, clientset, instance); err != nil {
+			cleanupDeployment(ctx, clientset, instance)
 			return nil, err
 		}
 		if enableLoadBalancer {
 			if err := deployLoadBalancerService(deployCtx, clientset, instance); err != nil {
+				cleanupDeployment(ctx, clientset, instance)
 				return nil, err
 			}
 		}
@@ -74,16 +76,56 @@ func DeployCaddy(
 		cleanupDeployment(ctx, clientset, instance)
 		return nil, fmt.Errorf("deployment %s/%s did not become ready: %w", namespace, deploymentName, err)
 	}
-	pods, err := clientset.CoreV1().Pods(namespace).List(deployCtx, metav1.ListOptions{
-		LabelSelector: fmt.Sprintf("app=caddy,instance=%s", nodeName),
-	})
-	if err != nil || len(pods.Items) == 0 {
-		logger.Error().Err(err).Msg("Failed to get Caddy pod name")
-		return instance, nil
+	podName, err := resolvePodName(deployCtx, clientset, namespace, nodeName)
+	if err != nil {
+		logger.Error().Err(err).Msg("Failed to resolve Caddy pod name")
+		cleanupDeployment(ctx, clientset, instance)
+		return nil, err
 	}
-	instance.PodName = pods.Items[0].Name
+	instance.PodName = podName
 	logger.Info().Str("pod", instance.PodName).Msg("Caddy instance deployed successfully")
 	return instance, nil
+}
+
+func resolvePodName(ctx context.Context, clientset kubernetes.Interface, namespace, nodeName string) (string, error) {
+	const (
+		maxAttempts    = 6
+		initialBackoff = 250 * time.Millisecond
+		maxBackoff     = 2 * time.Second
+	)
+	labelSelector := fmt.Sprintf("app=caddy,instance=%s", nodeName)
+	backoff := initialBackoff
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		pods, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+			LabelSelector: labelSelector,
+		})
+		if err == nil && len(pods.Items) > 0 {
+			return pods.Items[0].Name, nil
+		}
+		if err != nil {
+			lastErr = fmt.Errorf("failed to list pods for node %s: %w", nodeName, err)
+		} else {
+			lastErr = fmt.Errorf("no pods found for node %s", nodeName)
+		}
+		if attempt == maxAttempts {
+			break
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return "", fmt.Errorf("context deadline exceeded while resolving pod for node %s: %w", nodeName, ctx.Err())
+		case <-timer.C:
+		}
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+	}
+	return "", lastErr
 }
 
 func deployDeployment(
@@ -493,10 +535,14 @@ func waitForDeploymentReady(ctx context.Context, clientset *kubernetes.Clientset
 	}
 }
 
-func cleanupDeployment(ctx context.Context, clientset *kubernetes.Clientset, instance *Instance) {
+func cleanupDeployment(ctx context.Context, clientset kubernetes.Interface, instance *Instance) {
 	log.Warn().Str("deployment", instance.DeploymentName).Msg("Cleaning up failed deployment")
 	if err := clientset.CoreV1().Services(instance.Namespace).Delete(ctx, instance.ServiceName, metav1.DeleteOptions{}); err != nil {
 		log.Debug().Err(err).Str("service", instance.ServiceName).Msg("Failed to delete service during cleanup")
+	}
+	loadBalancerServiceName := instance.DeploymentName + "-loadbalancer"
+	if err := clientset.CoreV1().Services(instance.Namespace).Delete(ctx, loadBalancerServiceName, metav1.DeleteOptions{}); err != nil {
+		log.Debug().Err(err).Str("service", loadBalancerServiceName).Msg("Failed to delete LoadBalancer service during cleanup")
 	}
 	if err := clientset.AppsV1().Deployments(instance.Namespace).Delete(ctx, instance.DeploymentName, metav1.DeleteOptions{}); err != nil {
 		log.Debug().Err(err).Str("deployment", instance.DeploymentName).Msg("Failed to delete deployment during cleanup")

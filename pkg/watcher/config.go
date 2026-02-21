@@ -64,13 +64,12 @@ func (w *ConfigWatcher) Pause() {
 
 func (w *ConfigWatcher) Resume() {
 	w.mu.Lock()
-	if !w.isPaused {
-		w.mu.Unlock()
-		return
+	wasPaused := w.isPaused
+	if wasPaused {
+		w.isPaused = false
+		log.Info().Msg("ConfigMap watcher resumed")
 	}
-	w.isPaused = false
-	log.Info().Msg("ConfigMap watcher resumed")
-	shouldProcess := w.hasCachedConfig && w.nodeAvailableCheck()
+	shouldProcess := w.hasCachedConfig && w.nodeAvailableCheck != nil && w.nodeAvailableCheck()
 	var configToProcess string
 	shouldSkip := false
 	if shouldProcess {

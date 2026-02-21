@@ -36,13 +36,36 @@ type NodeWatcher struct {
 	currentNodes map[string]bool
 }
 
-func NewNodeWatcher(clientset *kubernetes.Clientset, labelSelector string, handler NodeHandler) *NodeWatcher {
-	parts := strings.SplitN(labelSelector, ":", 2)
-	labelKey := parts[0]
-	labelValue := "true"
-	if len(parts) > 1 {
-		labelValue = strings.Trim(parts[1], "\"' ")
+func parseLabelSelector(labelSelector string) (string, string) {
+	selector := strings.TrimSpace(labelSelector)
+	if selector == "" {
+		return "", "true"
 	}
+	var key string
+	var value string
+	if strings.Contains(selector, "=") {
+		parts := strings.SplitN(selector, "=", 2)
+		key = parts[0]
+		value = parts[1]
+	} else if strings.Contains(selector, ":") {
+		parts := strings.SplitN(selector, ":", 2)
+		key = parts[0]
+		value = parts[1]
+	} else {
+		key = selector
+		value = "true"
+	}
+	key = strings.TrimSpace(key)
+	value = strings.TrimSpace(value)
+	value = strings.Trim(value, "\"' ")
+	if value == "" {
+		value = "true"
+	}
+	return key, value
+}
+
+func NewNodeWatcher(clientset *kubernetes.Clientset, labelSelector string, handler NodeHandler) *NodeWatcher {
+	labelKey, labelValue := parseLabelSelector(labelSelector)
 	return &NodeWatcher{
 		clientset:    clientset,
 		labelKey:     labelKey,
@@ -53,7 +76,7 @@ func NewNodeWatcher(clientset *kubernetes.Clientset, labelSelector string, handl
 }
 
 func (w *NodeWatcher) Start(ctx context.Context) {
-	logger := log.With().Str("component", "node_watcher").Str("label", w.labelKey+":"+w.labelValue).Logger()
+	logger := log.With().Str("component", "node_watcher").Str("label", w.labelKey+"="+w.labelValue).Logger()
 	logger.Info().Msg("Starting node watcher")
 	for {
 		select {
