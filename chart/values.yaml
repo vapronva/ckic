@@ -4,7 +4,7 @@ replicaCount: 1
 image:
   repository: docker.horse
   image: vapronva/ckic/manager
-  tag: 0.17.1
+  tag: 0.18.0
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []

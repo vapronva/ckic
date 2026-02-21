@@ -6,8 +6,8 @@ description: Caddy Kubernetes Ingress Controller Manager with a few catches
 
 type: application
 
-version: 0.16.1
-appVersion: 0.17.1
+version: 0.17.0
+appVersion: 0.18.0
 
 icon: https://git.horse/uploads/-/system/project/avatar/177/ckic-avatar-takanashikiara-bluefield-twt-1.jpg
 
