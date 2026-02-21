@@ -2,6 +2,8 @@ package handlers
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"maps"
 	"sync"
 	"time"
@@ -33,6 +35,8 @@ type ConfigHandler struct {
 	CaddyAdminOriginKey string
 	HTTPHostPort        int
 	HTTPSHostPort       int
+	lastConfigDigest    string
+	instanceDigests     map[string]string
 }
 
 type failedInstance struct {
@@ -80,23 +84,45 @@ func NewConfigHandler(
 		CaddyAdminOriginKey: caddyAdminOriginKey,
 		HTTPHostPort:        httpHostPort,
 		HTTPSHostPort:       httpsHostPort,
+		instanceDigests:     make(map[string]string),
 	}
 }
 
-//nolint:gocognit,nestif,funlen
+//nolint:gocognit,nestif,funlen,cyclop
 func (h *ConfigHandler) Handle(configData string) {
 	h.handleMu.Lock()
 	defer h.handleMu.Unlock()
 	logger := log.With().Str("component", "config_handler").Logger()
+	configDigest := calculateConfigDigest(configData)
 	logger.Info().Msg("Detected configuration change, updating Caddy instances")
-	time.Sleep(constants.ConfigUpdateDelay)
 	h.Mu.RLock()
 	instancesCopy := make(map[string]*caddy.Instance)
 	maps.Copy(instancesCopy, h.DeployedInstances)
 	h.Mu.RUnlock()
+	for nodeName := range h.instanceDigests {
+		if _, exists := instancesCopy[nodeName]; !exists {
+			delete(h.instanceDigests, nodeName)
+		}
+	}
+	if len(instancesCopy) == 0 {
+		h.lastConfigDigest = configDigest
+		logger.Debug().
+			Str("configDigest", configDigest).
+			Msg("No deployed instances, skipping config push")
+		return
+	}
+	if configDigest == h.lastConfigDigest && h.allInstancesAtDigest(instancesCopy, configDigest) {
+		logger.Info().
+			Str("configDigest", configDigest).
+			Msg("Configuration digest unchanged across all instances, skipping update")
+		return
+	}
+	time.Sleep(constants.ConfigUpdateDelay)
 	var wg sync.WaitGroup
 	var muFailed sync.Mutex
+	var muSuccess sync.Mutex
 	var failedInstances []failedInstance
+	var successfulNodes []string
 	semaphore := make(chan struct{}, configUpdateConcurrency)
 	var apiConfig *caddy.AdminAPIConfig
 	if h.CaddyAdminOriginKey != "" {
@@ -162,11 +188,18 @@ func (h *ConfigHandler) Handle(configData string) {
 				if !current {
 					instanceLogger.Debug().
 						Msg("Instance replaced during update, skipping failure reset")
+					return
 				}
+				muSuccess.Lock()
+				successfulNodes = append(successfulNodes, nodeName)
+				muSuccess.Unlock()
 			}
 		}(nodeName, instance)
 	}
 	wg.Wait()
+	for _, nodeName := range successfulNodes {
+		h.instanceDigests[nodeName] = configDigest
+	}
 	if len(failedInstances) > 0 {
 		logger.Info().Msgf("Redeploying %d failed instances", len(failedInstances))
 		for _, failed := range failedInstances {
@@ -186,13 +219,20 @@ func (h *ConfigHandler) Handle(configData string) {
 					Msg("Failed instance was replaced, skipping redeployment")
 				continue
 			}
+			delete(h.DeployedInstances, failed.nodeName)
+			h.Mu.Unlock()
 			logger.Info().Str("node", failed.nodeName).Msg("Redeploying failed Caddy instance")
 			if err := failed.instance.Delete(); err != nil {
-				h.Mu.Unlock()
 				logger.Error().
 					Err(err).
 					Str("node", failed.nodeName).
 					Msg("Failed to delete failed Caddy instance")
+				h.Mu.Lock()
+				if _, exists := h.DeployedInstances[failed.nodeName]; !exists {
+					h.DeployedInstances[failed.nodeName] = failed.instance
+				}
+				h.Mu.Unlock()
+				delete(h.instanceDigests, failed.nodeName)
 				continue
 			}
 			externalIPs := h.ExternalEndpoints[failed.nodeName]
@@ -214,16 +254,71 @@ func (h *ConfigHandler) Handle(configData string) {
 				h.HTTPSHostPort,
 			)
 			if err != nil {
-				h.Mu.Unlock()
 				logger.Error().
 					Err(err).
 					Str("node", failed.nodeName).
 					Msg("Failed to redeploy Caddy instance")
+				h.Mu.Lock()
+				if _, exists := h.DeployedInstances[failed.nodeName]; !exists {
+					h.DeployedInstances[failed.nodeName] = failed.instance
+				}
+				h.Mu.Unlock()
+				delete(h.instanceDigests, failed.nodeName)
 				continue
 			}
-			h.DeployedInstances[failed.nodeName] = newInstance
+			replaced := false
+			h.Mu.Lock()
+			if _, exists := h.DeployedInstances[failed.nodeName]; !exists {
+				h.DeployedInstances[failed.nodeName] = newInstance
+				replaced = true
+			}
 			h.Mu.Unlock()
+			if !replaced {
+				logger.Debug().
+					Str("node", failed.nodeName).
+					Msg("Failed instance was replaced during redeployment; cleaning up stale redeploy")
+				if cleanupErr := newInstance.Delete(); cleanupErr != nil {
+					logger.Warn().
+						Err(cleanupErr).
+						Str("node", failed.nodeName).
+						Msg("Failed to clean up stale redeployed Caddy instance")
+				}
+				delete(h.instanceDigests, failed.nodeName)
+				continue
+			}
+			h.instanceDigests[failed.nodeName] = configDigest
 			logger.Info().Str("node", failed.nodeName).Msg("Successfully redeployed Caddy instance")
 		}
 	}
+	if h.allCurrentInstancesConverged(configDigest) {
+		h.lastConfigDigest = configDigest
+	}
+}
+
+func (h *ConfigHandler) allInstancesAtDigest(
+	instances map[string]*caddy.Instance,
+	configDigest string,
+) bool {
+	for nodeName := range instances {
+		if h.instanceDigests[nodeName] != configDigest {
+			return false
+		}
+	}
+	return true
+}
+
+func (h *ConfigHandler) allCurrentInstancesConverged(configDigest string) bool {
+	h.Mu.RLock()
+	defer h.Mu.RUnlock()
+	for nodeName := range h.DeployedInstances {
+		if h.instanceDigests[nodeName] != configDigest {
+			return false
+		}
+	}
+	return true
+}
+
+func calculateConfigDigest(configData string) string {
+	sum := sha256.Sum256([]byte(configData))
+	return hex.EncodeToString(sum[:])
 }

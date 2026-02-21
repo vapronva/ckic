@@ -38,6 +38,20 @@ spec:
             - "--node-label={{ .Values.config.nodeLabel }}"
             - "--config-map={{ .Values.config.configMapName }}"
             - "--config-namespace={{ .Values.config.configMapNamespace }}"
+            - "--bootstrap-default-config={{ .Values.config.bootstrapDefaultConfig }}"
+            - "--leader-elect={{ .Values.leaderElection.enabled }}"
+            - "--leader-election-lease-name={{ .Values.leaderElection.leaseName }}"
+            {{- if .Values.leaderElection.leaseNamespace }}
+            - "--leader-election-lease-namespace={{ .Values.leaderElection.leaseNamespace }}"
+            {{- end }}
+            - "--leader-election-lease-duration={{ .Values.leaderElection.leaseDuration }}"
+            - "--leader-election-renew-deadline={{ .Values.leaderElection.renewDeadline }}"
+            - "--leader-election-retry-period={{ .Values.leaderElection.retryPeriod }}"
+            {{- if .Values.probes.enabled }}
+            - "--health-bind-address=:{{ .Values.probes.port }}"
+            {{- else }}
+            - "--health-bind-address="
+            {{- end }}
             - "--comm-method={{ .Values.config.communicationMethod }}"
             - "--log-level={{ .Values.config.logLevel }}"
             - "--caddy-image={{ .Values.config.caddyImage }}"
@@ -75,6 +89,24 @@ spec:
             - "--external-publish-aggregated={{ .Values.config.external.publishAggregated }}"
             - "--external-aggregated-config-name={{ .Values.config.external.aggregatedConfigName }}"
             {{- end }}
+          {{- if .Values.probes.enabled }}
+          ports:
+            - name: health
+              containerPort: {{ .Values.probes.port }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.livenessPath }}
+              port: health
+            initialDelaySeconds: {{ .Values.probes.livenessInitialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.livenessPeriodSeconds }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readinessPath }}
+              port: health
+            initialDelaySeconds: {{ .Values.probes.readinessInitialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readinessPeriodSeconds }}
+          {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       {{- with .Values.nodeSelector }}

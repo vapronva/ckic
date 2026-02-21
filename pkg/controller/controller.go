@@ -26,6 +26,7 @@ type ControllerConfig struct {
 	NodeLabel                    string
 	ConfigMapName                string
 	ConfigMapNamespace           string
+	BootstrapDefaultConfig       bool
 	CommunicationMethod          caddy.CommunicationMethod
 	CaddyImage                   string
 	EnableLoadBalancer           bool
@@ -167,6 +168,7 @@ func buildWatcherBundle(
 			config.ConfigMapName,
 			configHandler.Handle,
 			nodeAvailabilityCheck,
+			config.BootstrapDefaultConfig,
 		)
 		return bundle
 	}
@@ -184,6 +186,7 @@ func buildWatcherBundle(
 		config.ConfigMapName,
 		bundle.agg.UpdateBase,
 		nodeAvailabilityCheck,
+		config.BootstrapDefaultConfig,
 	)
 	bundle.configWatcher.SetForceSyncHandler(bundle.agg.EnsureNodeSync)
 	bundle.externalWatcher = watcher.NewExternalConfigWatcher(

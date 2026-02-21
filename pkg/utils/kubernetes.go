@@ -22,12 +22,10 @@ func getKubernetesConfig(kubeconfig string) (*rest.Config, error) {
 	if kubeconfig != "" {
 		return clientcmd.BuildConfigFromFlags("", kubeconfig)
 	}
-
 	config, err := rest.InClusterConfig()
 	if err == nil {
 		return config, nil
 	}
-
 	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
 		clientcmd.NewDefaultClientConfigLoadingRules(),
 		&clientcmd.ConfigOverrides{},

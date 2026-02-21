@@ -201,7 +201,11 @@ func (h *NodeHandler) Handle(event watcher.NodeEvent) {
 			}
 		}()
 	case watcher.NodeRemoved:
-		var shouldNotify bool
+		var (
+			shouldNotify bool
+			instance     *caddy.Instance
+			exists       bool
+		)
 		h.inProgressNodesMu.Lock()
 		if _, inProgress := h.inProgressNodes[nodeName]; inProgress {
 			h.removedNodes[nodeName] = struct{}{}
@@ -211,17 +215,26 @@ func (h *NodeHandler) Handle(event watcher.NodeEvent) {
 		}
 		h.inProgressNodesMu.Unlock()
 		h.Mu.Lock()
-		if instance, exists := h.DeployedInstances[nodeName]; exists {
-			logger.Info().Msg("Node removed, cleaning up Caddy instance")
-			if err := instance.Delete(); err != nil {
-				logger.Error().Err(err).Msg("Failed to delete Caddy instance")
-			} else {
-				delete(h.DeployedInstances, nodeName)
-				logger.Info().Msg("Successfully removed Caddy instance")
-			}
+		instance, exists = h.DeployedInstances[nodeName]
+		if exists {
+			delete(h.DeployedInstances, nodeName)
 			shouldNotify = h.nodeChangeNotifier != nil
 		}
 		h.Mu.Unlock()
+		if !exists {
+			return
+		}
+		logger.Info().Msg("Node removed, cleaning up Caddy instance")
+		if err := instance.Delete(); err != nil {
+			logger.Error().Err(err).Msg("Failed to delete Caddy instance")
+			h.Mu.Lock()
+			if _, alreadyPresent := h.DeployedInstances[nodeName]; !alreadyPresent {
+				h.DeployedInstances[nodeName] = instance
+			}
+			h.Mu.Unlock()
+			return
+		}
+		logger.Info().Msg("Successfully removed Caddy instance")
 		if shouldNotify {
 			h.nodeChangeNotifier()
 		}

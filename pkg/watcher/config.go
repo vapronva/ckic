@@ -8,6 +8,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
@@ -19,7 +20,7 @@ type ConfigHandlerFunc func(string)
 
 type ConfigWatcher struct {
 	mu                  sync.RWMutex
-	clientset           *kubernetes.Clientset
+	clientset           kubernetes.Interface
 	namespace           string
 	configMapName       string
 	configHandler       ConfigHandlerFunc
@@ -34,6 +35,7 @@ type ConfigWatcher struct {
 	maxFailures         int
 	resetTimeout        time.Duration
 	lastSuccess         time.Time
+	bootstrapDefault    bool
 }
 
 const (
@@ -43,10 +45,11 @@ const (
 )
 
 func NewConfigWatcher(
-	clientset *kubernetes.Clientset,
+	clientset kubernetes.Interface,
 	namespace, configMapName string,
 	handler ConfigHandlerFunc,
 	nodeAvailableCheck func() bool,
+	bootstrapDefault bool,
 ) *ConfigWatcher {
 	return &ConfigWatcher{
 		clientset:          clientset,
@@ -58,6 +61,7 @@ func NewConfigWatcher(
 		maxFailures:        configWatcherMaxFailures,
 		resetTimeout:       configWatcherResetTimeout,
 		lastSuccess:        time.Now(),
+		bootstrapDefault:   bootstrapDefault,
 	}
 }
 
@@ -201,45 +205,7 @@ func (w *ConfigWatcher) Start(ctx context.Context) {
 		Str("configmap", w.configMapName).
 		Logger()
 	logger.Info().Msg("Starting config watcher")
-	configMap, err := w.clientset.CoreV1().
-		ConfigMaps(w.namespace).
-		Get(ctx, w.configMapName, metav1.GetOptions{})
-	if err != nil {
-		logger.Error().Err(err).Msg("Failed to get initial ConfigMap, creating a new one")
-		configMap = &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      w.configMapName,
-				Namespace: w.namespace,
-			},
-			Data: map[string]string{
-				"Caddyfile": ":80 {\n    respond \"Hello, world!\"\n}\n",
-			},
-		}
-		_, err = w.clientset.CoreV1().
-			ConfigMaps(w.namespace).
-			Create(ctx, configMap, metav1.CreateOptions{})
-		if err != nil {
-			logger.Error().Err(err).Msg("Failed to create default ConfigMap")
-		}
-	} else {
-		if configData, exists := configMap.Data["Caddyfile"]; exists {
-			logger.Info().Msg("Initial ConfigMap loaded")
-			if w.nodeAvailableCheck() {
-				w.configHandler(configData)
-				w.mu.Lock()
-				w.lastProcessedConfig = configData
-				w.mu.Unlock()
-			} else {
-				logger.Info().Msg("No eligible nodes available, caching initial config")
-				w.mu.Lock()
-				w.cachedConfig = configData
-				w.hasCachedConfig = true
-				w.mu.Unlock()
-			}
-		} else {
-			logger.Warn().Msg("ConfigMap missing Caddyfile key")
-		}
-	}
+	w.loadInitialConfig(ctx, logger)
 	delay := constants.ConfigMapWatcherInitialDelay
 	maxDelay := constants.ConfigMapWatcherMaxDelay
 	multiplier := 1.5
@@ -356,5 +322,61 @@ func (w *ConfigWatcher) Start(ctx context.Context) {
 		logger.Info().Msg("ConfigMap watch channel closed, restarting")
 		time.Sleep(delay)
 		delay = minDuration(time.Duration(float64(delay)*multiplier), maxDelay)
+	}
+}
+
+//nolint:nestif
+func (w *ConfigWatcher) loadInitialConfig(ctx context.Context, logger zerolog.Logger) {
+	configMap, err := w.clientset.CoreV1().
+		ConfigMaps(w.namespace).
+		Get(ctx, w.configMapName, metav1.GetOptions{})
+	if err != nil {
+		switch {
+		case apierrors.IsNotFound(err) && w.bootstrapDefault:
+			logger.Warn().
+				Msg("Initial ConfigMap not found and bootstrap is enabled, creating default ConfigMap")
+			configMap = &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      w.configMapName,
+					Namespace: w.namespace,
+				},
+				Data: map[string]string{
+					"Caddyfile": ":80 {\n    respond \"Hello, world!\"\n}\n",
+				},
+			}
+			_, err = w.clientset.CoreV1().
+				ConfigMaps(w.namespace).
+				Create(ctx, configMap, metav1.CreateOptions{})
+			if err != nil {
+				logger.Error().Err(err).Msg("Failed to create default ConfigMap")
+				configMap = nil
+			}
+		case apierrors.IsNotFound(err):
+			logger.Warn().
+				Msg("Initial ConfigMap not found and bootstrap is disabled, waiting for ConfigMap to be created")
+			configMap = nil
+		default:
+			logger.Error().Err(err).Msg("Failed to get initial ConfigMap")
+			configMap = nil
+		}
+	}
+	if configMap != nil {
+		if configData, exists := configMap.Data["Caddyfile"]; exists {
+			logger.Info().Msg("Initial ConfigMap loaded")
+			if w.nodeAvailableCheck() {
+				w.configHandler(configData)
+				w.mu.Lock()
+				w.lastProcessedConfig = configData
+				w.mu.Unlock()
+			} else {
+				logger.Info().Msg("No eligible nodes available, caching initial config")
+				w.mu.Lock()
+				w.cachedConfig = configData
+				w.hasCachedConfig = true
+				w.mu.Unlock()
+			}
+		} else {
+			logger.Warn().Msg("ConfigMap missing Caddyfile key")
+		}
 	}
 }

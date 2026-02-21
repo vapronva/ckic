@@ -4,7 +4,7 @@ replicaCount: 1
 image:
   repository: docker.horse
   image: vapronva/ckic/manager
-  tag: 0.18.0
+  tag: 0.19.0
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -27,20 +27,37 @@ securityContext:
   runAsUser: 1000
 
 resources:
-  limits:
-    memory: 20Mi
   requests:
-    cpu: 5m
-    memory: 10Mi
+    cpu: 50m
+    memory: 15Mi
 
 nodeSelector: {}
 tolerations: []
 affinity: {}
 
+leaderElection:
+  enabled: true
+  leaseName: ckic-manager-leader
+  leaseNamespace: ""
+  leaseDuration: 15s
+  renewDeadline: 10s
+  retryPeriod: 2s
+
+probes:
+  enabled: true
+  port: 8081
+  livenessPath: /healthz
+  readinessPath: /readyz
+  livenessInitialDelaySeconds: 15
+  livenessPeriodSeconds: 20
+  readinessInitialDelaySeconds: 5
+  readinessPeriodSeconds: 10
+
 config:
   nodeLabel: ckic.cmld.ru/enabled
   configMapName: caddy-config
   configMapNamespace: caddy-system
+  bootstrapDefaultConfig: false
   communicationMethod: clusterip
   logLevel: info
   caddyImage: docker.horse/oss-images/zerossl-caddy/caddy:2.10.2-alpine

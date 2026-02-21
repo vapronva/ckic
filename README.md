@@ -4,10 +4,14 @@
 
 ```mermaid
 flowchart LR
-    Main["<code>cmd/manager</code>"] --> |"Initialize"| Controller
+    Main["<code>cmd/manager</code>"] --> |"Initialize"| LeaderElection
+    LeaderElection["Leader election"] --> |"Only leader runs controller"| Controller
+    LeaderElection --> |"Acquire/Renew <code>Lease</code>"| K8sAPI
     CLIFlags["CLI flags"] --> |"Parse"| Controller
+    CLIFlags --> |"<code>leader-elect</code> & <code>leader-election-*</code>"| LeaderElection
+    CLIFlags --> |"<code>health-bind-address</code>"| ProbeServer
     CLIFlags --> |"<code>node-label</code>"| NodeWatcher
-    CLIFlags --> |"<code>config-map</code> & <code>config-namespace</code>"| ConfigWatcher
+    CLIFlags --> |"<code>config-map</code> & <code>config-namespace</code> & <code>bootstrap-default-config</code>"| ConfigWatcher
     CLIFlags --> |"<code>env-secret</code> & <code>env-keys</code>"| SecretEnvVars
     CLIFlags --> |"<code>data-pvc</code> & <code>config-pvc</code>"| VolumeManager
     CLIFlags --> |"<code>external-endpoints</code> & <code>external-endpoints-file</code>"| ExternalIPParser
@@ -61,18 +65,22 @@ flowchart LR
 
     VolumeManager["Volume manager"] --> |"Configure PVC or HostPath"| CaddyDeployer
     SecretEnvVars["Secret environment manager"] --> |"Inject environment vars"| CaddyDeployer
+    ProbeServer["Probe server"] --> |"Serve <code>/healthz</code> & <code>/readyz</code>"| K8sProbes
 
     K8sAPI["Kubernetes API"]
     CaddyAdminAPI["Caddy admin API"]
     K8sLoadBalancer["<code>LoadBalancer</code> service"]
+    K8sProbes["Kubernetes probes"]
 
     subgraph Core
+        LeaderElection
         Controller
         WatcherCoordinator
         StateReconciliation
         ConfigReconciliation
         InstanceRegistry
         ConfigMapStateStore
+        ProbeServer
     end
 
     subgraph NodeManagement
@@ -103,5 +111,6 @@ flowchart LR
         K8sAPI
         CaddyAdminAPI
         K8sLoadBalancer
+        K8sProbes
     end
 ```

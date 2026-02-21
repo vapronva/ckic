@@ -36,7 +36,12 @@ const (
 	configPushTimeout       = 30 * time.Second
 )
 
-func waitForCaddyAPIReady(ctx context.Context, adminURL string, apiConfig *AdminAPIConfig) error {
+func waitForCaddyAPIReady(
+	ctx context.Context,
+	adminURL string,
+	apiConfig *AdminAPIConfig,
+	client *http.Client,
+) error {
 	initialDelay := constants.CaddyAPIInitialDelay
 	maxDelay := constants.CaddyAPIMaxDelay
 	delay := initialDelay
@@ -45,7 +50,9 @@ func waitForCaddyAPIReady(ctx context.Context, adminURL string, apiConfig *Admin
 	if before, ok := strings.CutSuffix(adminURL, "/load"); ok {
 		readyURL = before + "/config/"
 	}
-	client := &http.Client{Timeout: readinessRequestTimeout}
+	if client == nil {
+		client = &http.Client{Timeout: readinessRequestTimeout}
+	}
 	ticker := time.NewTicker(delay)
 	defer ticker.Stop()
 	for {
@@ -93,6 +100,8 @@ func (i *Instance) UpdateConfig(
 	apiConfig *AdminAPIConfig,
 ) error {
 	var adminURL string
+	scheme := "http"
+	port := "2019"
 	logger := log.With().
 		Str("node", i.NodeName).
 		Str("pod", i.PodName).
@@ -101,11 +110,14 @@ func (i *Instance) UpdateConfig(
 	logger.Debug().Msg("Updating Caddy configuration")
 	switch method {
 	case CommunicationMethodClusterIP:
-		adminURL = fmt.Sprintf(
-			"http://%s.%s.svc.cluster.local:2019/load",
-			i.ServiceName,
-			i.Namespace,
-		)
+		adminURL = (&url.URL{
+			Scheme: scheme,
+			Host: net.JoinHostPort(
+				fmt.Sprintf("%s.%s.svc.cluster.local", i.ServiceName, i.Namespace),
+				port,
+			),
+			Path: "/load",
+		}).String()
 	case CommunicationMethodDirect:
 		pod, err := i.KubeClient.CoreV1().Pods(i.Namespace).Get(ctx, i.PodName, metav1.GetOptions{})
 		if err != nil {
@@ -126,7 +138,7 @@ func (i *Instance) UpdateConfig(
 				Err:      podIPErr,
 			}
 		}
-		adminURL = (&url.URL{Scheme: "http", Host: net.JoinHostPort(podIP, "2019"), Path: "/load"}).String()
+		adminURL = (&url.URL{Scheme: scheme, Host: net.JoinHostPort(podIP, port), Path: "/load"}).String()
 	case CommunicationMethodHostNetwork:
 		node, err := i.KubeClient.CoreV1().Nodes().Get(ctx, i.NodeName, metav1.GetOptions{})
 		if err != nil {
@@ -161,7 +173,7 @@ func (i *Instance) UpdateConfig(
 				Err:      nodeIPErr,
 			}
 		}
-		adminURL = (&url.URL{Scheme: "http", Host: net.JoinHostPort(nodeIP, "2019"), Path: "/load"}).String()
+		adminURL = (&url.URL{Scheme: scheme, Host: net.JoinHostPort(nodeIP, port), Path: "/load"}).String()
 	default:
 		err := fmt.Errorf("unknown communication method: %d", method)
 		logger.Error().Err(err).Msg("Invalid communication method")
@@ -171,17 +183,23 @@ func (i *Instance) UpdateConfig(
 			Err:      err,
 		}
 	}
+	readinessClient := buildAdminHTTPClient(apiConfig, readinessRequestTimeout)
 	readyCtx, cancel := context.WithTimeout(ctx, constants.CaddyAPIReadyTimeout)
 	defer cancel()
-	if err := waitForCaddyAPIReady(readyCtx, adminURL, apiConfig); err != nil {
-		logger.Error().Err(err).Msg("Caddy Admin API not ready")
+	if readyErr := waitForCaddyAPIReady(
+		readyCtx,
+		adminURL,
+		apiConfig,
+		readinessClient,
+	); readyErr != nil {
+		logger.Error().Err(readyErr).Msg("Caddy Admin API not ready")
 		return &errors.ConfigurationFailedError{
 			NodeName: i.NodeName,
 			Reason:   "admin API not ready",
-			Err:      err,
+			Err:      readyErr,
 		}
 	}
-	client := &http.Client{Timeout: configPushTimeout}
+	client := buildAdminHTTPClient(apiConfig, configPushTimeout)
 	req, err := http.NewRequestWithContext(
 		ctx,
 		http.MethodPost,
@@ -247,4 +265,10 @@ func (i *Instance) UpdateConfig(
 	}
 	logger.Info().Msg("Successfully updated Caddy configuration")
 	return nil
+}
+
+func buildAdminHTTPClient(apiConfig *AdminAPIConfig, timeout time.Duration) *http.Client {
+	client := &http.Client{Timeout: timeout}
+	_ = apiConfig
+	return client
 }

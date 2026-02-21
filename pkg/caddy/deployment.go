@@ -8,6 +8,7 @@ import (
 	"github.com/rs/zerolog/log"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
@@ -70,7 +71,11 @@ func DeployCaddy(
 		return nil, err
 	}
 	if !useHostNetwork {
-		if err := deployService(deployCtx, clientset, instance); err != nil {
+		if err := deployService(
+			deployCtx,
+			clientset,
+			instance,
+		); err != nil {
 			cleanupDeployment(ctx, clientset, instance)
 			return nil, err
 		}
@@ -165,6 +170,7 @@ func deployDeployment(
 ) error {
 	logger := log.With().Str("deployment", instance.DeploymentName).Logger()
 	replicas := int32(1)
+	containers := []corev1.Container{}
 	caddyContainer := corev1.Container{
 		Name:  caddyContainerName,
 		Image: caddyImage,
@@ -293,6 +299,7 @@ func deployDeployment(
 		},
 	})
 	caddyContainer.Env = envVars
+	containers = append(containers, caddyContainer)
 	volumes := []corev1.Volume{
 		{
 			Name: "caddy-config",
@@ -356,7 +363,7 @@ func deployDeployment(
 		NodeSelector: map[string]string{
 			"kubernetes.io/hostname": instance.NodeName,
 		},
-		Containers: []corev1.Container{caddyContainer},
+		Containers: containers,
 		Volumes:    volumes,
 	}
 	if useHostNetwork {
@@ -437,9 +444,105 @@ func normalizeHostPort(port int) (int32, error) {
 	return int32(port), nil
 }
 
-func deployService(ctx context.Context, clientset *kubernetes.Clientset, instance *Instance) error {
+func deployService(
+	ctx context.Context,
+	clientset *kubernetes.Clientset,
+	instance *Instance,
+) error {
 	logger := log.With().Str("service", instance.ServiceName).Logger()
-	service := &corev1.Service{
+	service := desiredClusterIPService(instance)
+	existingService, err := clientset.CoreV1().
+		Services(instance.Namespace).
+		Get(ctx, instance.DeploymentName, metav1.GetOptions{})
+	switch {
+	case err == nil:
+		mergeServiceForUpdate(existingService, service)
+		_, err = clientset.CoreV1().
+			Services(instance.Namespace).
+			Update(ctx, existingService, metav1.UpdateOptions{})
+		if err != nil {
+			logger.Error().Err(err).Msg("Failed to update existing Caddy service")
+			return fmt.Errorf("failed to update service %s: %w", instance.DeploymentName, err)
+		}
+		logger.Info().Msg("Updated existing Caddy service")
+	case apierrors.IsNotFound(err):
+		_, err = clientset.CoreV1().
+			Services(instance.Namespace).
+			Create(ctx, service, metav1.CreateOptions{})
+		if err != nil {
+			logger.Error().Err(err).Msg("Failed to create Caddy service")
+			return fmt.Errorf("failed to create service %s: %w", instance.DeploymentName, err)
+		}
+		logger.Info().Msg("Created Caddy service")
+	default:
+		logger.Error().Err(err).Msg("Failed to fetch existing Caddy service")
+		return fmt.Errorf("failed to get service %s: %w", instance.DeploymentName, err)
+	}
+	return nil
+}
+
+func deployLoadBalancerService(
+	ctx context.Context,
+	clientset *kubernetes.Clientset,
+	instance *Instance,
+) error {
+	logger := log.With().
+		Str("loadbalancer_service", instance.DeploymentName+"-loadbalancer").
+		Logger()
+	loadBalancerServiceName := instance.DeploymentName + "-loadbalancer"
+	loadBalancerService := desiredLoadBalancerService(instance)
+	if len(instance.ExternalIPs) > 0 {
+		logger.Info().
+			Strs("externalIPs", instance.ExternalIPs).
+			Msg("Setting external IPs for LoadBalancer service")
+		loadBalancerService.Spec.ExternalIPs = instance.ExternalIPs
+	}
+	existingNPService, err := clientset.CoreV1().
+		Services(instance.Namespace).
+		Get(ctx, loadBalancerServiceName, metav1.GetOptions{})
+	switch {
+	case err == nil:
+		mergeServiceForUpdate(existingNPService, loadBalancerService)
+		_, err = clientset.CoreV1().
+			Services(instance.Namespace).
+			Update(ctx, existingNPService, metav1.UpdateOptions{})
+		if err != nil {
+			logger.Error().Err(err).Msg("Failed to update existing LoadBalancer service")
+			return fmt.Errorf(
+				"failed to update LoadBalancer service %s: %w",
+				loadBalancerServiceName,
+				err,
+			)
+		}
+		logger.Info().Msg("Updated existing LoadBalancer service")
+	case apierrors.IsNotFound(err):
+		_, err = clientset.CoreV1().
+			Services(instance.Namespace).
+			Create(ctx, loadBalancerService, metav1.CreateOptions{})
+		if err != nil {
+			logger.Error().Err(err).Msg("Failed to create LoadBalancer service")
+			return fmt.Errorf(
+				"failed to create LoadBalancer service %s: %w",
+				loadBalancerServiceName,
+				err,
+			)
+		}
+		logger.Info().Msg("Created LoadBalancer service")
+	default:
+		logger.Error().Err(err).Msg("Failed to fetch existing LoadBalancer service")
+		return fmt.Errorf(
+			"failed to get LoadBalancer service %s: %w",
+			loadBalancerServiceName,
+			err,
+		)
+	}
+	return nil
+}
+
+func desiredClusterIPService(
+	instance *Instance,
+) *corev1.Service {
+	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      instance.DeploymentName,
 			Namespace: instance.Namespace,
@@ -489,44 +592,12 @@ func deployService(ctx context.Context, clientset *kubernetes.Clientset, instanc
 			Type: corev1.ServiceTypeClusterIP,
 		},
 	}
-	existingService, err := clientset.CoreV1().
-		Services(instance.Namespace).
-		Get(ctx, instance.DeploymentName, metav1.GetOptions{})
-	if err == nil {
-		service.ResourceVersion = existingService.ResourceVersion
-		_, err = clientset.CoreV1().
-			Services(instance.Namespace).
-			Update(ctx, service, metav1.UpdateOptions{})
-		if err != nil {
-			logger.Error().Err(err).Msg("Failed to update existing Caddy service")
-			return fmt.Errorf("failed to update service %s: %w", instance.DeploymentName, err)
-		}
-		logger.Info().Msg("Updated existing Caddy service")
-	} else {
-		_, err = clientset.CoreV1().
-			Services(instance.Namespace).
-			Create(ctx, service, metav1.CreateOptions{})
-		if err != nil {
-			logger.Error().Err(err).Msg("Failed to create Caddy service")
-			return fmt.Errorf("failed to create service %s: %w", instance.DeploymentName, err)
-		}
-		logger.Info().Msg("Created Caddy service")
-	}
-	return nil
 }
 
-func deployLoadBalancerService(
-	ctx context.Context,
-	clientset *kubernetes.Clientset,
-	instance *Instance,
-) error {
-	logger := log.With().
-		Str("loadbalancer_service", instance.DeploymentName+"-loadbalancer").
-		Logger()
-	loadBalancerServiceName := instance.DeploymentName + "-loadbalancer"
-	loadBalancerService := &corev1.Service{
+func desiredLoadBalancerService(instance *Instance) *corev1.Service {
+	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      loadBalancerServiceName,
+			Name:      instance.DeploymentName + "-loadbalancer",
 			Namespace: instance.Namespace,
 			Labels: map[string]string{
 				"app":                        "caddy",
@@ -573,44 +644,43 @@ func deployLoadBalancerService(
 			ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyTypeLocal,
 		},
 	}
-	if len(instance.ExternalIPs) > 0 {
-		logger.Info().
-			Strs("externalIPs", instance.ExternalIPs).
-			Msg("Setting external IPs for LoadBalancer service")
-		loadBalancerService.Spec.ExternalIPs = instance.ExternalIPs
+}
+
+func mergeServiceForUpdate(existing, desired *corev1.Service) {
+	existing.Labels = desired.Labels
+	existing.Annotations = desired.Annotations
+	existing.Spec.Selector = desired.Spec.Selector
+	existing.Spec.Type = desired.Spec.Type
+	existing.Spec.ExternalIPs = desired.Spec.ExternalIPs
+	existing.Spec.ExternalTrafficPolicy = desired.Spec.ExternalTrafficPolicy
+	existing.Spec.LoadBalancerClass = desired.Spec.LoadBalancerClass
+	existing.Spec.Ports = mergeServicePortsKeepingNodePorts(existing.Spec.Ports, desired.Spec.Ports)
+}
+
+func mergeServicePortsKeepingNodePorts(
+	existingPorts []corev1.ServicePort,
+	desiredPorts []corev1.ServicePort,
+) []corev1.ServicePort {
+	if len(desiredPorts) == 0 {
+		return nil
 	}
-	existingNPService, err := clientset.CoreV1().
-		Services(instance.Namespace).
-		Get(ctx, loadBalancerServiceName, metav1.GetOptions{})
-	if err == nil {
-		loadBalancerService.ResourceVersion = existingNPService.ResourceVersion
-		_, err = clientset.CoreV1().
-			Services(instance.Namespace).
-			Update(ctx, loadBalancerService, metav1.UpdateOptions{})
-		if err != nil {
-			logger.Error().Err(err).Msg("Failed to update existing LoadBalancer service")
-			return fmt.Errorf(
-				"failed to update LoadBalancer service %s: %w",
-				loadBalancerServiceName,
-				err,
-			)
-		}
-		logger.Info().Msg("Updated existing LoadBalancer service")
-	} else {
-		_, err = clientset.CoreV1().
-			Services(instance.Namespace).
-			Create(ctx, loadBalancerService, metav1.CreateOptions{})
-		if err != nil {
-			logger.Error().Err(err).Msg("Failed to create LoadBalancer service")
-			return fmt.Errorf(
-				"failed to create LoadBalancer service %s: %w",
-				loadBalancerServiceName,
-				err,
-			)
-		}
-		logger.Info().Msg("Created LoadBalancer service")
+	byPortKey := make(map[string]corev1.ServicePort, len(existingPorts))
+	for _, port := range existingPorts {
+		byPortKey[servicePortKey(port)] = port
 	}
-	return nil
+	merged := make([]corev1.ServicePort, 0, len(desiredPorts))
+	for _, port := range desiredPorts {
+		if existingPort, exists := byPortKey[servicePortKey(port)]; exists &&
+			existingPort.NodePort > 0 {
+			port.NodePort = existingPort.NodePort
+		}
+		merged = append(merged, port)
+	}
+	return merged
+}
+
+func servicePortKey(port corev1.ServicePort) string {
+	return port.Name + "/" + string(port.Protocol)
 }
 
 func waitForDeploymentReady(
