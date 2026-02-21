@@ -22,6 +22,7 @@ type ConfigHandler struct {
 	EnableLoadBalancer  bool
 	DeployedInstances   map[string]*caddy.Instance
 	Mu                  *sync.RWMutex
+	handleMu            sync.Mutex
 	EnvSecretName       string
 	EnvSecretKeys       []string
 	DataVolumePVC       string
@@ -32,6 +33,11 @@ type ConfigHandler struct {
 	CaddyAdminOriginKey string
 	HTTPHostPort        int
 	HTTPSHostPort       int
+}
+
+type failedInstance struct {
+	nodeName string
+	instance *caddy.Instance
 }
 
 func NewConfigHandler(
@@ -74,6 +80,8 @@ func NewConfigHandler(
 }
 
 func (h *ConfigHandler) Handle(configData string) {
+	h.handleMu.Lock()
+	defer h.handleMu.Unlock()
 	logger := log.With().Str("component", "config_handler").Logger()
 	logger.Info().Msg("Detected configuration change, updating Caddy instances")
 	time.Sleep(constants.ConfigUpdateDelay)
@@ -83,7 +91,7 @@ func (h *ConfigHandler) Handle(configData string) {
 	h.Mu.RUnlock()
 	var wg sync.WaitGroup
 	var muFailed sync.Mutex
-	var failedNodes []string
+	var failedInstances []failedInstance
 	semaphore := make(chan struct{}, 5)
 	var apiConfig *caddy.AdminAPIConfig
 	if h.CaddyAdminOriginKey != "" {
@@ -126,7 +134,10 @@ func (h *ConfigHandler) Handle(configData string) {
 				if newCount >= 5 {
 					instanceLogger.Warn().Msg("Too many update failures, marking for redeployment")
 					muFailed.Lock()
-					failedNodes = append(failedNodes, nodeName)
+					failedInstances = append(failedInstances, failedInstance{
+						nodeName: nodeName,
+						instance: instance,
+					})
 					muFailed.Unlock()
 				}
 			} else {
@@ -144,25 +155,32 @@ func (h *ConfigHandler) Handle(configData string) {
 		}(nodeName, instance)
 	}
 	wg.Wait()
-	if len(failedNodes) > 0 {
-		logger.Info().Msgf("Redeploying %d failed instances", len(failedNodes))
-		for _, nodeName := range failedNodes {
-			h.Mu.RLock()
-			instance := h.DeployedInstances[nodeName]
-			h.Mu.RUnlock()
-			if instance == nil {
+	if len(failedInstances) > 0 {
+		logger.Info().Msgf("Redeploying %d failed instances", len(failedInstances))
+		for _, failed := range failedInstances {
+			h.Mu.Lock()
+			current := h.DeployedInstances[failed.nodeName]
+			if current == nil {
+				h.Mu.Unlock()
+				logger.Debug().Str("node", failed.nodeName).Msg("Failed instance no longer exists, skipping redeployment")
 				continue
 			}
-			logger.Info().Str("node", nodeName).Msg("Redeploying failed Caddy instance")
-			if err := instance.Delete(); err != nil {
-				logger.Error().Err(err).Str("node", nodeName).Msg("Failed to delete failed Caddy instance")
+			if current != failed.instance {
+				h.Mu.Unlock()
+				logger.Debug().Str("node", failed.nodeName).Msg("Failed instance was replaced, skipping redeployment")
 				continue
 			}
-			externalIPs := h.ExternalEndpoints[nodeName]
+			logger.Info().Str("node", failed.nodeName).Msg("Redeploying failed Caddy instance")
+			if err := failed.instance.Delete(); err != nil {
+				h.Mu.Unlock()
+				logger.Error().Err(err).Str("node", failed.nodeName).Msg("Failed to delete failed Caddy instance")
+				continue
+			}
+			externalIPs := h.ExternalEndpoints[failed.nodeName]
 			newInstance, err := caddy.DeployCaddy(
 				context.Background(),
 				h.Clientset,
-				nodeName,
+				failed.nodeName,
 				h.Namespace,
 				h.CaddyImage,
 				h.EnableLoadBalancer,
@@ -177,13 +195,13 @@ func (h *ConfigHandler) Handle(configData string) {
 				h.HTTPSHostPort,
 			)
 			if err != nil {
-				logger.Error().Err(err).Str("node", nodeName).Msg("Failed to redeploy Caddy instance")
+				h.Mu.Unlock()
+				logger.Error().Err(err).Str("node", failed.nodeName).Msg("Failed to redeploy Caddy instance")
 				continue
 			}
-			h.Mu.Lock()
-			h.DeployedInstances[nodeName] = newInstance
+			h.DeployedInstances[failed.nodeName] = newInstance
 			h.Mu.Unlock()
-			logger.Info().Str("node", nodeName).Msg("Successfully redeployed Caddy instance")
+			logger.Info().Str("node", failed.nodeName).Msg("Successfully redeployed Caddy instance")
 		}
 	}
 }
