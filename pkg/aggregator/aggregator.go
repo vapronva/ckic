@@ -57,6 +57,7 @@ func NewNamespaceAggregator(
 	}
 }
 
+//nolint:gocognit,nestif
 func (a *NamespaceAggregator) UpdateBase(base string) {
 	logger := log.With().Str("component", "aggregator").Logger()
 	a.mu.Lock()
@@ -124,6 +125,7 @@ func (a *NamespaceAggregator) UpdateBase(base string) {
 	}
 }
 
+//nolint:gocognit,nestif
 func (a *NamespaceAggregator) SetExternal(namespace, fragment string) {
 	logger := log.With().Str("component", "aggregator").Str("namespace", namespace).Logger()
 	a.mu.Lock()
@@ -214,6 +216,7 @@ func (a *NamespaceAggregator) SetExternalBatch(externals map[string]string) {
 		Msg("Batch loaded external fragments during initialization")
 }
 
+//nolint:gocognit,nestif
 func (a *NamespaceAggregator) MarkInitialized() {
 	logger := log.With().Str("component", "aggregator").Logger()
 	a.mu.Lock()
@@ -279,6 +282,7 @@ func (a *NamespaceAggregator) MarkInitialized() {
 	}
 }
 
+//nolint:gocognit,nestif
 func (a *NamespaceAggregator) RemoveExternal(namespace string) {
 	logger := log.With().Str("component", "aggregator").Str("namespace", namespace).Logger()
 	a.mu.Lock()

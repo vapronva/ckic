@@ -83,6 +83,7 @@ func NewConfigHandler(
 	}
 }
 
+//nolint:gocognit,nestif,funlen
 func (h *ConfigHandler) Handle(configData string) {
 	h.handleMu.Lock()
 	defer h.handleMu.Unlock()

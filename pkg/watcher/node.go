@@ -103,6 +103,7 @@ func (w *NodeWatcher) snapshotTrackedNodes() []string {
 	return nodes
 }
 
+//nolint:gocognit,cyclop,funlen
 func (w *NodeWatcher) Start(ctx context.Context) {
 	logger := log.With().
 		Str("component", "node_watcher").

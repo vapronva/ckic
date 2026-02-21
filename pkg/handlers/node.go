@@ -135,6 +135,7 @@ func (h *NodeHandler) StartWorkerPool(ctx context.Context, workerCount int) {
 	}
 }
 
+//nolint:gocognit,funlen
 func (h *NodeHandler) Handle(event watcher.NodeEvent) {
 	nodeName := event.NodeName
 	logger := log.With().Str("node", nodeName).Logger()

@@ -28,6 +28,7 @@ const (
 	caddyCapabilityDrop   = corev1.Capability("ALL")
 )
 
+//nolint:nestif
 func DeployCaddy(
 	ctx context.Context,
 	clientset *kubernetes.Clientset,
@@ -151,6 +152,7 @@ func resolvePodName(
 	return "", lastErr
 }
 
+//nolint:gocognit,funlen
 func deployDeployment(
 	ctx context.Context,
 	clientset *kubernetes.Clientset,

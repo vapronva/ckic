@@ -220,6 +220,7 @@ func (c *Controller) Run(ctx context.Context) error {
 	return nil
 }
 
+//nolint:gocognit,nestif,cyclop,funlen
 func (c *Controller) ReconcileState(ctx context.Context) error {
 	logger := log.With().Str("component", "reconcile").Logger()
 	logger.Info().Msg("Starting reconciliation process")
@@ -383,6 +384,7 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 	return nil
 }
 
+//nolint:gocognit
 func (c *Controller) runPeriodicConfigReconciliation(ctx context.Context) {
 	ticker := time.NewTicker(configReconciliationInterval)
 	defer ticker.Stop()

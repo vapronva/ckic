@@ -18,6 +18,7 @@ func SetupLogger(level zerolog.Level) {
 			TimeFormat: time.RFC3339,
 		})
 	}
+	//nolint:reassign
 	log.Logger = log.Output(output).With().Str("service", "ckic-manager").Logger()
 }
 

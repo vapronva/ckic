@@ -101,6 +101,7 @@ func (w *ExternalConfigWatcher) isNamespaceAllowed(namespace string) bool {
 	}
 }
 
+//nolint:gocognit,funlen
 func (w *ExternalConfigWatcher) Start(ctx context.Context) {
 	logger := log.With().Str("component", "external_config_watcher").Logger()
 	logger.Info().

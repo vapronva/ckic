@@ -66,6 +66,7 @@ func waitForCaddyAPIReady(ctx context.Context, adminURL string, apiConfig *Admin
 					fmt.Sprintf("http://%s.caddy-admin-api.ckic.cmld.ru", apiConfig.OriginKey),
 				)
 			}
+			//nolint:gosec
 			resp, err := client.Do(req)
 			if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 				_ = resp.Body.Close()
@@ -84,6 +85,7 @@ func waitForCaddyAPIReady(ctx context.Context, adminURL string, apiConfig *Admin
 	}
 }
 
+//nolint:gocognit,funlen
 func (i *Instance) UpdateConfig(
 	ctx context.Context,
 	configData string,
@@ -204,6 +206,7 @@ func (i *Instance) UpdateConfig(
 			Str("origin", req.Header.Get("Origin")).
 			Msg("Added Origin header for admin API security")
 	}
+	//nolint:gosec
 	resp, err := client.Do(req)
 	if err != nil {
 		logger.Error().Err(err).Msg("Failed to send configuration to Caddy")

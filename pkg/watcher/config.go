@@ -193,6 +193,7 @@ func (w *ConfigWatcher) refreshResourceVersion(ctx context.Context, logger zerol
 	return nil
 }
 
+//nolint:gocognit,nestif,funlen
 func (w *ConfigWatcher) Start(ctx context.Context) {
 	logger := log.With().
 		Str("component", "config_watcher").

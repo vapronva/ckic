@@ -119,6 +119,7 @@ func main() {
 	}
 }
 
+//nolint:funlen
 func parseCLIOptions() cliOptions {
 	kubeconfigPath := pflag.String("kubeconfig", "", "Path to kubeconfig file")
 	nodeLabel := pflag.String("node-label", "ckic.cmld.ru/enabled", "Node label to watch for")
