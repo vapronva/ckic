@@ -12,14 +12,14 @@ import (
 )
 
 type Instance struct {
-	NodeName       string                `json:"nodeName"`
-	Namespace      string                `json:"namespace"`
-	PodName        string                `json:"podName"`
-	ServiceName    string                `json:"serviceName"`
-	DeploymentName string                `json:"deploymentName"`
-	FailureCount   atomic.Int32          `json:"-"`
-	ExternalIPs    []string              `json:"externalIPs,omitempty"`
-	KubeClient     *kubernetes.Clientset `json:"-"`
+	NodeName       string               `json:"nodeName"`
+	Namespace      string               `json:"namespace"`
+	PodName        string               `json:"podName"`
+	ServiceName    string               `json:"serviceName"`
+	DeploymentName string               `json:"deploymentName"`
+	FailureCount   atomic.Int32         `json:"-"`
+	ExternalIPs    []string             `json:"externalIPs,omitempty"`
+	KubeClient     kubernetes.Interface `json:"-"`
 }
 
 type instanceJSON struct {
