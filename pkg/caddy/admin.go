@@ -12,8 +12,8 @@ import (
 	"github.com/rs/zerolog/log"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"gl.vprw.ru/vapronva/ckic/pkg/constants"
-	"gl.vprw.ru/vapronva/ckic/pkg/errors"
+	"git.horse/vapronva/ckic/pkg/constants"
+	"git.horse/vapronva/ckic/pkg/errors"
 )
 
 type CommunicationMethod int
@@ -152,7 +152,6 @@ func (i *Instance) UpdateConfig(ctx context.Context, configData string, method C
 	client := &http.Client{
 		Timeout: 30 * time.Second,
 	}
-	// #nosec G107
 	req, err := http.NewRequestWithContext(ctx, "POST", adminURL, bytes.NewBufferString(configData))
 	if err != nil {
 		logger.Error().Err(err).Msg("Failed to create HTTP request")

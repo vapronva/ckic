@@ -12,7 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 
-	"gl.vprw.ru/vapronva/ckic/pkg/constants"
+	"git.horse/vapronva/ckic/pkg/constants"
 )
 
 type ConfigHandlerFunc func(string)
@@ -202,7 +202,6 @@ func (w *ConfigWatcher) Start(ctx context.Context) {
 			if failureCount >= w.maxFailures {
 				sleepTime := w.resetTimeout - time.Since(lastSuccess)
 				if sleepTime > 0 {
-					// bearer:disable go_lang_logger_leak
 					logger.Warn().Msgf("Circuit breaker open, sleeping for %v", sleepTime)
 					time.Sleep(sleepTime)
 				}
@@ -252,8 +251,7 @@ func (w *ConfigWatcher) Start(ctx context.Context) {
 						continue
 					}
 					if w.nodeAvailableCheck() {
-						logger.Info().Str("event", string(event.Type)).
-							Msg("ConfigMap updated, notifying handlers")
+						logger.Info().Str("event", string(event.Type)).Msg("ConfigMap updated, notifying handlers")
 						w.configHandler(configData)
 						w.mu.Lock()
 						w.lastProcessedConfig = configData

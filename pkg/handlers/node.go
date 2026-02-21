@@ -8,9 +8,9 @@ import (
 	"github.com/rs/zerolog/log"
 	"k8s.io/client-go/kubernetes"
 
-	"gl.vprw.ru/vapronva/ckic/pkg/caddy"
-	"gl.vprw.ru/vapronva/ckic/pkg/utils"
-	"gl.vprw.ru/vapronva/ckic/pkg/watcher"
+	"git.horse/vapronva/ckic/pkg/caddy"
+	"git.horse/vapronva/ckic/pkg/utils"
+	"git.horse/vapronva/ckic/pkg/watcher"
 )
 
 type deploymentJob struct {

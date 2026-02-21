@@ -5,8 +5,8 @@ import (
 
 	"github.com/rs/zerolog/log"
 
-	"gl.vprw.ru/vapronva/ckic/pkg/caddy"
-	"gl.vprw.ru/vapronva/ckic/pkg/watcher"
+	"git.horse/vapronva/ckic/pkg/caddy"
+	"git.horse/vapronva/ckic/pkg/watcher"
 )
 
 type WatcherCoordinator struct {

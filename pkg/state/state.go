@@ -10,8 +10,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
-	"gl.vprw.ru/vapronva/ckic/pkg/caddy"
-	"gl.vprw.ru/vapronva/ckic/pkg/constants"
+	"git.horse/vapronva/ckic/pkg/caddy"
+	"git.horse/vapronva/ckic/pkg/constants"
 )
 
 type StateStore interface {

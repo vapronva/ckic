@@ -485,7 +485,7 @@ func deployLoadBalancerService(ctx context.Context, clientset *kubernetes.Client
 				},
 			},
 			Type:                  corev1.ServiceTypeLoadBalancer,
-			LoadBalancerClass:     StringPtr("io.cilium/node"),
+			LoadBalancerClass:     new("io.cilium/node"),
 			ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyTypeLocal,
 		},
 	}
@@ -550,9 +550,9 @@ func cleanupDeployment(ctx context.Context, clientset kubernetes.Interface, inst
 }
 
 func hostPathTypePtr(t corev1.HostPathType) *corev1.HostPathType {
-	return &t
+	return new(t)
 }
 
 func StringPtr(s string) *string {
-	return &s
+	return new(s)
 }

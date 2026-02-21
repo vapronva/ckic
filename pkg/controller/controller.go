@@ -11,13 +11,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
-	"gl.vprw.ru/vapronva/ckic/pkg/aggregator"
-	"gl.vprw.ru/vapronva/ckic/pkg/caddy"
-	"gl.vprw.ru/vapronva/ckic/pkg/constants"
-	"gl.vprw.ru/vapronva/ckic/pkg/handlers"
-	"gl.vprw.ru/vapronva/ckic/pkg/state"
-	"gl.vprw.ru/vapronva/ckic/pkg/utils"
-	"gl.vprw.ru/vapronva/ckic/pkg/watcher"
+	"git.horse/vapronva/ckic/pkg/aggregator"
+	"git.horse/vapronva/ckic/pkg/caddy"
+	"git.horse/vapronva/ckic/pkg/constants"
+	"git.horse/vapronva/ckic/pkg/handlers"
+	"git.horse/vapronva/ckic/pkg/state"
+	"git.horse/vapronva/ckic/pkg/utils"
+	"git.horse/vapronva/ckic/pkg/watcher"
 )
 
 type ControllerConfig struct {
@@ -212,7 +212,6 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 				LabelSelector: "app=caddy,instance=" + nodeName,
 			})
 			if errPL != nil || len(podList.Items) == 0 {
-				// bearer:disable go_lang_logger_leak
 				logger.Warn().Msgf("No pods found for healthy deployment on node %s", nodeName)
 				continue
 			}
@@ -225,10 +224,8 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 				KubeClient:     c.clientset,
 			}
 			discovered[nodeName] = instance
-			// bearer:disable go_lang_logger_leak
 			logger.Info().Msgf("Adopted existing healthy deployment on node %s", nodeName)
 		} else {
-			// bearer:disable go_lang_logger_leak
 			logger.Warn().Msgf("Deployment on node %s is not healthy, deleting orphaned deployment", nodeName)
 			instance := &caddy.Instance{
 				NodeName:       nodeName,
@@ -238,10 +235,8 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 				KubeClient:     c.clientset,
 			}
 			if errID := instance.Delete(); errID != nil {
-				// bearer:disable go_lang_logger_leak
 				logger.Error().Err(errID).Msgf("Failed to delete orphaned deployment on node %s", nodeName)
 			} else {
-				// bearer:disable go_lang_logger_leak
 				logger.Info().Msgf("Deleted orphaned deployment on node %s", nodeName)
 			}
 		}

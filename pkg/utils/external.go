@@ -18,7 +18,7 @@ func ParseExternalEndpoints(endpoints []string, endpointsFile string) (ExternalE
 		if !filepath.IsAbs(cleanPath) {
 			return nil, fmt.Errorf("external endpoints file must be an absolute path: %s", endpointsFile)
 		}
-		fileData, err := os.ReadFile(cleanPath) // #nosec G304
+		fileData, err := os.ReadFile(cleanPath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read external endpoints file: %w", err)
 		}

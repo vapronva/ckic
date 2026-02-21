@@ -13,7 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 
-	"gl.vprw.ru/vapronva/ckic/pkg/constants"
+	"git.horse/vapronva/ckic/pkg/constants"
 )
 
 type ExternalConfigUpdateFunc func(namespace, fragment string)
@@ -130,7 +130,6 @@ func (w *ExternalConfigWatcher) Start(ctx context.Context) {
 			if w.failureCount >= w.maxFailures {
 				sleepTime := w.resetTimeout - time.Since(w.lastSuccess)
 				if sleepTime > 0 {
-					// bearer:disable go_lang_logger_leak
 					logger.Warn().Msgf("Circuit breaker open, sleeping for %v", sleepTime)
 					time.Sleep(sleepTime)
 				}
@@ -176,11 +175,7 @@ func (w *ExternalConfigWatcher) Start(ctx context.Context) {
 						logger.Debug().Str("event", string(event.Type)).Str("namespace", cm.Namespace).Str("name", cm.Name).Msg("External ConfigMap content unchanged, skipping")
 						continue
 					}
-					logger.Info().
-						Str("event", string(event.Type)).
-						Str("namespace", cm.Namespace).
-						Str("name", cm.Name).
-						Msg("External ConfigMap updated")
+					logger.Info().Str("event", string(event.Type)).Str("namespace", cm.Namespace).Str("name", cm.Name).Msg("External ConfigMap updated")
 					if w.onUpdate != nil {
 						w.onUpdate(sourceKey, fragment)
 					}

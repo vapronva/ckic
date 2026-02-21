@@ -9,9 +9,9 @@ import (
 	"github.com/rs/zerolog/log"
 	"k8s.io/client-go/kubernetes"
 
-	"gl.vprw.ru/vapronva/ckic/pkg/caddy"
-	"gl.vprw.ru/vapronva/ckic/pkg/constants"
-	"gl.vprw.ru/vapronva/ckic/pkg/utils"
+	"git.horse/vapronva/ckic/pkg/caddy"
+	"git.horse/vapronva/ckic/pkg/constants"
+	"git.horse/vapronva/ckic/pkg/utils"
 )
 
 type ConfigHandler struct {
@@ -145,7 +145,6 @@ func (h *ConfigHandler) Handle(configData string) {
 	}
 	wg.Wait()
 	if len(failedNodes) > 0 {
-		// bearer:disable go_lang_logger_leak
 		logger.Info().Msgf("Redeploying %d failed instances", len(failedNodes))
 		for _, nodeName := range failedNodes {
 			h.Mu.RLock()

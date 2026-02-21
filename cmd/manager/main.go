@@ -10,9 +10,9 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/pflag"
 
-	"gl.vprw.ru/vapronva/ckic/pkg/caddy"
-	"gl.vprw.ru/vapronva/ckic/pkg/controller"
-	"gl.vprw.ru/vapronva/ckic/pkg/utils"
+	"git.horse/vapronva/ckic/pkg/caddy"
+	"git.horse/vapronva/ckic/pkg/controller"
+	"git.horse/vapronva/ckic/pkg/utils"
 )
 
 func main() {
@@ -52,7 +52,6 @@ func main() {
 	case "hostnetwork":
 		commMethod = caddy.CommunicationMethodHostNetwork
 	default:
-		// bearer:disable go_lang_logger_leak
 		log.Warn().Msgf("Unknown communication method %s, defaulting to clusterip", *communicationMethod)
 		commMethod = caddy.CommunicationMethodClusterIP
 	}

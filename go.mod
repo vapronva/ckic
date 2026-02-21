@@ -1,4 +1,4 @@
-module gl.vprw.ru/vapronva/ckic
+module git.horse/vapronva/ckic
 
 go 1.26
 
