@@ -7,22 +7,29 @@ import (
 )
 
 func GetKubernetesClient(kubeconfig string) (*kubernetes.Clientset, error) {
-	var config *rest.Config
-	var err error
-	if kubeconfig == "" {
-		config, err = rest.InClusterConfig()
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
-		if err != nil {
-			return nil, err
-		}
+	config, err := getKubernetesConfig(kubeconfig)
+	if err != nil {
+		return nil, err
 	}
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		return nil, err
 	}
 	return clientset, nil
+}
+
+func getKubernetesConfig(kubeconfig string) (*rest.Config, error) {
+	if kubeconfig != "" {
+		return clientcmd.BuildConfigFromFlags("", kubeconfig)
+	}
+
+	config, err := rest.InClusterConfig()
+	if err == nil {
+		return config, nil
+	}
+
+	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		clientcmd.NewDefaultClientConfigLoadingRules(),
+		&clientcmd.ConfigOverrides{},
+	).ClientConfig()
 }
