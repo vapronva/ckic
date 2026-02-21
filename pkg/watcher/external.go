@@ -2,6 +2,7 @@ package watcher
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
@@ -125,23 +127,11 @@ func (w *ExternalConfigWatcher) Start(ctx context.Context) {
 		}
 		watchOptions := metav1.ListOptions{
 			LabelSelector:   w.labelSelector,
-			ResourceVersion: "",
+			ResourceVersion: w.lastResourceVersion,
 		}
 		watcher, err := w.clientset.CoreV1().ConfigMaps("").Watch(ctx, watchOptions)
 		if err != nil {
-			logger.Error().Err(err).Msg("Failed to create external ConfigMap watcher, retrying")
-			w.failureCount++
-			if w.failureCount >= w.maxFailures {
-				sleepTime := w.resetTimeout - time.Since(w.lastSuccess)
-				if sleepTime > 0 {
-					logger.Warn().Msgf("Circuit breaker open, sleeping for %v", sleepTime)
-					time.Sleep(sleepTime)
-				}
-				w.failureCount = 0
-			} else {
-				time.Sleep(delay)
-				delay = minExternalDuration(time.Duration(float64(delay)*multiplier), maxDelay)
-			}
+			delay = w.handleWatchCreateError(ctx, logger, err, delay, maxDelay, multiplier)
 			continue
 		}
 		delay = constants.ConfigMapWatcherInitialDelay
@@ -154,13 +144,7 @@ func (w *ExternalConfigWatcher) Start(ctx context.Context) {
 			default:
 			}
 			if event.Type == watch.Error {
-				if status, ok := event.Object.(*metav1.Status); ok && status.Code == 410 {
-					logger.Info().
-						Int32("code", status.Code).
-						Msg("Received watch timeout (410); ignoring because we restart with an empty resourceVersion")
-				} else {
-					logger.Error().Msg("Error in external ConfigMap watch channel")
-				}
+				w.handleWatchErrorEvent(ctx, logger, event)
 				break
 			}
 			cm, ok := event.Object.(*corev1.ConfigMap)
@@ -168,13 +152,13 @@ func (w *ExternalConfigWatcher) Start(ctx context.Context) {
 				logger.Warn().Msg("Unexpected object in external ConfigMap watch")
 				continue
 			}
+			w.lastResourceVersion = cm.ResourceVersion
 			if !w.isNamespaceAllowed(cm.Namespace) {
 				logger.Debug().
 					Str("namespace", cm.Namespace).
 					Msg("Skipping ConfigMap from excluded namespace")
 				continue
 			}
-			w.lastResourceVersion = cm.ResourceVersion
 			switch event.Type {
 			case watch.Added, watch.Modified:
 				if fragment, exists := cm.Data["Caddyfile"]; exists {
@@ -227,6 +211,70 @@ func (w *ExternalConfigWatcher) Start(ctx context.Context) {
 	}
 }
 
+func (w *ExternalConfigWatcher) handleWatchCreateError(
+	ctx context.Context,
+	logger zerolog.Logger,
+	err error,
+	delay, maxDelay time.Duration,
+	multiplier float64,
+) time.Duration {
+	if isExternalResourceVersionExpired(err) {
+		logger.Warn().
+			Err(err).
+			Str("resourceVersion", w.lastResourceVersion).
+			Msg("External watch resourceVersion expired, reconciling from full list")
+		reconcileErr := w.reconcileFromList(ctx, logger)
+		if reconcileErr == nil {
+			return constants.ConfigMapWatcherInitialDelay
+		}
+		logger.Error().
+			Err(reconcileErr).
+			Msg("Failed to reconcile external ConfigMaps after expired watch")
+	}
+	logger.Error().Err(err).Msg("Failed to create external ConfigMap watcher, retrying")
+	w.failureCount++
+	if w.failureCount < w.maxFailures {
+		time.Sleep(delay)
+		return minExternalDuration(time.Duration(float64(delay)*multiplier), maxDelay)
+	}
+	sleepTime := w.resetTimeout - time.Since(w.lastSuccess)
+	if sleepTime > 0 {
+		logger.Warn().Msgf("Circuit breaker open, sleeping for %v", sleepTime)
+		time.Sleep(sleepTime)
+	}
+	w.failureCount = 0
+	return delay
+}
+
+func (w *ExternalConfigWatcher) handleWatchErrorEvent(
+	ctx context.Context,
+	logger zerolog.Logger,
+	event watch.Event,
+) {
+	status, statusOK := event.Object.(*metav1.Status)
+	if !statusOK {
+		logger.Error().Msg("Error in external ConfigMap watch channel")
+		return
+	}
+	if !isExternalWatchExpiredStatus(status) {
+		logger.Error().
+			Int32("code", status.Code).
+			Str("reason", string(status.Reason)).
+			Str("message", status.Message).
+			Msg("Error in external ConfigMap watch channel")
+		return
+	}
+	logger.Warn().
+		Int32("code", status.Code).
+		Str("resourceVersion", w.lastResourceVersion).
+		Msg("Received expired external watch event, reconciling from full list")
+	if reconcileErr := w.reconcileFromList(ctx, logger); reconcileErr != nil {
+		logger.Error().
+			Err(reconcileErr).
+			Msg("Failed to reconcile external ConfigMaps after expired watch event")
+	}
+}
+
 func (w *ExternalConfigWatcher) initialList(ctx context.Context, logger zerolog.Logger) {
 	listOptions := metav1.ListOptions{
 		LabelSelector: w.labelSelector,
@@ -260,6 +308,79 @@ func (w *ExternalConfigWatcher) initialList(ctx context.Context, logger zerolog.
 	w.lastSuccess = time.Now()
 }
 
+func (w *ExternalConfigWatcher) reconcileFromList(
+	ctx context.Context,
+	logger zerolog.Logger,
+) error {
+	listOptions := metav1.ListOptions{
+		LabelSelector: w.labelSelector,
+	}
+	configMaps, err := w.clientset.CoreV1().ConfigMaps("").List(ctx, listOptions)
+	if err != nil {
+		return fmt.Errorf("failed to list external ConfigMaps for reconciliation: %w", err)
+	}
+	w.reconcileSnapshot(configMaps, logger)
+	return nil
+}
+
+func (w *ExternalConfigWatcher) reconcileSnapshot(
+	configMaps *corev1.ConfigMapList,
+	logger zerolog.Logger,
+) {
+	seen := make(map[string]struct{}, len(configMaps.Items))
+	updates := 0
+	removals := 0
+	for _, cm := range configMaps.Items {
+		if !w.isNamespaceAllowed(cm.Namespace) {
+			continue
+		}
+		sourceKey := fmt.Sprintf("%s/%s", cm.Namespace, cm.Name)
+		seen[sourceKey] = struct{}{}
+		fragment, exists := cm.Data["Caddyfile"]
+		if !exists {
+			logger.Warn().
+				Str("namespace", cm.Namespace).
+				Str("name", cm.Name).
+				Msg("External ConfigMap missing 'Caddyfile' key during reconciliation")
+			continue
+		}
+		if w.lastProcessedConfigs[sourceKey] == fragment {
+			continue
+		}
+		logger.Info().
+			Str("namespace", cm.Namespace).
+			Str("name", cm.Name).
+			Msg("Reconciling external ConfigMap update")
+		if w.onUpdate != nil {
+			w.onUpdate(sourceKey, fragment)
+		}
+		w.lastProcessedConfigs[sourceKey] = fragment
+		updates++
+	}
+	for sourceKey := range w.lastProcessedConfigs {
+		if _, exists := seen[sourceKey]; exists {
+			continue
+		}
+		logger.Info().
+			Str("source", sourceKey).
+			Msg("Reconciling stale external ConfigMap removal")
+		if w.onRemove != nil {
+			w.onRemove(sourceKey)
+		}
+		delete(w.lastProcessedConfigs, sourceKey)
+		removals++
+	}
+	w.lastResourceVersion = configMaps.ResourceVersion
+	w.lastSuccess = time.Now()
+	w.failureCount = 0
+	logger.Info().
+		Int("count", len(configMaps.Items)).
+		Int("updates", updates).
+		Int("removals", removals).
+		Str("resourceVersion", w.lastResourceVersion).
+		Msg("External ConfigMap reconciliation complete")
+}
+
 func (w *ExternalConfigWatcher) InitialListBatch(ctx context.Context) (map[string]string, error) {
 	logger := log.With().Str("component", "external_config_watcher").Logger()
 	listOptions := metav1.ListOptions{
@@ -289,6 +410,28 @@ func (w *ExternalConfigWatcher) InitialListBatch(ctx context.Context) (map[strin
 		Str("resourceVersion", w.lastResourceVersion).
 		Msg("Batch loaded external ConfigMaps")
 	return externals, nil
+}
+
+func isExternalResourceVersionExpired(err error) bool {
+	if err == nil {
+		return false
+	}
+	if apierrors.IsResourceExpired(err) || apierrors.IsGone(err) {
+		return true
+	}
+	statusErr := &apierrors.StatusError{}
+	ok := errors.As(err, &statusErr)
+	if !ok {
+		return false
+	}
+	return isExternalWatchExpiredStatus(&statusErr.ErrStatus)
+}
+
+func isExternalWatchExpiredStatus(status *metav1.Status) bool {
+	if status == nil {
+		return false
+	}
+	return status.Code == 410 || status.Reason == metav1.StatusReasonExpired
 }
 
 func minExternalDuration(a, b time.Duration) time.Duration {
