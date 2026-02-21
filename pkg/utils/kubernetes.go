@@ -1,9 +1,6 @@
 package utils
 
 import (
-	"os"
-	"path/filepath"
-
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -18,11 +15,6 @@ func GetKubernetesClient(kubeconfig string) (*kubernetes.Clientset, error) {
 			return nil, err
 		}
 	} else {
-		if kubeconfig == "" {
-			if home := homeDir(); home != "" {
-				kubeconfig = filepath.Join(home, ".kube", "config")
-			}
-		}
 		config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
 		if err != nil {
 			return nil, err
@@ -33,11 +25,4 @@ func GetKubernetesClient(kubeconfig string) (*kubernetes.Clientset, error) {
 		return nil, err
 	}
 	return clientset, nil
-}
-
-func homeDir() string {
-	if h := os.Getenv("HOME"); h != "" {
-		return h
-	}
-	return os.Getenv("XDG_CONFIG_HOME")
 }

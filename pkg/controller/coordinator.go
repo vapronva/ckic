@@ -22,7 +22,12 @@ type coordinatedConfigWatcher interface {
 	Pause()
 }
 
-func NewWatcherCoordinator(nodeWatcher *watcher.NodeWatcher, configWatcher coordinatedConfigWatcher, deployedInstances map[string]*caddy.Instance, mu *sync.RWMutex) *WatcherCoordinator {
+func NewWatcherCoordinator(
+	nodeWatcher *watcher.NodeWatcher,
+	configWatcher coordinatedConfigWatcher,
+	deployedInstances map[string]*caddy.Instance,
+	mu *sync.RWMutex,
+) *WatcherCoordinator {
 	return &WatcherCoordinator{
 		mu:                mu,
 		nodeWatcher:       nodeWatcher,

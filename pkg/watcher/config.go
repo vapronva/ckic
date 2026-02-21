@@ -36,8 +36,17 @@ type ConfigWatcher struct {
 	lastSuccess         time.Time
 }
 
-func NewConfigWatcher(clientset *kubernetes.Clientset, namespace, configMapName string,
-	handler ConfigHandlerFunc, nodeAvailableCheck func() bool,
+const (
+	configWatcherMaxFailures  = 5
+	configWatcherResetTimeout = 5 * time.Minute
+	configPauseSleep          = 10 * time.Second
+)
+
+func NewConfigWatcher(
+	clientset *kubernetes.Clientset,
+	namespace, configMapName string,
+	handler ConfigHandlerFunc,
+	nodeAvailableCheck func() bool,
 ) *ConfigWatcher {
 	return &ConfigWatcher{
 		clientset:          clientset,
@@ -46,8 +55,8 @@ func NewConfigWatcher(clientset *kubernetes.Clientset, namespace, configMapName 
 		configHandler:      handler,
 		nodeAvailableCheck: nodeAvailableCheck,
 		isPaused:           false,
-		maxFailures:        5,
-		resetTimeout:       5 * time.Minute,
+		maxFailures:        configWatcherMaxFailures,
+		resetTimeout:       configWatcherResetTimeout,
 		lastSuccess:        time.Now(),
 	}
 }
@@ -102,7 +111,8 @@ func (w *ConfigWatcher) EnsureSync() {
 		w.isPaused = false
 		log.Info().Msg("ConfigMap watcher resumed")
 	}
-	shouldProcessCached := w.hasCachedConfig && w.nodeAvailableCheck != nil && w.nodeAvailableCheck()
+	shouldProcessCached := w.hasCachedConfig && w.nodeAvailableCheck != nil &&
+		w.nodeAvailableCheck()
 	var cachedConfig string
 	if shouldProcessCached {
 		cachedConfig = w.cachedConfig
@@ -149,7 +159,9 @@ func minDuration(a, b time.Duration) time.Duration {
 }
 
 func (w *ConfigWatcher) refreshResourceVersion(ctx context.Context, logger zerolog.Logger) error {
-	cm, err := w.clientset.CoreV1().ConfigMaps(w.namespace).Get(ctx, w.configMapName, metav1.GetOptions{})
+	cm, err := w.clientset.CoreV1().
+		ConfigMaps(w.namespace).
+		Get(ctx, w.configMapName, metav1.GetOptions{})
 	if err != nil {
 		return err
 	}
@@ -182,9 +194,15 @@ func (w *ConfigWatcher) refreshResourceVersion(ctx context.Context, logger zerol
 }
 
 func (w *ConfigWatcher) Start(ctx context.Context) {
-	logger := log.With().Str("component", "config_watcher").Str("namespace", w.namespace).Str("configmap", w.configMapName).Logger()
+	logger := log.With().
+		Str("component", "config_watcher").
+		Str("namespace", w.namespace).
+		Str("configmap", w.configMapName).
+		Logger()
 	logger.Info().Msg("Starting config watcher")
-	configMap, err := w.clientset.CoreV1().ConfigMaps(w.namespace).Get(ctx, w.configMapName, metav1.GetOptions{})
+	configMap, err := w.clientset.CoreV1().
+		ConfigMaps(w.namespace).
+		Get(ctx, w.configMapName, metav1.GetOptions{})
 	if err != nil {
 		logger.Error().Err(err).Msg("Failed to get initial ConfigMap, creating a new one")
 		configMap = &corev1.ConfigMap{
@@ -196,7 +214,9 @@ func (w *ConfigWatcher) Start(ctx context.Context) {
 				"Caddyfile": ":80 {\n    respond \"Hello, world!\"\n}\n",
 			},
 		}
-		_, err = w.clientset.CoreV1().ConfigMaps(w.namespace).Create(ctx, configMap, metav1.CreateOptions{})
+		_, err = w.clientset.CoreV1().
+			ConfigMaps(w.namespace).
+			Create(ctx, configMap, metav1.CreateOptions{})
 		if err != nil {
 			logger.Error().Err(err).Msg("Failed to create default ConfigMap")
 		}
@@ -234,16 +254,16 @@ func (w *ConfigWatcher) Start(ctx context.Context) {
 		w.mu.RUnlock()
 		if paused {
 			logger.Debug().Msg("Config watcher is paused; sleeping until resumed")
-			time.Sleep(10 * time.Second)
+			time.Sleep(configPauseSleep)
 			continue
 		}
 		watchOptions := metav1.ListOptions{
 			FieldSelector:   "metadata.name=" + w.configMapName,
 			ResourceVersion: "",
 		}
-		watcher, err := w.clientset.CoreV1().ConfigMaps(w.namespace).Watch(ctx, watchOptions)
-		if err != nil {
-			logger.Error().Err(err).Msg("Failed to create ConfigMap watcher, retrying")
+		cmWatcher, watchErr := w.clientset.CoreV1().ConfigMaps(w.namespace).Watch(ctx, watchOptions)
+		if watchErr != nil {
+			logger.Error().Err(watchErr).Msg("Failed to create ConfigMap watcher, retrying")
 			w.mu.Lock()
 			w.failureCount++
 			failureCount := w.failureCount
@@ -268,19 +288,25 @@ func (w *ConfigWatcher) Start(ctx context.Context) {
 			continue
 		}
 		delay = constants.ConfigMapWatcherInitialDelay
-		for event := range watcher.ResultChan() {
+		for event := range cmWatcher.ResultChan() {
 			select {
 			case <-ctx.Done():
-				watcher.Stop()
+				cmWatcher.Stop()
 				logger.Info().Msg("Config watcher shutting down")
 				return
 			default:
 			}
 			if event.Type == watch.Error {
 				if status, ok := event.Object.(*metav1.Status); ok && status.Code == 410 {
-					logger.Info().Int32("code", status.Code).Msg("Received watch timeout (410); ignoring because we restart with an empty resourceVersion")
-				} else if status, ok := event.Object.(*metav1.Status); ok {
-					logger.Error().Int32("code", status.Code).Str("reason", string(status.Reason)).Str("message", status.Message).Msg("Error in ConfigMap watch channel")
+					logger.Info().
+						Int32("code", status.Code).
+						Msg("Received watch timeout (410); ignoring because we restart with an empty resourceVersion")
+				} else if eventStatus, eventStatusOK := event.Object.(*metav1.Status); eventStatusOK {
+					logger.Error().
+						Int32("code", eventStatus.Code).
+						Str("reason", string(eventStatus.Reason)).
+						Str("message", eventStatus.Message).
+						Msg("Error in ConfigMap watch channel")
 				} else {
 					logger.Error().Msg("Error in ConfigMap watch channel")
 				}
@@ -297,11 +323,15 @@ func (w *ConfigWatcher) Start(ctx context.Context) {
 					lastProcessed := w.lastProcessedConfig
 					w.mu.RUnlock()
 					if configData == lastProcessed {
-						logger.Debug().Str("event", string(event.Type)).Msg("ConfigMap content unchanged, skipping handler")
+						logger.Debug().
+							Str("event", string(event.Type)).
+							Msg("ConfigMap content unchanged, skipping handler")
 						continue
 					}
 					if w.nodeAvailableCheck() {
-						logger.Info().Str("event", string(event.Type)).Msg("ConfigMap updated, notifying handlers")
+						logger.Info().
+							Str("event", string(event.Type)).
+							Msg("ConfigMap updated, notifying handlers")
 						w.configHandler(configData)
 						w.mu.Lock()
 						w.lastProcessedConfig = configData
@@ -309,7 +339,8 @@ func (w *ConfigWatcher) Start(ctx context.Context) {
 						w.failureCount = 0
 						w.mu.Unlock()
 					} else {
-						logger.Info().Msg("ConfigMap updated but no eligible nodes available, caching config")
+						logger.Info().
+							Msg("ConfigMap updated but no eligible nodes available, caching config")
 						w.mu.Lock()
 						w.cachedConfig = configData
 						w.hasCachedConfig = true

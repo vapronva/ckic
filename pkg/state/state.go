@@ -25,7 +25,10 @@ type ConfigMapStateStore struct {
 	Name      string
 }
 
-func NewConfigMapStateStore(client kubernetes.Interface, namespace, name string) *ConfigMapStateStore {
+func NewConfigMapStateStore(
+	client kubernetes.Interface,
+	namespace, name string,
+) *ConfigMapStateStore {
 	return &ConfigMapStateStore{
 		Client:    client,
 		Namespace: namespace,
@@ -38,50 +41,56 @@ func (s *ConfigMapStateStore) SaveState(state map[string]*caddy.Instance) error 
 	if err != nil {
 		return fmt.Errorf("failed to marshal state: %w", err)
 	}
-	cm, err := s.Client.CoreV1().ConfigMaps(s.Namespace).Get(
-		context.Background(), s.Name, metav1.GetOptions{})
+	return s.upsertStateConfigMap(context.Background(), string(data))
+}
+
+func (s *ConfigMapStateStore) upsertStateConfigMap(ctx context.Context, data string) error {
+	cm, err := s.Client.CoreV1().ConfigMaps(s.Namespace).Get(ctx, s.Name, metav1.GetOptions{})
 	if err == nil {
-		if cm.Data == nil {
-			cm.Data = make(map[string]string)
-		}
-		cm.Data[constants.StateKey] = string(data)
-		_, err = s.Client.CoreV1().ConfigMaps(s.Namespace).Update(
-			context.Background(), cm, metav1.UpdateOptions{})
-		if err != nil {
-			return fmt.Errorf("failed to update state ConfigMap: %w", err)
-		}
-	} else {
-		cm = &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      s.Name,
-				Namespace: s.Namespace,
-			},
-			Data: map[string]string{
-				constants.StateKey: string(data),
-			},
-		}
-		_, err = s.Client.CoreV1().ConfigMaps(s.Namespace).Create(
-			context.Background(), cm, metav1.CreateOptions{})
-		if err != nil {
-			if apierrors.IsAlreadyExists(err) {
-				cm, getErr := s.Client.CoreV1().ConfigMaps(s.Namespace).Get(
-					context.Background(), s.Name, metav1.GetOptions{})
-				if getErr != nil {
-					return fmt.Errorf("failed to get state ConfigMap after create conflict: %w", getErr)
-				}
-				if cm.Data == nil {
-					cm.Data = make(map[string]string)
-				}
-				cm.Data[constants.StateKey] = string(data)
-				_, err = s.Client.CoreV1().ConfigMaps(s.Namespace).Update(
-					context.Background(), cm, metav1.UpdateOptions{})
-				if err != nil {
-					return fmt.Errorf("failed to update state ConfigMap after create conflict: %w", err)
-				}
-				return nil
-			}
+		return s.updateStateConfigMap(ctx, cm, data)
+	}
+	if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("failed to get state ConfigMap: %w", err)
+	}
+	cm = &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      s.Name,
+			Namespace: s.Namespace,
+		},
+		Data: map[string]string{
+			constants.StateKey: data,
+		},
+	}
+	if _, err = s.Client.CoreV1().
+		ConfigMaps(s.Namespace).
+		Create(ctx, cm, metav1.CreateOptions{}); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
 			return fmt.Errorf("failed to create state ConfigMap: %w", err)
 		}
+		existingCM, getErr := s.Client.CoreV1().
+			ConfigMaps(s.Namespace).
+			Get(ctx, s.Name, metav1.GetOptions{})
+		if getErr != nil {
+			return fmt.Errorf("failed to get state ConfigMap after create conflict: %w", getErr)
+		}
+		return s.updateStateConfigMap(ctx, existingCM, data)
+	}
+	return nil
+}
+
+func (s *ConfigMapStateStore) updateStateConfigMap(
+	ctx context.Context,
+	cm *corev1.ConfigMap,
+	data string,
+) error {
+	if cm.Data == nil {
+		cm.Data = make(map[string]string)
+	}
+	cm.Data[constants.StateKey] = data
+	if _, err := s.Client.CoreV1().
+		ConfigMaps(s.Namespace).
+		Update(ctx, cm, metav1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("failed to update state ConfigMap: %w", err)
 	}
 	return nil
 }

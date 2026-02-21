@@ -48,23 +48,24 @@ type NodeHandler struct {
 	removedNodes       map[string]struct{}
 }
 
+const (
+	deploymentQueueSize = 100
+	deployJobTimeout    = 3 * time.Minute
+)
+
 func NewNodeHandler(
 	clientset *kubernetes.Clientset,
-	namespace,
-	caddyImage string,
+	namespace, caddyImage string,
 	enableLoadBalancer bool,
 	instances map[string]*caddy.Instance,
 	mu *sync.RWMutex,
 	notifier func(),
 	envSecretName string,
 	envSecretKeys []string,
-	dataVolumePVC string,
-	configVolumePVC string,
-	configMapName string,
+	dataVolumePVC, configVolumePVC, configMapName string,
 	externalEndpoints utils.ExternalEndpointsMap,
 	useHostNetwork bool,
-	httpHostPort int,
-	httpsHostPort int,
+	httpHostPort, httpsHostPort int,
 ) *NodeHandler {
 	return &NodeHandler{
 		Clientset:          clientset,
@@ -93,7 +94,7 @@ func (h *NodeHandler) SetNodeChangeNotifier(notifier func()) {
 }
 
 func (h *NodeHandler) StartWorkerPool(ctx context.Context, workerCount int) {
-	h.jobCh = make(chan deploymentJob, 100)
+	h.jobCh = make(chan deploymentJob, deploymentQueueSize)
 	for range workerCount {
 		go func() {
 			for {
@@ -104,7 +105,7 @@ func (h *NodeHandler) StartWorkerPool(ctx context.Context, workerCount int) {
 					if !ok {
 						return
 					}
-					deployCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+					deployCtx, cancel := context.WithTimeout(ctx, deployJobTimeout)
 					instance, err := caddy.DeployCaddy(
 						deployCtx,
 						h.Clientset,

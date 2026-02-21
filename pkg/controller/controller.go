@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"sync"
@@ -62,6 +63,18 @@ type Controller struct {
 	aggregator        any
 }
 
+const (
+	nodeHandlerWorkerCount           = 4
+	configReconciliationInterval     = 5 * time.Minute
+	periodicStatePersistenceInterval = 2 * time.Minute
+)
+
+type watcherBundle struct {
+	configWatcher   *watcher.ConfigWatcher
+	externalWatcher *watcher.ExternalConfigWatcher
+	agg             *aggregator.NamespaceAggregator
+}
+
 func NewController(clientset *kubernetes.Clientset, config ControllerConfig) (*Controller, error) {
 	deployedInstances := make(map[string]*caddy.Instance)
 	mutex := &sync.RWMutex{}
@@ -108,55 +121,25 @@ func NewController(clientset *kubernetes.Clientset, config ControllerConfig) (*C
 		config.HTTPHostPort,
 		config.HTTPSHostPort,
 	)
-	var configWatcher *watcher.ConfigWatcher
-	var externalWatcher *watcher.ExternalConfigWatcher
-	var agg *aggregator.NamespaceAggregator
-	if config.ExternalEnable {
-		agg = aggregator.NewNamespaceAggregator(
-			clientset,
-			config.ConfigMapNamespace,
-			config.ExternalPublishAggregated,
-			config.ExternalAggregatedConfigName,
-			configHandler.Handle,
-			nodeAvailabilityCheck,
-		)
-		configWatcher = watcher.NewConfigWatcher(
-			clientset,
-			config.ConfigMapNamespace,
-			config.ConfigMapName,
-			agg.UpdateBase,
-			nodeAvailabilityCheck,
-		)
-		configWatcher.SetForceSyncHandler(agg.EnsureNodeSync)
-		externalWatcher = watcher.NewExternalConfigWatcher(
-			clientset,
-			config.ConfigMapNamespace,
-			config.ConfigMapName,
-			config.ExternalLabel,
-			config.ExternalNsMode,
-			config.ExternalAllowNamespaces,
-			config.ExternalDenyNamespaces,
-			agg.SetExternal,
-			agg.RemoveExternal,
-		)
-	} else {
-		configWatcher = watcher.NewConfigWatcher(
-			clientset,
-			config.ConfigMapNamespace,
-			config.ConfigMapName,
-			configHandler.Handle,
-			nodeAvailabilityCheck,
-		)
-	}
-	coordinator := NewWatcherCoordinator(nodeWatcher, configWatcher, deployedInstances, mutex)
+	watchers := buildWatcherBundle(clientset, config, configHandler, nodeAvailabilityCheck)
+	coordinator := NewWatcherCoordinator(
+		nodeWatcher,
+		watchers.configWatcher,
+		deployedInstances,
+		mutex,
+	)
 	nodeHandler.SetNodeChangeNotifier(coordinator.NotifyNodeChange)
-	stateStore := state.NewConfigMapStateStore(clientset, config.ConfigMapNamespace, constants.StateConfigMapName)
+	stateStore := state.NewConfigMapStateStore(
+		clientset,
+		config.ConfigMapNamespace,
+		constants.StateConfigMapName,
+	)
 	ctrl := &Controller{
 		clientset:         clientset,
 		config:            config,
 		nodeWatcher:       nodeWatcher,
-		configWatcher:     configWatcher,
-		externalWatcher:   externalWatcher,
+		configWatcher:     watchers.configWatcher,
+		externalWatcher:   watchers.externalWatcher,
 		nodeHandler:       nodeHandler,
 		configHandler:     configHandler,
 		deployedInstances: deployedInstances,
@@ -164,10 +147,57 @@ func NewController(clientset *kubernetes.Clientset, config ControllerConfig) (*C
 		stateStore:        stateStore,
 		coordinator:       coordinator,
 	}
-	if agg != nil {
-		ctrl.aggregator = agg
+	if watchers.agg != nil {
+		ctrl.aggregator = watchers.agg
 	}
 	return ctrl, nil
+}
+
+func buildWatcherBundle(
+	clientset *kubernetes.Clientset,
+	config ControllerConfig,
+	configHandler *handlers.ConfigHandler,
+	nodeAvailabilityCheck func() bool,
+) watcherBundle {
+	bundle := watcherBundle{}
+	if !config.ExternalEnable {
+		bundle.configWatcher = watcher.NewConfigWatcher(
+			clientset,
+			config.ConfigMapNamespace,
+			config.ConfigMapName,
+			configHandler.Handle,
+			nodeAvailabilityCheck,
+		)
+		return bundle
+	}
+	bundle.agg = aggregator.NewNamespaceAggregator(
+		clientset,
+		config.ConfigMapNamespace,
+		config.ExternalPublishAggregated,
+		config.ExternalAggregatedConfigName,
+		configHandler.Handle,
+		nodeAvailabilityCheck,
+	)
+	bundle.configWatcher = watcher.NewConfigWatcher(
+		clientset,
+		config.ConfigMapNamespace,
+		config.ConfigMapName,
+		bundle.agg.UpdateBase,
+		nodeAvailabilityCheck,
+	)
+	bundle.configWatcher.SetForceSyncHandler(bundle.agg.EnsureNodeSync)
+	bundle.externalWatcher = watcher.NewExternalConfigWatcher(
+		clientset,
+		config.ConfigMapNamespace,
+		config.ConfigMapName,
+		config.ExternalLabel,
+		config.ExternalNsMode,
+		config.ExternalAllowNamespaces,
+		config.ExternalDenyNamespaces,
+		bundle.agg.SetExternal,
+		bundle.agg.RemoveExternal,
+	)
+	return bundle
 }
 
 func (c *Controller) Run(ctx context.Context) error {
@@ -175,7 +205,7 @@ func (c *Controller) Run(ctx context.Context) error {
 		log.Error().Err(err).Msg("Reconciliation failed")
 		return err
 	}
-	c.nodeHandler.StartWorkerPool(ctx, 4)
+	c.nodeHandler.StartWorkerPool(ctx, nodeHandlerWorkerCount)
 	go c.nodeWatcher.Start(ctx)
 	go c.configWatcher.Start(ctx)
 	if c.config.ExternalEnable && c.externalWatcher != nil {
@@ -196,14 +226,18 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 	discovered := make(map[string]*caddy.Instance)
 	nodeLabelKey, nodeLabelValue := watcher.ParseLabelSelector(c.config.NodeLabel)
 	if nodeLabelKey == "" {
-		return fmt.Errorf("node label selector is empty")
+		return errors.New("node label selector is empty")
 	}
 	nodeSelector := nodeLabelKey + "=" + nodeLabelValue
 	nodes, err := c.clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{
 		LabelSelector: nodeSelector,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to list nodes for reconciliation selector %q: %w", nodeSelector, err)
+		return fmt.Errorf(
+			"failed to list nodes for reconciliation selector %q: %w",
+			nodeSelector,
+			err,
+		)
 	}
 	eligibleNodes := make(map[string]struct{}, len(nodes.Items))
 	for _, node := range nodes.Items {
@@ -224,13 +258,18 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 			continue
 		}
 		if _, matchesSelector := eligibleNodes[nodeName]; !matchesSelector {
-			logger.Debug().Str("node", nodeName).Str("selector", nodeSelector).Msg("Skipping managed deployment outside NodeLabel selector scope")
+			logger.Debug().
+				Str("node", nodeName).
+				Str("selector", nodeSelector).
+				Msg("Skipping managed deployment outside NodeLabel selector scope")
 			continue
 		}
 		if dep.Status.ReadyReplicas > 0 {
-			podList, errPL := c.clientset.CoreV1().Pods(c.config.ConfigMapNamespace).List(ctx, metav1.ListOptions{
-				LabelSelector: "app=caddy,instance=" + nodeName,
-			})
+			podList, errPL := c.clientset.CoreV1().
+				Pods(c.config.ConfigMapNamespace).
+				List(ctx, metav1.ListOptions{
+					LabelSelector: "app=caddy,instance=" + nodeName,
+				})
 			if errPL != nil || len(podList.Items) == 0 {
 				logger.Warn().Msgf("No pods found for healthy deployment on node %s", nodeName)
 				continue
@@ -246,7 +285,8 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 			discovered[nodeName] = instance
 			logger.Info().Msgf("Adopted existing healthy deployment on node %s", nodeName)
 		} else {
-			logger.Warn().Msgf("Deployment on node %s is not healthy, deleting orphaned deployment", nodeName)
+			logger.Warn().
+				Msgf("Deployment on node %s is not healthy, deleting orphaned deployment", nodeName)
 			instance := &caddy.Instance{
 				NodeName:       nodeName,
 				Namespace:      c.config.ConfigMapNamespace,
@@ -255,7 +295,9 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 				KubeClient:     c.clientset,
 			}
 			if errID := instance.Delete(); errID != nil {
-				logger.Error().Err(errID).Msgf("Failed to delete orphaned deployment on node %s", nodeName)
+				logger.Error().
+					Err(errID).
+					Msgf("Failed to delete orphaned deployment on node %s", nodeName)
 			} else {
 				logger.Info().Msgf("Deleted orphaned deployment on node %s", nodeName)
 			}
@@ -266,11 +308,15 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 		logger.Warn().Err(err).Msg("Could not load saved state, proceeding with discovered state")
 	}
 	if c.config.PreferSavedState && len(savedState) > 0 {
-		logger.Info().Msg("PreferSavedState is enabled. Merging saved state with discovered state, preferring saved state")
+		logger.Info().
+			Msg("PreferSavedState is enabled. Merging saved state with discovered state, preferring saved state")
 		for node := range discovered {
 			if savedInst, exists := savedState[node]; exists {
 				discovered[node].FailureCount.Store(savedInst.FailureCount.Load())
-				logger.Debug().Str("node", node).Int32("failureCount", savedInst.FailureCount.Load()).Msg("Restored FailureCount from saved state")
+				logger.Debug().
+					Str("node", node).
+					Int32("failureCount", savedInst.FailureCount.Load()).
+					Msg("Restored FailureCount from saved state")
 			}
 		}
 	} else {
@@ -284,12 +330,13 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 	instancesCopy := make(map[string]*caddy.Instance, len(c.deployedInstances))
 	maps.Copy(instancesCopy, c.deployedInstances)
 	c.instancesMutex.Unlock()
-	if err := c.stateStore.SaveState(instancesCopy); err != nil {
-		logger.Error().Err(err).Msg("Failed to persist state")
+	if saveErr := c.stateStore.SaveState(instancesCopy); saveErr != nil {
+		logger.Error().Err(saveErr).Msg("Failed to persist state")
 	}
 	if c.config.ExternalEnable {
 		if c.aggregator == nil {
-			logger.Error().Msg("External aggregation enabled but aggregator is nil, skipping initial config setup")
+			logger.Error().
+				Msg("External aggregation enabled but aggregator is nil, skipping initial config setup")
 		} else if agg, ok := c.aggregator.(*aggregator.NamespaceAggregator); ok {
 			if c.externalWatcher != nil {
 				externals, errBatch := c.externalWatcher.InitialListBatch(ctx)
@@ -299,9 +346,13 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 					agg.SetExternalBatch(externals)
 				}
 			}
-			configMap, err := c.clientset.CoreV1().ConfigMaps(c.config.ConfigMapNamespace).Get(ctx, c.config.ConfigMapName, metav1.GetOptions{})
-			if err != nil {
-				logger.Error().Err(err).Msg("Failed to get ConfigMap for initial config push")
+			configMap, configMapErr := c.clientset.CoreV1().
+				ConfigMaps(c.config.ConfigMapNamespace).
+				Get(ctx, c.config.ConfigMapName, metav1.GetOptions{})
+			if configMapErr != nil {
+				logger.Error().
+					Err(configMapErr).
+					Msg("Failed to get ConfigMap for initial config push")
 			} else if configData, exists := configMap.Data["Caddyfile"]; exists {
 				agg.UpdateBase(configData)
 			} else {
@@ -318,10 +369,10 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 		}
 	} else if len(c.deployedInstances) > 0 {
 		logger.Info().Msg("Pushing initial configuration to discovered instances")
-		configMap, err := c.clientset.CoreV1().ConfigMaps(c.config.ConfigMapNamespace).Get(
+		configMap, configMapErr := c.clientset.CoreV1().ConfigMaps(c.config.ConfigMapNamespace).Get(
 			ctx, c.config.ConfigMapName, metav1.GetOptions{})
-		if err != nil {
-			logger.Error().Err(err).Msg("Failed to get ConfigMap for initial config push")
+		if configMapErr != nil {
+			logger.Error().Err(configMapErr).Msg("Failed to get ConfigMap for initial config push")
 		} else if configData, exists := configMap.Data["Caddyfile"]; exists {
 			c.configHandler.Handle(configData)
 		} else {
@@ -333,7 +384,7 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 }
 
 func (c *Controller) runPeriodicConfigReconciliation(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Minute)
+	ticker := time.NewTicker(configReconciliationInterval)
 	defer ticker.Stop()
 	logger := log.With().Str("component", "config_reconciliation").Logger()
 	for {
@@ -355,13 +406,15 @@ func (c *Controller) runPeriodicConfigReconciliation(ctx context.Context) {
 			}
 			if c.config.ExternalEnable {
 				if c.aggregator == nil {
-					logger.Error().Msg("External aggregation enabled but aggregator is nil, skipping reconciliation to prevent configuration drift")
+					logger.Error().
+						Msg("External aggregation enabled but aggregator is nil, skipping reconciliation to prevent configuration drift")
 					continue
 				}
 				if agg, ok := c.aggregator.(*aggregator.NamespaceAggregator); ok {
 					agg.UpdateBase(configData)
 				} else {
-					logger.Error().Msg("Failed to assert aggregator type, skipping reconciliation to prevent configuration drift")
+					logger.Error().
+						Msg("Failed to assert aggregator type, skipping reconciliation to prevent configuration drift")
 					continue
 				}
 			} else {
@@ -373,7 +426,7 @@ func (c *Controller) runPeriodicConfigReconciliation(ctx context.Context) {
 }
 
 func (c *Controller) runPeriodicStatePersistence(ctx context.Context) {
-	ticker := time.NewTicker(2 * time.Minute)
+	ticker := time.NewTicker(periodicStatePersistenceInterval)
 	defer ticker.Stop()
 	logger := log.With().Str("component", "state_persistence").Logger()
 	logger.Info().Msg("Starting periodic state persistence (every 2 minutes)")
@@ -395,7 +448,9 @@ func (c *Controller) runPeriodicStatePersistence(ctx context.Context) {
 			if err := c.stateStore.SaveState(instancesCopy); err != nil {
 				logger.Error().Err(err).Msg("Failed to persist state during periodic save")
 			} else {
-				logger.Debug().Int("instances", instanceCount).Msg("Periodic state persistence completed")
+				logger.Debug().
+					Int("instances", instanceCount).
+					Msg("Periodic state persistence completed")
 			}
 		}
 	}
@@ -417,6 +472,8 @@ func (c *Controller) persistStateOnShutdown() {
 	if err := c.stateStore.SaveState(instancesCopy); err != nil {
 		logger.Error().Err(err).Msg("Failed to persist state during shutdown")
 	} else {
-		logger.Info().Int("instances", instanceCount).Msg("State persisted successfully before shutdown")
+		logger.Info().
+			Int("instances", instanceCount).
+			Msg("State persisted successfully before shutdown")
 	}
 }

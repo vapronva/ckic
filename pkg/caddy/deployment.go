@@ -13,24 +13,34 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
+const (
+	deploymentTimeout     = 3 * time.Minute
+	deploymentPollDelay   = 5 * time.Second
+	caddyAdminPort        = 2019
+	caddyHTTPPort         = 80
+	caddyHTTPSPort        = 443
+	hostPortMin           = 1
+	hostPortMax           = 65535
+	caddyContainerName    = "caddy"
+	caddyImagePullPolicy  = corev1.PullPolicy("Always")
+	caddyCapabilityNetAdm = corev1.Capability("NET_ADMIN")
+	caddyCapabilityBind   = corev1.Capability("NET_BIND_SERVICE")
+	caddyCapabilityDrop   = corev1.Capability("ALL")
+)
+
 func DeployCaddy(
 	ctx context.Context,
 	clientset *kubernetes.Clientset,
-	nodeName,
-	namespace,
-	caddyImage string,
+	nodeName, namespace, caddyImage string,
 	enableLoadBalancer bool,
 	externalIPs []string,
 	envSecretName string,
 	envSecretKeys []string,
-	dataVolumePVC string,
-	configVolumePVC string,
-	configMapName string,
+	dataVolumePVC, configVolumePVC, configMapName string,
 	useHostNetwork bool,
-	httpHostPort int,
-	httpsHostPort int,
+	httpHostPort, httpsHostPort int,
 ) (*Instance, error) {
-	deployCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	deployCtx, cancel := context.WithTimeout(ctx, deploymentTimeout)
 	defer cancel()
 	logger := log.With().Str("node", nodeName).Logger()
 	deploymentName := fmt.Sprintf("caddy-%s", nodeName)
@@ -74,7 +84,12 @@ func DeployCaddy(
 	}
 	if err := waitForDeploymentReady(deployCtx, clientset, namespace, deploymentName); err != nil {
 		cleanupDeployment(ctx, clientset, instance)
-		return nil, fmt.Errorf("deployment %s/%s did not become ready: %w", namespace, deploymentName, err)
+		return nil, fmt.Errorf(
+			"deployment %s/%s did not become ready: %w",
+			namespace,
+			deploymentName,
+			err,
+		)
 	}
 	podName, err := resolvePodName(deployCtx, clientset, namespace, nodeName)
 	if err != nil {
@@ -87,7 +102,11 @@ func DeployCaddy(
 	return instance, nil
 }
 
-func resolvePodName(ctx context.Context, clientset kubernetes.Interface, namespace, nodeName string) (string, error) {
+func resolvePodName(
+	ctx context.Context,
+	clientset kubernetes.Interface,
+	namespace, nodeName string,
+) (string, error) {
 	const (
 		maxAttempts    = 6
 		initialBackoff = 250 * time.Millisecond
@@ -117,7 +136,11 @@ func resolvePodName(ctx context.Context, clientset kubernetes.Interface, namespa
 			if !timer.Stop() {
 				<-timer.C
 			}
-			return "", fmt.Errorf("context deadline exceeded while resolving pod for node %s: %w", nodeName, ctx.Err())
+			return "", fmt.Errorf(
+				"context deadline exceeded while resolving pod for node %s: %w",
+				nodeName,
+				ctx.Err(),
+			)
 		case <-timer.C:
 		}
 		backoff *= 2
@@ -132,76 +155,103 @@ func deployDeployment(
 	ctx context.Context,
 	clientset *kubernetes.Clientset,
 	instance *Instance,
-	caddyImage string,
-	envSecretName string,
+	caddyImage, envSecretName string,
 	envSecretKeys []string,
-	dataVolumePVC string,
-	configVolumePVC string,
-	configMapName string,
+	dataVolumePVC, configVolumePVC, configMapName string,
 	useHostNetwork bool,
-	httpHostPort int,
-	httpsHostPort int,
+	httpHostPort, httpsHostPort int,
 ) error {
 	logger := log.With().Str("deployment", instance.DeploymentName).Logger()
 	replicas := int32(1)
 	caddyContainer := corev1.Container{
-		Name:  "caddy",
+		Name:  caddyContainerName,
 		Image: caddyImage,
 		Ports: []corev1.ContainerPort{
-			{Name: "admin", ContainerPort: 2019, Protocol: corev1.ProtocolTCP},
+			{Name: "admin", ContainerPort: caddyAdminPort, Protocol: corev1.ProtocolTCP},
 		},
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: "caddy-config", MountPath: "/etc/caddy/Caddyfile", SubPath: "Caddyfile"},
 			{Name: "opt-data", MountPath: "/data"},
 			{Name: "opt-config", MountPath: "/config"},
 		},
-		ImagePullPolicy: corev1.PullPolicy("Always"),
+		ImagePullPolicy: caddyImagePullPolicy,
 		SecurityContext: &corev1.SecurityContext{
 			Capabilities: &corev1.Capabilities{
-				Add:  []corev1.Capability{"NET_ADMIN", "NET_BIND_SERVICE"},
-				Drop: []corev1.Capability{"ALL"},
+				Add:  []corev1.Capability{caddyCapabilityNetAdm, caddyCapabilityBind},
+				Drop: []corev1.Capability{caddyCapabilityDrop},
 			},
 		},
 	}
 	if useHostNetwork {
-		logger.Info().Int("httpPort", httpHostPort).Int("httpsPort", httpsHostPort).Msg("Configuring hostNetwork with host ports")
+		httpPort32, err := normalizeHostPort(httpHostPort)
+		if err != nil {
+			return fmt.Errorf("invalid HTTP host port: %w", err)
+		}
+		httpsPort32, err := normalizeHostPort(httpsHostPort)
+		if err != nil {
+			return fmt.Errorf("invalid HTTPS host port: %w", err)
+		}
+		logger.Info().
+			Int("httpPort", httpHostPort).
+			Int("httpsPort", httpsHostPort).
+			Msg("Configuring hostNetwork with host ports")
 		caddyContainer.Ports = append(caddyContainer.Ports,
 			corev1.ContainerPort{
 				Name:          "http-tcp",
-				ContainerPort: 80,
+				ContainerPort: caddyHTTPPort,
 				Protocol:      corev1.ProtocolTCP,
-				HostPort:      int32(httpHostPort),
+				HostPort:      httpPort32,
 			},
 			corev1.ContainerPort{
 				Name:          "http-udp",
-				ContainerPort: 80,
+				ContainerPort: caddyHTTPPort,
 				Protocol:      corev1.ProtocolUDP,
-				HostPort:      int32(httpHostPort),
+				HostPort:      httpPort32,
 			},
 			corev1.ContainerPort{
 				Name:          "https-tcp",
-				ContainerPort: 443,
+				ContainerPort: caddyHTTPSPort,
 				Protocol:      corev1.ProtocolTCP,
-				HostPort:      int32(httpsHostPort),
+				HostPort:      httpsPort32,
 			},
 			corev1.ContainerPort{
 				Name:          "https-udp",
-				ContainerPort: 443,
+				ContainerPort: caddyHTTPSPort,
 				Protocol:      corev1.ProtocolUDP,
-				HostPort:      int32(httpsHostPort),
+				HostPort:      httpsPort32,
 			},
 		)
 	} else {
-		caddyContainer.Ports = append(caddyContainer.Ports,
-			corev1.ContainerPort{Name: "http-tcp", ContainerPort: 80, Protocol: corev1.ProtocolTCP},
-			corev1.ContainerPort{Name: "http-udp", ContainerPort: 80, Protocol: corev1.ProtocolUDP},
-			corev1.ContainerPort{Name: "https-tcp", ContainerPort: 443, Protocol: corev1.ProtocolTCP},
-			corev1.ContainerPort{Name: "https-udp", ContainerPort: 443, Protocol: corev1.ProtocolUDP},
+		caddyContainer.Ports = append(
+			caddyContainer.Ports,
+			corev1.ContainerPort{
+				Name:          "http-tcp",
+				ContainerPort: caddyHTTPPort,
+				Protocol:      corev1.ProtocolTCP,
+			},
+			corev1.ContainerPort{
+				Name:          "http-udp",
+				ContainerPort: caddyHTTPPort,
+				Protocol:      corev1.ProtocolUDP,
+			},
+			corev1.ContainerPort{
+				Name:          "https-tcp",
+				ContainerPort: caddyHTTPSPort,
+				Protocol:      corev1.ProtocolTCP,
+			},
+			corev1.ContainerPort{
+				Name:          "https-udp",
+				ContainerPort: caddyHTTPSPort,
+				Protocol:      corev1.ProtocolUDP,
+			},
 		)
 	}
 	var envVars []corev1.EnvVar
 	if envSecretName != "" && len(envSecretKeys) > 0 {
-		logger.Info().Str("secret", envSecretName).Strs("keys", envSecretKeys).Msg("Configuring environment variables from secret")
+		logger.Info().
+			Str("secret", envSecretName).
+			Strs("keys", envSecretKeys).
+			Msg("Configuring environment variables from secret")
 		for _, key := range envSecretKeys {
 			envVars = append(envVars, corev1.EnvVar{
 				Name: key,
@@ -342,27 +392,47 @@ func deployDeployment(
 			},
 		},
 	}
-	existingDeployment, err := clientset.AppsV1().Deployments(instance.Namespace).Get(ctx, instance.DeploymentName, metav1.GetOptions{})
+	existingDeployment, err := clientset.AppsV1().
+		Deployments(instance.Namespace).
+		Get(ctx, instance.DeploymentName, metav1.GetOptions{})
 	if err == nil {
 		deployment.ResourceVersion = existingDeployment.ResourceVersion
-		_, err = clientset.AppsV1().Deployments(instance.Namespace).Update(ctx, deployment, metav1.UpdateOptions{})
+		_, err = clientset.AppsV1().
+			Deployments(instance.Namespace).
+			Update(ctx, deployment, metav1.UpdateOptions{})
 		if err != nil {
 			logger.Error().Err(err).Msg("Failed to update existing Caddy deployment")
 			return fmt.Errorf("failed to update deployment %s: %w", instance.DeploymentName, err)
 		}
 		logger.Info().Msg("Updated existing Caddy deployment")
 	} else {
-		_, err = clientset.AppsV1().Deployments(instance.Namespace).Create(ctx, deployment, metav1.CreateOptions{})
+		_, err = clientset.AppsV1().
+			Deployments(instance.Namespace).
+			Create(ctx, deployment, metav1.CreateOptions{})
 		if err != nil {
 			logger.Error().Err(err).Msg("Failed to create Caddy deployment")
 			return fmt.Errorf("failed to create deployment %s: %w", instance.DeploymentName, err)
 		}
 		logger.Info().Msg("Created Caddy deployment")
 	}
-	if err := clientset.PolicyV1().PodDisruptionBudgets(instance.Namespace).Delete(ctx, instance.DeploymentName, metav1.DeleteOptions{}); err == nil {
+	if cleanupErr := clientset.PolicyV1().
+		PodDisruptionBudgets(instance.Namespace).
+		Delete(ctx, instance.DeploymentName, metav1.DeleteOptions{}); cleanupErr == nil {
 		logger.Info().Msg("Deleted legacy PodDisruptionBudget")
 	}
 	return nil
+}
+
+func normalizeHostPort(port int) (int32, error) {
+	if port < hostPortMin || port > hostPortMax {
+		return 0, fmt.Errorf(
+			"port %d is out of valid range [%d, %d]",
+			port,
+			hostPortMin,
+			hostPortMax,
+		)
+	}
+	return int32(port), nil
 }
 
 func deployService(ctx context.Context, clientset *kubernetes.Clientset, instance *Instance) error {
@@ -385,49 +455,55 @@ func deployService(ctx context.Context, clientset *kubernetes.Clientset, instanc
 			Ports: []corev1.ServicePort{
 				{
 					Name:       "admin",
-					Port:       2019,
-					TargetPort: intstr.FromInt(2019),
+					Port:       caddyAdminPort,
+					TargetPort: intstr.FromInt(caddyAdminPort),
 					Protocol:   corev1.ProtocolTCP,
 				},
 				{
 					Name:       "http-tcp",
-					Port:       80,
-					TargetPort: intstr.FromInt(80),
+					Port:       caddyHTTPPort,
+					TargetPort: intstr.FromInt(caddyHTTPPort),
 					Protocol:   corev1.ProtocolTCP,
 				},
 				{
 					Name:       "http-udp",
-					Port:       80,
-					TargetPort: intstr.FromInt(80),
+					Port:       caddyHTTPPort,
+					TargetPort: intstr.FromInt(caddyHTTPPort),
 					Protocol:   corev1.ProtocolUDP,
 				},
 				{
 					Name:       "https-tcp",
-					Port:       443,
-					TargetPort: intstr.FromInt(443),
+					Port:       caddyHTTPSPort,
+					TargetPort: intstr.FromInt(caddyHTTPSPort),
 					Protocol:   corev1.ProtocolTCP,
 				},
 				{
 					Name:       "https-udp",
-					Port:       443,
-					TargetPort: intstr.FromInt(443),
+					Port:       caddyHTTPSPort,
+					TargetPort: intstr.FromInt(caddyHTTPSPort),
 					Protocol:   corev1.ProtocolUDP,
 				},
 			},
 			Type: corev1.ServiceTypeClusterIP,
 		},
 	}
-	existingService, err := clientset.CoreV1().Services(instance.Namespace).Get(ctx, instance.DeploymentName, metav1.GetOptions{})
+	existingService, err := clientset.CoreV1().
+		Services(instance.Namespace).
+		Get(ctx, instance.DeploymentName, metav1.GetOptions{})
 	if err == nil {
 		service.ResourceVersion = existingService.ResourceVersion
-		_, err = clientset.CoreV1().Services(instance.Namespace).Update(ctx, service, metav1.UpdateOptions{})
+		_, err = clientset.CoreV1().
+			Services(instance.Namespace).
+			Update(ctx, service, metav1.UpdateOptions{})
 		if err != nil {
 			logger.Error().Err(err).Msg("Failed to update existing Caddy service")
 			return fmt.Errorf("failed to update service %s: %w", instance.DeploymentName, err)
 		}
 		logger.Info().Msg("Updated existing Caddy service")
 	} else {
-		_, err = clientset.CoreV1().Services(instance.Namespace).Create(ctx, service, metav1.CreateOptions{})
+		_, err = clientset.CoreV1().
+			Services(instance.Namespace).
+			Create(ctx, service, metav1.CreateOptions{})
 		if err != nil {
 			logger.Error().Err(err).Msg("Failed to create Caddy service")
 			return fmt.Errorf("failed to create service %s: %w", instance.DeploymentName, err)
@@ -437,8 +513,14 @@ func deployService(ctx context.Context, clientset *kubernetes.Clientset, instanc
 	return nil
 }
 
-func deployLoadBalancerService(ctx context.Context, clientset *kubernetes.Clientset, instance *Instance) error {
-	logger := log.With().Str("loadbalancer_service", instance.DeploymentName+"-loadbalancer").Logger()
+func deployLoadBalancerService(
+	ctx context.Context,
+	clientset *kubernetes.Clientset,
+	instance *Instance,
+) error {
+	logger := log.With().
+		Str("loadbalancer_service", instance.DeploymentName+"-loadbalancer").
+		Logger()
 	loadBalancerServiceName := instance.DeploymentName + "-loadbalancer"
 	loadBalancerService := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
@@ -461,26 +543,26 @@ func deployLoadBalancerService(ctx context.Context, clientset *kubernetes.Client
 			Ports: []corev1.ServicePort{
 				{
 					Name:       "http-tcp",
-					Port:       80,
-					TargetPort: intstr.FromInt(80),
+					Port:       caddyHTTPPort,
+					TargetPort: intstr.FromInt(caddyHTTPPort),
 					Protocol:   corev1.ProtocolTCP,
 				},
 				{
 					Name:       "https-tcp",
-					Port:       443,
-					TargetPort: intstr.FromInt(443),
+					Port:       caddyHTTPSPort,
+					TargetPort: intstr.FromInt(caddyHTTPSPort),
 					Protocol:   corev1.ProtocolTCP,
 				},
 				{
 					Name:       "http-udp",
-					Port:       80,
-					TargetPort: intstr.FromInt(80),
+					Port:       caddyHTTPPort,
+					TargetPort: intstr.FromInt(caddyHTTPPort),
 					Protocol:   corev1.ProtocolUDP,
 				},
 				{
 					Name:       "https-udp",
-					Port:       443,
-					TargetPort: intstr.FromInt(443),
+					Port:       caddyHTTPSPort,
+					TargetPort: intstr.FromInt(caddyHTTPSPort),
 					Protocol:   corev1.ProtocolUDP,
 				},
 			},
@@ -490,39 +572,64 @@ func deployLoadBalancerService(ctx context.Context, clientset *kubernetes.Client
 		},
 	}
 	if len(instance.ExternalIPs) > 0 {
-		logger.Info().Strs("externalIPs", instance.ExternalIPs).Msg("Setting external IPs for LoadBalancer service")
+		logger.Info().
+			Strs("externalIPs", instance.ExternalIPs).
+			Msg("Setting external IPs for LoadBalancer service")
 		loadBalancerService.Spec.ExternalIPs = instance.ExternalIPs
 	}
-	existingNPService, err := clientset.CoreV1().Services(instance.Namespace).Get(ctx, loadBalancerServiceName, metav1.GetOptions{})
+	existingNPService, err := clientset.CoreV1().
+		Services(instance.Namespace).
+		Get(ctx, loadBalancerServiceName, metav1.GetOptions{})
 	if err == nil {
 		loadBalancerService.ResourceVersion = existingNPService.ResourceVersion
-		_, err = clientset.CoreV1().Services(instance.Namespace).Update(ctx, loadBalancerService, metav1.UpdateOptions{})
+		_, err = clientset.CoreV1().
+			Services(instance.Namespace).
+			Update(ctx, loadBalancerService, metav1.UpdateOptions{})
 		if err != nil {
 			logger.Error().Err(err).Msg("Failed to update existing LoadBalancer service")
-			return fmt.Errorf("failed to update LoadBalancer service %s: %w", loadBalancerServiceName, err)
+			return fmt.Errorf(
+				"failed to update LoadBalancer service %s: %w",
+				loadBalancerServiceName,
+				err,
+			)
 		}
 		logger.Info().Msg("Updated existing LoadBalancer service")
 	} else {
-		_, err = clientset.CoreV1().Services(instance.Namespace).Create(ctx, loadBalancerService, metav1.CreateOptions{})
+		_, err = clientset.CoreV1().
+			Services(instance.Namespace).
+			Create(ctx, loadBalancerService, metav1.CreateOptions{})
 		if err != nil {
 			logger.Error().Err(err).Msg("Failed to create LoadBalancer service")
-			return fmt.Errorf("failed to create LoadBalancer service %s: %w", loadBalancerServiceName, err)
+			return fmt.Errorf(
+				"failed to create LoadBalancer service %s: %w",
+				loadBalancerServiceName,
+				err,
+			)
 		}
 		logger.Info().Msg("Created LoadBalancer service")
 	}
 	return nil
 }
 
-func waitForDeploymentReady(ctx context.Context, clientset *kubernetes.Clientset, namespace, name string) error {
+func waitForDeploymentReady(
+	ctx context.Context,
+	clientset *kubernetes.Clientset,
+	namespace, name string,
+) error {
 	logger := log.With().Str("deployment", name).Str("namespace", namespace).Logger()
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(deploymentPollDelay)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("context deadline exceeded while waiting for deployment: %w", ctx.Err())
+			return fmt.Errorf(
+				"context deadline exceeded while waiting for deployment: %w",
+				ctx.Err(),
+			)
 		case <-ticker.C:
-			deployment, err := clientset.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
+			deployment, err := clientset.AppsV1().
+				Deployments(namespace).
+				Get(ctx, name, metav1.GetOptions{})
 			if err != nil {
 				return fmt.Errorf("failed to get deployment %s: %w", name, err)
 			}
@@ -530,22 +637,41 @@ func waitForDeploymentReady(ctx context.Context, clientset *kubernetes.Clientset
 				logger.Info().Msg("Deployment is ready")
 				return nil
 			}
-			logger.Debug().Int32("available", deployment.Status.AvailableReplicas).Int32("ready", deployment.Status.ReadyReplicas).Int32("desired", *deployment.Spec.Replicas).Msg("Waiting for deployment to be ready")
+			logger.Debug().
+				Int32("available", deployment.Status.AvailableReplicas).
+				Int32("ready", deployment.Status.ReadyReplicas).
+				Int32("desired", *deployment.Spec.Replicas).
+				Msg("Waiting for deployment to be ready")
 		}
 	}
 }
 
 func cleanupDeployment(ctx context.Context, clientset kubernetes.Interface, instance *Instance) {
 	log.Warn().Str("deployment", instance.DeploymentName).Msg("Cleaning up failed deployment")
-	if err := clientset.CoreV1().Services(instance.Namespace).Delete(ctx, instance.ServiceName, metav1.DeleteOptions{}); err != nil {
-		log.Debug().Err(err).Str("service", instance.ServiceName).Msg("Failed to delete service during cleanup")
+	if err := clientset.CoreV1().
+		Services(instance.Namespace).
+		Delete(ctx, instance.ServiceName, metav1.DeleteOptions{}); err != nil {
+		log.Debug().
+			Err(err).
+			Str("service", instance.ServiceName).
+			Msg("Failed to delete service during cleanup")
 	}
 	loadBalancerServiceName := instance.DeploymentName + "-loadbalancer"
-	if err := clientset.CoreV1().Services(instance.Namespace).Delete(ctx, loadBalancerServiceName, metav1.DeleteOptions{}); err != nil {
-		log.Debug().Err(err).Str("service", loadBalancerServiceName).Msg("Failed to delete LoadBalancer service during cleanup")
+	if err := clientset.CoreV1().
+		Services(instance.Namespace).
+		Delete(ctx, loadBalancerServiceName, metav1.DeleteOptions{}); err != nil {
+		log.Debug().
+			Err(err).
+			Str("service", loadBalancerServiceName).
+			Msg("Failed to delete LoadBalancer service during cleanup")
 	}
-	if err := clientset.AppsV1().Deployments(instance.Namespace).Delete(ctx, instance.DeploymentName, metav1.DeleteOptions{}); err != nil {
-		log.Debug().Err(err).Str("deployment", instance.DeploymentName).Msg("Failed to delete deployment during cleanup")
+	if err := clientset.AppsV1().
+		Deployments(instance.Namespace).
+		Delete(ctx, instance.DeploymentName, metav1.DeleteOptions{}); err != nil {
+		log.Debug().
+			Err(err).
+			Str("deployment", instance.DeploymentName).
+			Msg("Failed to delete deployment during cleanup")
 	}
 }
 

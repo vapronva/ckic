@@ -3,9 +3,12 @@ package caddy
 import (
 	"bytes"
 	"context"
+	stdErrors "errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -28,6 +31,11 @@ type AdminAPIConfig struct {
 	OriginKey string
 }
 
+const (
+	readinessRequestTimeout = 10 * time.Second
+	configPushTimeout       = 30 * time.Second
+)
+
 func waitForCaddyAPIReady(ctx context.Context, adminURL string, apiConfig *AdminAPIConfig) error {
 	initialDelay := constants.CaddyAPIInitialDelay
 	maxDelay := constants.CaddyAPIMaxDelay
@@ -37,20 +45,26 @@ func waitForCaddyAPIReady(ctx context.Context, adminURL string, apiConfig *Admin
 	if before, ok := strings.CutSuffix(adminURL, "/load"); ok {
 		readyURL = before + "/config/"
 	}
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: readinessRequestTimeout}
 	ticker := time.NewTicker(delay)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("context deadline exceeded while waiting for Caddy API: %w", ctx.Err())
+			return fmt.Errorf(
+				"context deadline exceeded while waiting for Caddy API: %w",
+				ctx.Err(),
+			)
 		case <-ticker.C:
-			req, err := http.NewRequestWithContext(ctx, "GET", readyURL, nil)
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, readyURL, nil)
 			if err != nil {
 				return fmt.Errorf("failed to create readiness request: %w", err)
 			}
 			if apiConfig != nil && apiConfig.OriginKey != "" {
-				req.Header.Set("Origin", fmt.Sprintf("http://%s.caddy-admin-api.ckic.cmld.ru", apiConfig.OriginKey))
+				req.Header.Set(
+					"Origin",
+					fmt.Sprintf("http://%s.caddy-admin-api.ckic.cmld.ru", apiConfig.OriginKey),
+				)
 			}
 			resp, err := client.Do(req)
 			if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -60,25 +74,41 @@ func waitForCaddyAPIReady(ctx context.Context, adminURL string, apiConfig *Admin
 			if err == nil {
 				_ = resp.Body.Close()
 			}
-			log.Debug().Str("adminURL", adminURL).Str("readyURL", readyURL).Msgf("Caddy Admin API not ready, retrying in %v", delay)
+			log.Debug().
+				Str("adminURL", adminURL).
+				Str("readyURL", readyURL).
+				Msgf("Caddy Admin API not ready, retrying in %v", delay)
 			delay = min(time.Duration(float64(delay)*multiplier), maxDelay)
 			ticker.Reset(delay)
 		}
 	}
 }
 
-func (i *Instance) UpdateConfig(ctx context.Context, configData string, method CommunicationMethod, apiConfig *AdminAPIConfig) error {
+func (i *Instance) UpdateConfig(
+	ctx context.Context,
+	configData string,
+	method CommunicationMethod,
+	apiConfig *AdminAPIConfig,
+) error {
 	var adminURL string
-	logger := log.With().Str("node", i.NodeName).Str("pod", i.PodName).Str("method", fmt.Sprintf("%d", method)).Logger()
+	logger := log.With().
+		Str("node", i.NodeName).
+		Str("pod", i.PodName).
+		Str("method", fmt.Sprintf("%d", method)).
+		Logger()
 	logger.Debug().Msg("Updating Caddy configuration")
 	switch method {
 	case CommunicationMethodClusterIP:
-		adminURL = fmt.Sprintf("http://%s.%s.svc.cluster.local:2019/load", i.ServiceName, i.Namespace)
+		adminURL = fmt.Sprintf(
+			"http://%s.%s.svc.cluster.local:2019/load",
+			i.ServiceName,
+			i.Namespace,
+		)
 	case CommunicationMethodDirect:
 		pod, err := i.KubeClient.CoreV1().Pods(i.Namespace).Get(ctx, i.PodName, metav1.GetOptions{})
 		if err != nil {
 			logger.Error().Err(err).Msg("Failed to get pod information")
-			return &errors.ErrConfigurationFailed{
+			return &errors.ConfigurationFailedError{
 				NodeName: i.NodeName,
 				Reason:   "failed to get pod info",
 				Err:      err,
@@ -86,20 +116,20 @@ func (i *Instance) UpdateConfig(ctx context.Context, configData string, method C
 		}
 		podIP := pod.Status.PodIP
 		if podIP == "" {
-			err := fmt.Errorf("pod IP is empty")
-			logger.Error().Err(err).Msg("Cannot get pod IP for direct communication")
-			return &errors.ErrConfigurationFailed{
+			podIPErr := stdErrors.New("pod IP is empty")
+			logger.Error().Err(podIPErr).Msg("Cannot get pod IP for direct communication")
+			return &errors.ConfigurationFailedError{
 				NodeName: i.NodeName,
 				Reason:   "pod IP is empty",
-				Err:      err,
+				Err:      podIPErr,
 			}
 		}
-		adminURL = fmt.Sprintf("http://%s:2019/load", podIP)
+		adminURL = (&url.URL{Scheme: "http", Host: net.JoinHostPort(podIP, "2019"), Path: "/load"}).String()
 	case CommunicationMethodHostNetwork:
 		node, err := i.KubeClient.CoreV1().Nodes().Get(ctx, i.NodeName, metav1.GetOptions{})
 		if err != nil {
 			logger.Error().Err(err).Msg("Failed to get node information")
-			return &errors.ErrConfigurationFailed{
+			return &errors.ConfigurationFailedError{
 				NodeName: i.NodeName,
 				Reason:   "failed to get node info",
 				Err:      err,
@@ -121,19 +151,19 @@ func (i *Instance) UpdateConfig(ctx context.Context, configData string, method C
 			}
 		}
 		if nodeIP == "" {
-			err := fmt.Errorf("no IP address found for node")
-			logger.Error().Err(err).Msg("Cannot get node IP for hostNetwork communication")
-			return &errors.ErrConfigurationFailed{
+			nodeIPErr := stdErrors.New("no IP address found for node")
+			logger.Error().Err(nodeIPErr).Msg("Cannot get node IP for hostNetwork communication")
+			return &errors.ConfigurationFailedError{
 				NodeName: i.NodeName,
 				Reason:   "node IP not found",
-				Err:      err,
+				Err:      nodeIPErr,
 			}
 		}
-		adminURL = fmt.Sprintf("http://%s:2019/load", nodeIP)
+		adminURL = (&url.URL{Scheme: "http", Host: net.JoinHostPort(nodeIP, "2019"), Path: "/load"}).String()
 	default:
 		err := fmt.Errorf("unknown communication method: %d", method)
 		logger.Error().Err(err).Msg("Invalid communication method")
-		return &errors.ErrConfigurationFailed{
+		return &errors.ConfigurationFailedError{
 			NodeName: i.NodeName,
 			Reason:   "unknown communication method",
 			Err:      err,
@@ -143,19 +173,22 @@ func (i *Instance) UpdateConfig(ctx context.Context, configData string, method C
 	defer cancel()
 	if err := waitForCaddyAPIReady(readyCtx, adminURL, apiConfig); err != nil {
 		logger.Error().Err(err).Msg("Caddy Admin API not ready")
-		return &errors.ErrConfigurationFailed{
+		return &errors.ConfigurationFailedError{
 			NodeName: i.NodeName,
 			Reason:   "admin API not ready",
 			Err:      err,
 		}
 	}
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
-	req, err := http.NewRequestWithContext(ctx, "POST", adminURL, bytes.NewBufferString(configData))
+	client := &http.Client{Timeout: configPushTimeout}
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		adminURL,
+		bytes.NewBufferString(configData),
+	)
 	if err != nil {
 		logger.Error().Err(err).Msg("Failed to create HTTP request")
-		return &errors.ErrConfigurationFailed{
+		return &errors.ConfigurationFailedError{
 			NodeName: i.NodeName,
 			Reason:   "failed to create HTTP request",
 			Err:      err,
@@ -163,13 +196,18 @@ func (i *Instance) UpdateConfig(ctx context.Context, configData string, method C
 	}
 	req.Header.Set("Content-Type", "text/caddyfile")
 	if apiConfig != nil && apiConfig.OriginKey != "" {
-		req.Header.Set("Origin", fmt.Sprintf("http://%s.caddy-admin-api.ckic.cmld.ru", apiConfig.OriginKey))
-		logger.Debug().Str("origin", req.Header.Get("Origin")).Msg("Added Origin header for admin API security")
+		req.Header.Set(
+			"Origin",
+			fmt.Sprintf("http://%s.caddy-admin-api.ckic.cmld.ru", apiConfig.OriginKey),
+		)
+		logger.Debug().
+			Str("origin", req.Header.Get("Origin")).
+			Msg("Added Origin header for admin API security")
 	}
 	resp, err := client.Do(req)
 	if err != nil {
 		logger.Error().Err(err).Msg("Failed to send configuration to Caddy")
-		return &errors.ErrConfigurationFailed{
+		return &errors.ConfigurationFailedError{
 			NodeName: i.NodeName,
 			Reason:   "failed to send configuration",
 			Err:      err,
@@ -179,7 +217,7 @@ func (i *Instance) UpdateConfig(ctx context.Context, configData string, method C
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		logger.Error().Err(err).Msg("Failed to read response body")
-		return &errors.ErrConfigurationFailed{
+		return &errors.ConfigurationFailedError{
 			NodeName: i.NodeName,
 			Reason:   "failed to read response",
 			Err:      err,
@@ -188,11 +226,17 @@ func (i *Instance) UpdateConfig(ctx context.Context, configData string, method C
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		err = fmt.Errorf("caddy returned status %d: %s", resp.StatusCode, string(body))
 		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-			logger.Error().Err(err).Int("status", resp.StatusCode).Msg("Caddy configuration update failed with client error")
+			logger.Error().
+				Err(err).
+				Int("status", resp.StatusCode).
+				Msg("Caddy configuration update failed with client error")
 		} else {
-			logger.Error().Err(err).Int("status", resp.StatusCode).Msg("Caddy configuration update failed")
+			logger.Error().
+				Err(err).
+				Int("status", resp.StatusCode).
+				Msg("Caddy configuration update failed")
 		}
-		return &errors.ErrConfigurationFailed{
+		return &errors.ConfigurationFailedError{
 			NodeName: i.NodeName,
 			Reason:   "non-2xx response",
 			Err:      err,

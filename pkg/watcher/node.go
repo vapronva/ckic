@@ -22,6 +22,14 @@ const (
 	NodeRemoved
 )
 
+const defaultLabelSelectorValue = "true"
+
+const (
+	labelSelectorParts  = 2
+	nodeListRetryDelay  = 10 * time.Second
+	nodeWatchRetryDelay = 5 * time.Second
+)
+
 type NodeEvent struct {
 	Type     NodeEventType
 	NodeName string
@@ -41,32 +49,37 @@ type NodeWatcher struct {
 func ParseLabelSelector(labelSelector string) (string, string) {
 	selector := strings.TrimSpace(labelSelector)
 	if selector == "" {
-		return "", "true"
+		return "", defaultLabelSelectorValue
 	}
 	var key string
 	var value string
-	if strings.Contains(selector, "=") {
-		parts := strings.SplitN(selector, "=", 2)
+	switch {
+	case strings.Contains(selector, "="):
+		parts := strings.SplitN(selector, "=", labelSelectorParts)
 		key = parts[0]
 		value = parts[1]
-	} else if strings.Contains(selector, ":") {
-		parts := strings.SplitN(selector, ":", 2)
+	case strings.Contains(selector, ":"):
+		parts := strings.SplitN(selector, ":", labelSelectorParts)
 		key = parts[0]
 		value = parts[1]
-	} else {
+	default:
 		key = selector
-		value = "true"
+		value = defaultLabelSelectorValue
 	}
 	key = strings.TrimSpace(key)
 	value = strings.TrimSpace(value)
 	value = strings.Trim(value, "\"' ")
 	if value == "" {
-		value = "true"
+		value = defaultLabelSelectorValue
 	}
 	return key, value
 }
 
-func NewNodeWatcher(clientset *kubernetes.Clientset, labelSelector string, handler NodeHandler) *NodeWatcher {
+func NewNodeWatcher(
+	clientset *kubernetes.Clientset,
+	labelSelector string,
+	handler NodeHandler,
+) *NodeWatcher {
 	labelKey, labelValue := ParseLabelSelector(labelSelector)
 	return &NodeWatcher{
 		clientset:    clientset,
@@ -91,7 +104,10 @@ func (w *NodeWatcher) snapshotTrackedNodes() []string {
 }
 
 func (w *NodeWatcher) Start(ctx context.Context) {
-	logger := log.With().Str("component", "node_watcher").Str("label", w.labelKey+"="+w.labelValue).Logger()
+	logger := log.With().
+		Str("component", "node_watcher").
+		Str("label", w.labelKey+"="+w.labelValue).
+		Logger()
 	logger.Info().Msg("Starting node watcher")
 	for {
 		select {
@@ -104,7 +120,7 @@ func (w *NodeWatcher) Start(ctx context.Context) {
 			})
 			if err != nil {
 				logger.Error().Err(err).Msg("Failed to list nodes")
-				time.Sleep(10 * time.Second)
+				time.Sleep(nodeListRetryDelay)
 				continue
 			}
 			var addedNodes []string
@@ -146,7 +162,7 @@ func (w *NodeWatcher) Start(ctx context.Context) {
 			})
 			if err != nil {
 				logger.Error().Err(err).Msg("Failed to create node watcher")
-				time.Sleep(10 * time.Second)
+				time.Sleep(nodeListRetryDelay)
 				continue
 			}
 			watchChan := watcher.ResultChan()
@@ -225,7 +241,7 @@ func (w *NodeWatcher) Start(ctx context.Context) {
 			}
 			retryTicker.Stop()
 			logger.Info().Msg("Node watcher channel closed, restarting")
-			time.Sleep(5 * time.Second)
+			time.Sleep(nodeWatchRetryDelay)
 		}
 	}
 }

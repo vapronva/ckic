@@ -35,6 +35,8 @@ type NamespaceAggregator struct {
 	initializing            bool
 }
 
+const mirrorPublishTimeout = 30 * time.Second
+
 func NewNamespaceAggregator(
 	clientset *kubernetes.Clientset,
 	namespace string,
@@ -163,7 +165,8 @@ func (a *NamespaceAggregator) SetExternal(namespace, fragment string) {
 		a.publishMu.Unlock()
 	}
 	if nodeUnchanged {
-		logger.Debug().Msg("External fragment updated but merged config unchanged for nodes, skipping push")
+		logger.Debug().
+			Msg("External fragment updated but merged config unchanged for nodes, skipping push")
 		return
 	}
 	logger.Info().Msg("External fragment updated, pushing to nodes")
@@ -206,7 +209,9 @@ func (a *NamespaceAggregator) SetExternalBatch(externals map[string]string) {
 		a.stateVersion++
 	}
 	a.mu.Unlock()
-	logger.Info().Int("count", len(externals)).Msg("Batch loaded external fragments during initialization")
+	logger.Info().
+		Int("count", len(externals)).
+		Msg("Batch loaded external fragments during initialization")
 }
 
 func (a *NamespaceAggregator) MarkInitialized() {
@@ -232,7 +237,9 @@ func (a *NamespaceAggregator) MarkInitialized() {
 			logger.Debug().Msg("Skipping stale mirror publish on initialization")
 		} else {
 			if err := a.publishMirrorConfigMap(merged); err != nil {
-				logger.Error().Err(err).Msg("Failed to publish aggregated ConfigMap on initialization")
+				logger.Error().
+					Err(err).
+					Msg("Failed to publish aggregated ConfigMap on initialization")
 			} else {
 				a.mu.Lock()
 				if version > a.lastPublishedVersion {
@@ -308,7 +315,8 @@ func (a *NamespaceAggregator) RemoveExternal(namespace string) {
 		a.publishMu.Unlock()
 	}
 	if nodeUnchanged {
-		logger.Debug().Msg("External fragment removed but merged config unchanged for nodes, skipping push")
+		logger.Debug().
+			Msg("External fragment removed but merged config unchanged for nodes, skipping push")
 		return
 	}
 	logger.Info().Msg("External fragment removed, pushing to nodes")
@@ -346,15 +354,17 @@ func (a *NamespaceAggregator) currentMergedLocked() string {
 		namespaces = append(namespaces, ns)
 	}
 	sort.Strings(namespaces)
+	var mergedSb349 strings.Builder
 	for _, ns := range namespaces {
 		fragment := a.externals[ns]
 		if strings.TrimSpace(fragment) == "" {
 			continue
 		}
-		merged += fmt.Sprintf("\n\n# ---- Begin external from %s ----\n", ns)
-		merged += strings.TrimSpace(fragment)
-		merged += fmt.Sprintf("\n# ---- End external from %s ----\n", ns)
+		fmt.Fprintf(&mergedSb349, "\n\n# ---- Begin external from %s ----\n", ns)
+		mergedSb349.WriteString(strings.TrimSpace(fragment))
+		fmt.Fprintf(&mergedSb349, "\n# ---- End external from %s ----\n", ns)
 	}
+	merged += mergedSb349.String()
 	return merged
 }
 
@@ -391,16 +401,23 @@ func (a *NamespaceAggregator) EnsureNodeSync() {
 }
 
 func (a *NamespaceAggregator) publishMirrorConfigMap(mergedConfig string) error {
-	logger := log.With().Str("component", "aggregator").Str("configmap", a.aggregatedConfigMapName).Logger()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	logger := log.With().
+		Str("component", "aggregator").
+		Str("configmap", a.aggregatedConfigMapName).
+		Logger()
+	ctx, cancel := context.WithTimeout(context.Background(), mirrorPublishTimeout)
 	defer cancel()
-	cm, err := a.clientset.CoreV1().ConfigMaps(a.namespace).Get(ctx, a.aggregatedConfigMapName, metav1.GetOptions{})
+	cm, err := a.clientset.CoreV1().
+		ConfigMaps(a.namespace).
+		Get(ctx, a.aggregatedConfigMapName, metav1.GetOptions{})
 	if err == nil {
 		if cm.Data == nil {
 			cm.Data = make(map[string]string)
 		}
 		cm.Data["Caddyfile"] = mergedConfig
-		_, err = a.clientset.CoreV1().ConfigMaps(a.namespace).Update(ctx, cm, metav1.UpdateOptions{})
+		_, err = a.clientset.CoreV1().
+			ConfigMaps(a.namespace).
+			Update(ctx, cm, metav1.UpdateOptions{})
 		if err != nil {
 			return fmt.Errorf("failed to update mirror ConfigMap: %w", err)
 		}
@@ -419,7 +436,9 @@ func (a *NamespaceAggregator) publishMirrorConfigMap(mergedConfig string) error 
 				"Caddyfile": mergedConfig,
 			},
 		}
-		_, err = a.clientset.CoreV1().ConfigMaps(a.namespace).Create(ctx, cm, metav1.CreateOptions{})
+		_, err = a.clientset.CoreV1().
+			ConfigMaps(a.namespace).
+			Create(ctx, cm, metav1.CreateOptions{})
 		if err != nil {
 			return fmt.Errorf("failed to create mirror ConfigMap: %w", err)
 		}

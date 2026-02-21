@@ -39,14 +39,14 @@ type ExternalConfigWatcher struct {
 	batchInitialized     bool
 }
 
+const (
+	externalWatcherMaxFailures  = 5
+	externalWatcherResetTimeout = 5 * time.Minute
+)
+
 func NewExternalConfigWatcher(
 	clientset *kubernetes.Clientset,
-	ownNamespace string,
-	configMapName string,
-	labelSelector string,
-	nsMode string,
-	allowNamespaces string,
-	denyNamespaces string,
+	ownNamespace, configMapName, labelSelector, nsMode, allowNamespaces, denyNamespaces string,
 	onUpdate ExternalConfigUpdateFunc,
 	onRemove ExternalConfigRemoveFunc,
 ) *ExternalConfigWatcher {
@@ -79,8 +79,8 @@ func NewExternalConfigWatcher(
 		onUpdate:             onUpdate,
 		onRemove:             onRemove,
 		lastProcessedConfigs: make(map[string]string),
-		maxFailures:          5,
-		resetTimeout:         5 * time.Minute,
+		maxFailures:          externalWatcherMaxFailures,
+		resetTimeout:         externalWatcherResetTimeout,
 		lastSuccess:          time.Now(),
 	}
 }
@@ -103,7 +103,10 @@ func (w *ExternalConfigWatcher) isNamespaceAllowed(namespace string) bool {
 
 func (w *ExternalConfigWatcher) Start(ctx context.Context) {
 	logger := log.With().Str("component", "external_config_watcher").Logger()
-	logger.Info().Str("label", w.labelSelector).Str("mode", w.nsMode).Msg("Starting external config watcher")
+	logger.Info().
+		Str("label", w.labelSelector).
+		Str("mode", w.nsMode).
+		Msg("Starting external config watcher")
 	if !w.batchInitialized {
 		w.initialList(ctx, logger)
 	} else {
@@ -151,7 +154,9 @@ func (w *ExternalConfigWatcher) Start(ctx context.Context) {
 			}
 			if event.Type == watch.Error {
 				if status, ok := event.Object.(*metav1.Status); ok && status.Code == 410 {
-					logger.Info().Int32("code", status.Code).Msg("Received watch timeout (410); ignoring because we restart with an empty resourceVersion")
+					logger.Info().
+						Int32("code", status.Code).
+						Msg("Received watch timeout (410); ignoring because we restart with an empty resourceVersion")
 				} else {
 					logger.Error().Msg("Error in external ConfigMap watch channel")
 				}
@@ -163,7 +168,9 @@ func (w *ExternalConfigWatcher) Start(ctx context.Context) {
 				continue
 			}
 			if !w.isNamespaceAllowed(cm.Namespace) {
-				logger.Debug().Str("namespace", cm.Namespace).Msg("Skipping ConfigMap from excluded namespace")
+				logger.Debug().
+					Str("namespace", cm.Namespace).
+					Msg("Skipping ConfigMap from excluded namespace")
 				continue
 			}
 			w.lastResourceVersion = cm.ResourceVersion
@@ -172,10 +179,18 @@ func (w *ExternalConfigWatcher) Start(ctx context.Context) {
 				if fragment, exists := cm.Data["Caddyfile"]; exists {
 					sourceKey := fmt.Sprintf("%s/%s", cm.Namespace, cm.Name)
 					if w.lastProcessedConfigs[sourceKey] == fragment {
-						logger.Debug().Str("event", string(event.Type)).Str("namespace", cm.Namespace).Str("name", cm.Name).Msg("External ConfigMap content unchanged, skipping")
+						logger.Debug().
+							Str("event", string(event.Type)).
+							Str("namespace", cm.Namespace).
+							Str("name", cm.Name).
+							Msg("External ConfigMap content unchanged, skipping")
 						continue
 					}
-					logger.Info().Str("event", string(event.Type)).Str("namespace", cm.Namespace).Str("name", cm.Name).Msg("External ConfigMap updated")
+					logger.Info().
+						Str("event", string(event.Type)).
+						Str("namespace", cm.Namespace).
+						Str("name", cm.Name).
+						Msg("External ConfigMap updated")
 					if w.onUpdate != nil {
 						w.onUpdate(sourceKey, fragment)
 					}
@@ -183,17 +198,26 @@ func (w *ExternalConfigWatcher) Start(ctx context.Context) {
 					w.lastSuccess = time.Now()
 					w.failureCount = 0
 				} else {
-					logger.Warn().Str("namespace", cm.Namespace).Str("name", cm.Name).Msg("External ConfigMap missing 'Caddyfile' key")
+					logger.Warn().
+						Str("namespace", cm.Namespace).
+						Str("name", cm.Name).
+						Msg("External ConfigMap missing 'Caddyfile' key")
 				}
 			case watch.Deleted:
 				sourceKey := fmt.Sprintf("%s/%s", cm.Namespace, cm.Name)
-				logger.Info().Str("namespace", cm.Namespace).Str("name", cm.Name).Msg("External ConfigMap deleted")
+				logger.Info().
+					Str("namespace", cm.Namespace).
+					Str("name", cm.Name).
+					Msg("External ConfigMap deleted")
 				if w.onRemove != nil {
 					w.onRemove(sourceKey)
 				}
 				delete(w.lastProcessedConfigs, sourceKey)
 				w.lastSuccess = time.Now()
 				w.failureCount = 0
+			case watch.Bookmark:
+				logger.Debug().Msg("Received external ConfigMap bookmark event")
+			case watch.Error:
 			}
 		}
 		logger.Info().Msg("External ConfigMap watch channel closed, restarting")
@@ -212,14 +236,20 @@ func (w *ExternalConfigWatcher) initialList(ctx context.Context, logger zerolog.
 		return
 	}
 	w.lastResourceVersion = configMaps.ResourceVersion
-	logger.Info().Int("count", len(configMaps.Items)).Str("resourceVersion", w.lastResourceVersion).Msg("Discovered initial external ConfigMaps")
+	logger.Info().
+		Int("count", len(configMaps.Items)).
+		Str("resourceVersion", w.lastResourceVersion).
+		Msg("Discovered initial external ConfigMaps")
 	for _, cm := range configMaps.Items {
 		if !w.isNamespaceAllowed(cm.Namespace) {
 			continue
 		}
 		if fragment, exists := cm.Data["Caddyfile"]; exists {
 			sourceKey := fmt.Sprintf("%s/%s", cm.Namespace, cm.Name)
-			logger.Info().Str("namespace", cm.Namespace).Str("name", cm.Name).Msg("Loading initial external ConfigMap")
+			logger.Info().
+				Str("namespace", cm.Namespace).
+				Str("name", cm.Name).
+				Msg("Loading initial external ConfigMap")
 			if w.onUpdate != nil {
 				w.onUpdate(sourceKey, fragment)
 			}
@@ -253,7 +283,10 @@ func (w *ExternalConfigWatcher) InitialListBatch(ctx context.Context) (map[strin
 	}
 	w.batchInitialized = true
 	w.lastSuccess = time.Now()
-	logger.Info().Int("count", len(externals)).Str("resourceVersion", w.lastResourceVersion).Msg("Batch loaded external ConfigMaps")
+	logger.Info().
+		Int("count", len(externals)).
+		Str("resourceVersion", w.lastResourceVersion).
+		Msg("Batch loaded external ConfigMaps")
 	return externals, nil
 }
 
