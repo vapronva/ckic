@@ -75,12 +75,24 @@ func waitForCaddyAPIReady(
 			}
 			//nolint:gosec
 			resp, err := client.Do(req)
-			if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				_ = resp.Body.Close()
-				return nil
-			}
 			if err == nil {
-				_ = resp.Body.Close()
+				if _, copyErr := io.Copy(io.Discard, resp.Body); copyErr != nil {
+					log.Warn().
+						Err(copyErr).
+						Str("adminURL", adminURL).
+						Str("readyURL", readyURL).
+						Msg("Failed to drain readiness response body")
+				}
+				if closeErr := resp.Body.Close(); closeErr != nil {
+					log.Warn().
+						Err(closeErr).
+						Str("adminURL", adminURL).
+						Str("readyURL", readyURL).
+						Msg("Failed to close readiness response body")
+				}
+				if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+					return nil
+				}
 			}
 			log.Debug().
 				Str("adminURL", adminURL).
@@ -234,7 +246,11 @@ func (i *Instance) UpdateConfig(
 			Err:      err,
 		}
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			logger.Warn().Err(closeErr).Msg("Failed to close response body")
+		}
+	}()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		logger.Error().Err(err).Msg("Failed to read response body")
