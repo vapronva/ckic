@@ -183,7 +183,7 @@ func parseCLIOptions() cliOptions {
 	logLevel := pflag.String("log-level", "info", "Log level (debug, info, warn, error)")
 	caddyImage := pflag.String(
 		"caddy-image",
-		"docker.horse/oss-images/zerossl-caddy/caddy:2.10.2-alpine",
+		"docker.horse/oss-images/zerossl-caddy/caddy:2.11.1-alpine",
 		"Caddy image (format image:tag)",
 	)
 	enableLoadBalancer := pflag.Bool(

@@ -4,7 +4,7 @@ replicaCount: 1
 image:
   repository: docker.horse
   image: vapronva/ckic/manager
-  tag: 0.19.0
+  tag: 0.20.0
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -60,7 +60,7 @@ config:
   bootstrapDefaultConfig: false
   communicationMethod: clusterip
   logLevel: info
-  caddyImage: docker.horse/oss-images/zerossl-caddy/caddy:2.10.2-alpine
+  caddyImage: docker.horse/oss-images/zerossl-caddy/caddy:2.11.1-alpine
   enableLoadBalancer: true
   useHostNetwork: false
   httpHostPort: 80
