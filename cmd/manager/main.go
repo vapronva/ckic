@@ -25,10 +25,12 @@ import (
 )
 
 const (
-	defaultHTTPHostPort    = 80
-	defaultHTTPSHostPort   = 443
-	probeShutdownTimeout   = 5 * time.Second
-	probeReadHeaderTimeout = 10 * time.Second
+	defaultHTTPHostPort           = 80
+	defaultHTTPSHostPort          = 443
+	probeShutdownTimeout          = 5 * time.Second
+	probeReadHeaderTimeout        = 10 * time.Second
+	leaderElectionShutdownMinWait = 1 * time.Second
+	leaderElectionShutdownMaxWait = 5 * time.Second
 )
 
 type cliOptions struct {
@@ -67,6 +69,12 @@ type cliOptions struct {
 	leaderElectionRenewDeadline  time.Duration
 	leaderElectionRetryPeriod    time.Duration
 }
+
+type controllerRunner interface {
+	Run(context.Context) error
+}
+
+type leaderElectionRunFunc func(context.Context, leaderelection.LeaderElectionConfig)
 
 func main() {
 	options := parseCLIOptions()
@@ -396,26 +404,83 @@ func newControllerOrDie(
 
 func runControllerWithLeaderElection(
 	ctx context.Context,
-	clientset *kubernetes.Clientset,
+	clientset kubernetes.Interface,
 	options cliOptions,
-	ctrl *controller.Controller,
+	ctrl controllerRunner,
 	readiness *atomic.Bool,
 ) error {
+	return runControllerWithLeaderElectionWithRunner(
+		ctx,
+		clientset,
+		options,
+		ctrl,
+		readiness,
+		leaderelection.RunOrDie,
+	)
+}
+
+func runControllerWithLeaderElectionWithRunner(
+	ctx context.Context,
+	clientset kubernetes.Interface,
+	options cliOptions,
+	ctrl controllerRunner,
+	readiness *atomic.Bool,
+	runLeaderElection leaderElectionRunFunc,
+) error {
 	if !options.leaderElectionEnabled {
-		readiness.Store(true)
-		defer readiness.Store(false)
-		return ctrl.Run(ctx)
+		return runControllerWithoutLeaderElection(ctx, ctrl, readiness)
 	}
-	leaseNamespace := options.leaderElectionLeaseNamespace
-	if leaseNamespace == "" {
-		leaseNamespace = options.configMapNamespace
+	readiness.Store(false)
+	defer readiness.Store(false)
+	leaseNamespace := leaderElectionLeaseNamespace(options)
+	identity := leaderElectionIdentity()
+	lock := leaderElectionLock(clientset, options, leaseNamespace, identity)
+	runErrCh := make(chan error, 1)
+	electionDoneCh := startLeaderElectionLoop(
+		ctx,
+		lock,
+		options,
+		identity,
+		ctrl,
+		readiness,
+		runLeaderElection,
+		runErrCh,
+		leaseNamespace,
+	)
+	return waitForLeaderElectionResult(ctx, options, runErrCh, electionDoneCh)
+}
+
+func runControllerWithoutLeaderElection(
+	ctx context.Context,
+	ctrl controllerRunner,
+	readiness *atomic.Bool,
+) error {
+	readiness.Store(true)
+	defer readiness.Store(false)
+	return ctrl.Run(ctx)
+}
+
+func leaderElectionLeaseNamespace(options cliOptions) string {
+	if options.leaderElectionLeaseNamespace != "" {
+		return options.leaderElectionLeaseNamespace
 	}
+	return options.configMapNamespace
+}
+
+func leaderElectionIdentity() string {
 	hostname, err := os.Hostname()
 	if err != nil {
 		hostname = "ckic-manager"
 	}
-	identity := fmt.Sprintf("%s-%d", hostname, os.Getpid())
-	lock := &resourcelock.LeaseLock{
+	return fmt.Sprintf("%s-%d", hostname, os.Getpid())
+}
+
+func leaderElectionLock(
+	clientset kubernetes.Interface,
+	options cliOptions,
+	leaseNamespace, identity string,
+) resourcelock.Interface {
+	return &resourcelock.LeaseLock{
 		LeaseMeta: metav1.ObjectMeta{
 			Name:      options.leaderElectionLeaseName,
 			Namespace: leaseNamespace,
@@ -425,13 +490,46 @@ func runControllerWithLeaderElection(
 			Identity: identity,
 		},
 	}
-	runErrCh := make(chan error, 1)
-	reportRunResult := func(err error) {
-		select {
-		case runErrCh <- err:
-		default:
-		}
-	}
+}
+
+func startLeaderElectionLoop(
+	ctx context.Context,
+	lock resourcelock.Interface,
+	options cliOptions,
+	identity string,
+	ctrl controllerRunner,
+	readiness *atomic.Bool,
+	runLeaderElection leaderElectionRunFunc,
+	runErrCh chan<- error,
+	leaseNamespace string,
+) <-chan struct{} {
+	electionDoneCh := make(chan struct{})
+	logLeaderElectionEnabled(options, leaseNamespace)
+	go func() {
+		defer close(electionDoneCh)
+		runLeaderElection(ctx, leaderelection.LeaderElectionConfig{
+			Lock:            lock,
+			ReleaseOnCancel: true,
+			LeaseDuration:   options.leaderElectionLeaseDuration,
+			RenewDeadline:   options.leaderElectionRenewDeadline,
+			RetryPeriod:     options.leaderElectionRetryPeriod,
+			Callbacks: leaderelection.LeaderCallbacks{
+				OnStartedLeading: func(leadCtx context.Context) {
+					onStartedLeading(leadCtx, identity, ctrl, readiness, runErrCh)
+				},
+				OnStoppedLeading: func() {
+					onStoppedLeading(ctx, readiness, runErrCh)
+				},
+				OnNewLeader: func(newLeaderIdentity string) {
+					onNewLeader(identity, newLeaderIdentity)
+				},
+			},
+		})
+	}()
+	return electionDoneCh
+}
+
+func logLeaderElectionEnabled(options cliOptions, leaseNamespace string) {
 	log.Info().
 		Str("leaseName", options.leaderElectionLeaseName).
 		Str("leaseNamespace", leaseNamespace).
@@ -439,48 +537,151 @@ func runControllerWithLeaderElection(
 		Dur("renewDeadline", options.leaderElectionRenewDeadline).
 		Dur("retryPeriod", options.leaderElectionRetryPeriod).
 		Msg("Leader election is enabled")
-	go leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
-		Lock:            lock,
-		ReleaseOnCancel: true,
-		LeaseDuration:   options.leaderElectionLeaseDuration,
-		RenewDeadline:   options.leaderElectionRenewDeadline,
-		RetryPeriod:     options.leaderElectionRetryPeriod,
-		Callbacks: leaderelection.LeaderCallbacks{
-			OnStartedLeading: func(leadCtx context.Context) {
-				log.Info().Str("identity", identity).Msg("Acquired leadership")
-				readiness.Store(true)
-				defer readiness.Store(false)
-				runErr := ctrl.Run(leadCtx)
-				if runErr != nil && !errors.Is(runErr, context.Canceled) {
-					reportRunResult(runErr)
-					return
-				}
-				reportRunResult(nil)
-			},
-			OnStoppedLeading: func() {
-				if ctx.Err() != nil {
-					return
-				}
-				reportRunResult(errors.New("leader election lost"))
-			},
-			OnNewLeader: func(newLeaderIdentity string) {
-				log.Info().
-					Str("leaderIdentity", newLeaderIdentity).
-					Bool("isLocalLeader", newLeaderIdentity == identity).
-					Msg("Observed leader election update")
-			},
-		},
-	})
+}
+
+func onStartedLeading(
+	leadCtx context.Context,
+	identity string,
+	ctrl controllerRunner,
+	readiness *atomic.Bool,
+	runErrCh chan<- error,
+) {
+	log.Info().Str("identity", identity).Msg("Acquired leadership")
+	readiness.Store(true)
+	defer readiness.Store(false)
+	runErr := ctrl.Run(leadCtx)
+	if runErr != nil && !errors.Is(runErr, context.Canceled) {
+		reportRunResult(runErrCh, runErr)
+		return
+	}
+	reportRunResult(runErrCh, nil)
+}
+
+func onStoppedLeading(
+	ctx context.Context,
+	readiness *atomic.Bool,
+	runErrCh chan<- error,
+) {
+	readiness.Store(false)
+	if ctx.Err() != nil {
+		return
+	}
+	reportRunResult(runErrCh, errors.New("leader election lost"))
+}
+
+func onNewLeader(identity, newLeaderIdentity string) {
+	log.Info().
+		Str("leaderIdentity", newLeaderIdentity).
+		Bool("isLocalLeader", newLeaderIdentity == identity).
+		Msg("Observed leader election update")
+}
+
+func reportRunResult(runErrCh chan<- error, runErr error) {
 	select {
-	case runErr := <-runErrCh:
-		return runErr
-	case <-ctx.Done():
+	case runErrCh <- runErr:
+	default:
+	}
+}
+
+func waitForLeaderElectionResult(
+	ctx context.Context,
+	options cliOptions,
+	runErrCh <-chan error,
+	electionDoneCh <-chan struct{},
+) error {
+	for {
 		select {
 		case runErr := <-runErrCh:
-			return runErr
-		default:
-			return nil
+			return handleRunResult(ctx, options, runErr, electionDoneCh)
+		case <-ctx.Done():
+			return handleContextDone(options, runErrCh, electionDoneCh)
+		case <-electionDoneCh:
+			return handleElectionDone(ctx, runErrCh)
 		}
+	}
+}
+
+func handleRunResult(
+	ctx context.Context,
+	options cliOptions,
+	runErr error,
+	electionDoneCh <-chan struct{},
+) error {
+	if runErr != nil {
+		return runErr
+	}
+	waitForElectionShutdown(options, electionDoneCh)
+	if isContextDone(ctx) {
+		return nil
+	}
+	return errors.New("controller loop exited unexpectedly without context cancellation")
+}
+
+func handleContextDone(
+	options cliOptions,
+	runErrCh <-chan error,
+	electionDoneCh <-chan struct{},
+) error {
+	waitForElectionShutdown(options, electionDoneCh)
+	if runErr, hasRunErr := readRunErrNonBlocking(runErrCh); hasRunErr && runErr != nil {
+		return runErr
+	}
+	return nil
+}
+
+func handleElectionDone(ctx context.Context, runErrCh <-chan error) error {
+	if runErr, hasRunErr := readRunErrNonBlocking(runErrCh); hasRunErr && runErr != nil {
+		return runErr
+	}
+	if isContextDone(ctx) {
+		return nil
+	}
+	return errors.New("leader election loop exited unexpectedly")
+}
+
+func readRunErrNonBlocking(runErrCh <-chan error) (error, bool) {
+	select {
+	case runErr := <-runErrCh:
+		return runErr, true
+	default:
+		return nil, false
+	}
+}
+
+func isContextDone(ctx context.Context) bool {
+	select {
+	case <-ctx.Done():
+		return true
+	default:
+		return false
+	}
+}
+
+func waitForElectionShutdown(options cliOptions, electionDoneCh <-chan struct{}) {
+	timeout := leaderElectionShutdownTimeout(
+		options.leaderElectionRenewDeadline,
+		options.leaderElectionRetryPeriod,
+	)
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-electionDoneCh:
+	case <-timer.C:
+		log.Warn().
+			Dur("timeout", timeout).
+			Msg("Timed out waiting for leader election shutdown; lease handoff may wait for expiration")
+	}
+}
+
+func leaderElectionShutdownTimeout(renewDeadline, retryPeriod time.Duration) time.Duration {
+	timeout := renewDeadline + retryPeriod
+	switch {
+	case timeout < leaderElectionShutdownMinWait:
+		return leaderElectionShutdownMinWait
+	case timeout > leaderElectionShutdownMaxWait:
+		return leaderElectionShutdownMaxWait
+	default:
+		return timeout
 	}
 }
 

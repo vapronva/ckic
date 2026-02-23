@@ -358,17 +358,17 @@ func (a *NamespaceAggregator) currentMergedLocked() string {
 		namespaces = append(namespaces, ns)
 	}
 	sort.Strings(namespaces)
-	var mergedSb349 strings.Builder
+	var mergedSb strings.Builder
 	for _, ns := range namespaces {
 		fragment := a.externals[ns]
 		if strings.TrimSpace(fragment) == "" {
 			continue
 		}
-		fmt.Fprintf(&mergedSb349, "\n\n# ---- Begin external from %s ----\n", ns)
-		mergedSb349.WriteString(strings.TrimSpace(fragment))
-		fmt.Fprintf(&mergedSb349, "\n# ---- End external from %s ----\n", ns)
+		fmt.Fprintf(&mergedSb, "\n\n# ---- Begin external from %s ----\n", ns)
+		mergedSb.WriteString(strings.TrimSpace(fragment))
+		fmt.Fprintf(&mergedSb, "\n# ---- End external from %s ----\n", ns)
 	}
-	merged += mergedSb349.String()
+	merged += mergedSb.String()
 	return merged
 }
 

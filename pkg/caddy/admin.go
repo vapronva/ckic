@@ -46,15 +46,8 @@ func waitForCaddyAPIReady(
 	maxDelay := constants.CaddyAPIMaxDelay
 	delay := initialDelay
 	multiplier := 1.5
-	readyURL := adminURL
-	if before, ok := strings.CutSuffix(adminURL, "/load"); ok {
-		readyURL = before + "/config/"
-	}
-	if client == nil {
-		client = &http.Client{Timeout: readinessRequestTimeout}
-	}
-	ticker := time.NewTicker(delay)
-	defer ticker.Stop()
+	readyURL := readinessURL(adminURL)
+	client = readinessClient(client)
 	for {
 		select {
 		case <-ctx.Done():
@@ -62,45 +55,86 @@ func waitForCaddyAPIReady(
 				"context deadline exceeded while waiting for Caddy API: %w",
 				ctx.Err(),
 			)
-		case <-ticker.C:
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, readyURL, nil)
-			if err != nil {
-				return fmt.Errorf("failed to create readiness request: %w", err)
-			}
-			if apiConfig != nil && apiConfig.OriginKey != "" {
-				req.Header.Set(
-					"Origin",
-					fmt.Sprintf("http://%s.caddy-admin-api.ckic.cmld.ru", apiConfig.OriginKey),
-				)
-			}
-			//nolint:gosec
-			resp, err := client.Do(req)
-			if err == nil {
-				if _, copyErr := io.Copy(io.Discard, resp.Body); copyErr != nil {
-					log.Warn().
-						Err(copyErr).
-						Str("adminURL", adminURL).
-						Str("readyURL", readyURL).
-						Msg("Failed to drain readiness response body")
-				}
-				if closeErr := resp.Body.Close(); closeErr != nil {
-					log.Warn().
-						Err(closeErr).
-						Str("adminURL", adminURL).
-						Str("readyURL", readyURL).
-						Msg("Failed to close readiness response body")
-				}
-				if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-					return nil
-				}
-			}
+		case <-time.After(delay):
+		}
+		ready, err := readinessProbe(ctx, client, readyURL, apiConfig, adminURL)
+		if err != nil {
+			log.Debug().
+				Err(err).
+				Str("adminURL", adminURL).
+				Str("readyURL", readyURL).
+				Msgf("Caddy Admin API readiness probe failed, retrying in %v", delay)
+		} else if ready {
+			return nil
+		}
+		if err == nil {
 			log.Debug().
 				Str("adminURL", adminURL).
 				Str("readyURL", readyURL).
 				Msgf("Caddy Admin API not ready, retrying in %v", delay)
-			delay = min(time.Duration(float64(delay)*multiplier), maxDelay)
-			ticker.Reset(delay)
 		}
+		delay = min(time.Duration(float64(delay)*multiplier), maxDelay)
+	}
+}
+
+func readinessURL(adminURL string) string {
+	if before, ok := strings.CutSuffix(adminURL, "/load"); ok {
+		return before + "/config/"
+	}
+	return adminURL
+}
+
+func readinessClient(client *http.Client) *http.Client {
+	if client != nil {
+		return client
+	}
+	return &http.Client{Timeout: readinessRequestTimeout}
+}
+
+func readinessProbe(
+	ctx context.Context,
+	client *http.Client,
+	readyURL string,
+	apiConfig *AdminAPIConfig,
+	adminURL string,
+) (bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, readyURL, nil)
+	if err != nil {
+		return false, fmt.Errorf("failed to create readiness request: %w", err)
+	}
+	if apiConfig != nil && apiConfig.OriginKey != "" {
+		req.Header.Set("Origin", adminOrigin(apiConfig.OriginKey))
+	}
+	//nolint:gosec
+	resp, doErr := client.Do(req)
+	if doErr != nil {
+		return false, doErr
+	}
+	drainAndCloseReadinessBody(resp, adminURL, readyURL)
+	return resp.StatusCode >= 200 && resp.StatusCode < 300, nil
+}
+
+func adminOrigin(originKey string) string {
+	return fmt.Sprintf("http://%s.caddy-admin-api.ckic.cmld.ru", originKey)
+}
+
+func drainAndCloseReadinessBody(resp *http.Response, adminURL, readyURL string) {
+	if resp == nil || resp.Body == nil {
+		return
+	}
+	if _, copyErr := io.Copy(io.Discard, resp.Body); copyErr != nil {
+		log.Warn().
+			Err(copyErr).
+			Str("adminURL", adminURL).
+			Str("readyURL", readyURL).
+			Msg("Failed to drain readiness response body")
+	}
+	if closeErr := resp.Body.Close(); closeErr != nil {
+		log.Warn().
+			Err(closeErr).
+			Str("adminURL", adminURL).
+			Str("readyURL", readyURL).
+			Msg("Failed to close readiness response body")
 	}
 }
 

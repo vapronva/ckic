@@ -32,7 +32,7 @@ const (
 //nolint:nestif
 func DeployCaddy(
 	ctx context.Context,
-	clientset *kubernetes.Clientset,
+	clientset kubernetes.Interface,
 	nodeName, namespace, caddyImage string,
 	enableLoadBalancer bool,
 	externalIPs []string,
@@ -160,7 +160,7 @@ func resolvePodName(
 //nolint:gocognit,funlen
 func deployDeployment(
 	ctx context.Context,
-	clientset *kubernetes.Clientset,
+	clientset kubernetes.Interface,
 	instance *Instance,
 	caddyImage, envSecretName string,
 	envSecretKeys []string,
@@ -383,6 +383,7 @@ func deployDeployment(
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: &replicas,
+			Strategy: deploymentStrategy(useHostNetwork),
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
 					"app":      "caddy",
@@ -404,7 +405,8 @@ func deployDeployment(
 	existingDeployment, err := clientset.AppsV1().
 		Deployments(instance.Namespace).
 		Get(ctx, instance.DeploymentName, metav1.GetOptions{})
-	if err == nil {
+	switch {
+	case err == nil:
 		deployment.ResourceVersion = existingDeployment.ResourceVersion
 		_, err = clientset.AppsV1().
 			Deployments(instance.Namespace).
@@ -414,7 +416,7 @@ func deployDeployment(
 			return fmt.Errorf("failed to update deployment %s: %w", instance.DeploymentName, err)
 		}
 		logger.Info().Msg("Updated existing Caddy deployment")
-	} else {
+	case apierrors.IsNotFound(err):
 		_, err = clientset.AppsV1().
 			Deployments(instance.Namespace).
 			Create(ctx, deployment, metav1.CreateOptions{})
@@ -423,6 +425,9 @@ func deployDeployment(
 			return fmt.Errorf("failed to create deployment %s: %w", instance.DeploymentName, err)
 		}
 		logger.Info().Msg("Created Caddy deployment")
+	default:
+		logger.Error().Err(err).Msg("Failed to fetch existing Caddy deployment")
+		return fmt.Errorf("failed to get deployment %s: %w", instance.DeploymentName, err)
 	}
 	if cleanupErr := clientset.PolicyV1().
 		PodDisruptionBudgets(instance.Namespace).
@@ -430,6 +435,23 @@ func deployDeployment(
 		logger.Info().Msg("Deleted legacy PodDisruptionBudget")
 	}
 	return nil
+}
+
+func deploymentStrategy(useHostNetwork bool) appsv1.DeploymentStrategy {
+	if useHostNetwork {
+		return appsv1.DeploymentStrategy{
+			Type: appsv1.RecreateDeploymentStrategyType,
+		}
+	}
+	maxSurge := intstr.FromString("25%")
+	maxUnavailable := intstr.FromString("25%")
+	return appsv1.DeploymentStrategy{
+		Type: appsv1.RollingUpdateDeploymentStrategyType,
+		RollingUpdate: &appsv1.RollingUpdateDeployment{
+			MaxSurge:       &maxSurge,
+			MaxUnavailable: &maxUnavailable,
+		},
+	}
 }
 
 func normalizeHostPort(port int) (int32, error) {
@@ -446,7 +468,7 @@ func normalizeHostPort(port int) (int32, error) {
 
 func deployService(
 	ctx context.Context,
-	clientset *kubernetes.Clientset,
+	clientset kubernetes.Interface,
 	instance *Instance,
 ) error {
 	logger := log.With().Str("service", instance.ServiceName).Logger()
@@ -483,7 +505,7 @@ func deployService(
 
 func deployLoadBalancerService(
 	ctx context.Context,
-	clientset *kubernetes.Clientset,
+	clientset kubernetes.Interface,
 	instance *Instance,
 ) error {
 	logger := log.With().
@@ -685,7 +707,7 @@ func servicePortKey(port corev1.ServicePort) string {
 
 func waitForDeploymentReady(
 	ctx context.Context,
-	clientset *kubernetes.Clientset,
+	clientset kubernetes.Interface,
 	namespace, name string,
 ) error {
 	logger := log.With().Str("deployment", name).Str("namespace", namespace).Logger()
@@ -705,17 +727,48 @@ func waitForDeploymentReady(
 			if err != nil {
 				return fmt.Errorf("failed to get deployment %s: %w", name, err)
 			}
-			if deployment.Status.ReadyReplicas > 0 {
+			if deploymentRolloutComplete(deployment) {
 				logger.Info().Msg("Deployment is ready")
 				return nil
 			}
+			desiredReplicas := int32(1)
+			if deployment.Spec.Replicas != nil {
+				desiredReplicas = *deployment.Spec.Replicas
+			}
 			logger.Debug().
+				Int64("generation", deployment.Generation).
+				Int64("observedGeneration", deployment.Status.ObservedGeneration).
 				Int32("available", deployment.Status.AvailableReplicas).
 				Int32("ready", deployment.Status.ReadyReplicas).
-				Int32("desired", *deployment.Spec.Replicas).
+				Int32("updated", deployment.Status.UpdatedReplicas).
+				Int32("replicas", deployment.Status.Replicas).
+				Int32("desired", desiredReplicas).
 				Msg("Waiting for deployment to be ready")
 		}
 	}
+}
+
+func deploymentRolloutComplete(deployment *appsv1.Deployment) bool {
+	if deployment == nil || deployment.Spec.Replicas == nil {
+		return false
+	}
+	desired := *deployment.Spec.Replicas
+	if deployment.Status.ObservedGeneration < deployment.Generation {
+		return false
+	}
+	if deployment.Status.UpdatedReplicas < desired {
+		return false
+	}
+	if deployment.Status.Replicas > deployment.Status.UpdatedReplicas {
+		return false
+	}
+	if deployment.Status.AvailableReplicas < desired {
+		return false
+	}
+	if deployment.Status.ReadyReplicas < desired {
+		return false
+	}
+	return true
 }
 
 func cleanupDeployment(ctx context.Context, clientset kubernetes.Interface, instance *Instance) {
