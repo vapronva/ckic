@@ -50,7 +50,7 @@ type ControllerConfig struct {
 }
 
 type Controller struct {
-	clientset         *kubernetes.Clientset
+	clientset         kubernetes.Interface
 	config            ControllerConfig
 	nodeWatcher       *watcher.NodeWatcher
 	configWatcher     *watcher.ConfigWatcher
@@ -76,7 +76,7 @@ type watcherBundle struct {
 	agg             *aggregator.NamespaceAggregator
 }
 
-func NewController(clientset *kubernetes.Clientset, config ControllerConfig) (*Controller, error) {
+func NewController(clientset kubernetes.Interface, config ControllerConfig) (*Controller, error) {
 	deployedInstances := make(map[string]*caddy.Instance)
 	mutex := &sync.RWMutex{}
 	nodeAvailabilityCheck := func() bool {
@@ -155,7 +155,7 @@ func NewController(clientset *kubernetes.Clientset, config ControllerConfig) (*C
 }
 
 func buildWatcherBundle(
-	clientset *kubernetes.Clientset,
+	clientset kubernetes.Interface,
 	config ControllerConfig,
 	configHandler *handlers.ConfigHandler,
 	nodeAvailabilityCheck func() bool,
@@ -307,6 +307,7 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 			}
 		}
 	}
+	c.reconcileDiscoveredDeployments(ctx, discovered)
 	savedState, err := c.stateStore.LoadState()
 	if err != nil {
 		logger.Warn().Err(err).Msg("Could not load saved state, proceeding with discovered state")
@@ -385,6 +386,45 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 	}
 	logger.Info().Msg("Reconciliation process completed")
 	return nil
+}
+
+func (c *Controller) reconcileDiscoveredDeployments(
+	ctx context.Context,
+	discovered map[string]*caddy.Instance,
+) {
+	logger := log.With().Str("component", "reconcile").Logger()
+	for nodeName, adopted := range discovered {
+		reconciled, err := caddy.DeployCaddy(
+			ctx,
+			c.clientset,
+			nodeName,
+			c.config.ConfigMapNamespace,
+			c.config.CaddyImage,
+			c.config.EnableLoadBalancer,
+			c.config.ExternalEndpoints[nodeName],
+			c.config.EnvSecretName,
+			c.config.EnvSecretKeys,
+			c.config.DataVolumePVC,
+			c.config.ConfigVolumePVC,
+			c.config.ConfigMapName,
+			c.config.UseHostNetwork,
+			c.config.HTTPHostPort,
+			c.config.HTTPSHostPort,
+		)
+		if err != nil {
+			logger.Error().
+				Err(err).
+				Str("node", nodeName).
+				Msg("Failed to reconcile adopted deployment, keeping discovered instance")
+			continue
+		}
+		discovered[nodeName] = reconciled
+		if adopted == nil || adopted.PodName != reconciled.PodName {
+			logger.Info().Msgf("Reconciled adopted deployment on node %s", nodeName)
+			continue
+		}
+		logger.Debug().Str("node", nodeName).Msg("Adopted deployment already matches desired spec")
+	}
 }
 
 //nolint:gocognit

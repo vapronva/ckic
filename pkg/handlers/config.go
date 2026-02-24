@@ -18,7 +18,7 @@ import (
 
 type ConfigHandler struct {
 	CommunicationMethod caddy.CommunicationMethod
-	Clientset           *kubernetes.Clientset
+	Clientset           kubernetes.Interface
 	Namespace           string
 	CaddyImage          string
 	EnableLoadBalancer  bool
@@ -37,6 +37,7 @@ type ConfigHandler struct {
 	HTTPSHostPort       int
 	lastConfigDigest    string
 	instanceDigests     map[string]string
+	instanceSignatures  map[string]string
 }
 
 type failedInstance struct {
@@ -53,7 +54,7 @@ const (
 
 func NewConfigHandler(
 	method caddy.CommunicationMethod,
-	clientset *kubernetes.Clientset,
+	clientset kubernetes.Interface,
 	namespace, caddyImage string,
 	enableLoadBalancer bool,
 	instances map[string]*caddy.Instance,
@@ -85,6 +86,7 @@ func NewConfigHandler(
 		HTTPHostPort:        httpHostPort,
 		HTTPSHostPort:       httpsHostPort,
 		instanceDigests:     make(map[string]string),
+		instanceSignatures:  make(map[string]string),
 	}
 }
 
@@ -92,6 +94,12 @@ func NewConfigHandler(
 func (h *ConfigHandler) Handle(configData string) {
 	h.handleMu.Lock()
 	defer h.handleMu.Unlock()
+	if h.instanceDigests == nil {
+		h.instanceDigests = make(map[string]string)
+	}
+	if h.instanceSignatures == nil {
+		h.instanceSignatures = make(map[string]string)
+	}
 	logger := log.With().Str("component", "config_handler").Logger()
 	configDigest := calculateConfigDigest(configData)
 	logger.Info().Msg("Detected configuration change, updating Caddy instances")
@@ -102,6 +110,11 @@ func (h *ConfigHandler) Handle(configData string) {
 	for nodeName := range h.instanceDigests {
 		if _, exists := instancesCopy[nodeName]; !exists {
 			delete(h.instanceDigests, nodeName)
+		}
+	}
+	for nodeName := range h.instanceSignatures {
+		if _, exists := instancesCopy[nodeName]; !exists {
+			delete(h.instanceSignatures, nodeName)
 		}
 	}
 	if len(instancesCopy) == 0 {
@@ -199,6 +212,9 @@ func (h *ConfigHandler) Handle(configData string) {
 	wg.Wait()
 	for _, nodeName := range successfulNodes {
 		h.instanceDigests[nodeName] = configDigest
+		if instance, exists := instancesCopy[nodeName]; exists {
+			h.instanceSignatures[nodeName] = instanceStateSignature(instance)
+		}
 	}
 	if len(failedInstances) > 0 {
 		logger.Info().Msgf("Redeploying %d failed instances", len(failedInstances))
@@ -233,6 +249,7 @@ func (h *ConfigHandler) Handle(configData string) {
 				}
 				h.Mu.Unlock()
 				delete(h.instanceDigests, failed.nodeName)
+				delete(h.instanceSignatures, failed.nodeName)
 				continue
 			}
 			externalIPs := h.ExternalEndpoints[failed.nodeName]
@@ -264,6 +281,7 @@ func (h *ConfigHandler) Handle(configData string) {
 				}
 				h.Mu.Unlock()
 				delete(h.instanceDigests, failed.nodeName)
+				delete(h.instanceSignatures, failed.nodeName)
 				continue
 			}
 			replaced := false
@@ -284,9 +302,11 @@ func (h *ConfigHandler) Handle(configData string) {
 						Msg("Failed to clean up stale redeployed Caddy instance")
 				}
 				delete(h.instanceDigests, failed.nodeName)
+				delete(h.instanceSignatures, failed.nodeName)
 				continue
 			}
 			h.instanceDigests[failed.nodeName] = configDigest
+			h.instanceSignatures[failed.nodeName] = instanceStateSignature(newInstance)
 			logger.Info().Str("node", failed.nodeName).Msg("Successfully redeployed Caddy instance")
 		}
 	}
@@ -299,8 +319,11 @@ func (h *ConfigHandler) allInstancesAtDigest(
 	instances map[string]*caddy.Instance,
 	configDigest string,
 ) bool {
-	for nodeName := range instances {
+	for nodeName, instance := range instances {
 		if h.instanceDigests[nodeName] != configDigest {
+			return false
+		}
+		if h.instanceSignatures[nodeName] != instanceStateSignature(instance) {
 			return false
 		}
 	}
@@ -310,12 +333,22 @@ func (h *ConfigHandler) allInstancesAtDigest(
 func (h *ConfigHandler) allCurrentInstancesConverged(configDigest string) bool {
 	h.Mu.RLock()
 	defer h.Mu.RUnlock()
-	for nodeName := range h.DeployedInstances {
+	for nodeName, instance := range h.DeployedInstances {
 		if h.instanceDigests[nodeName] != configDigest {
+			return false
+		}
+		if h.instanceSignatures[nodeName] != instanceStateSignature(instance) {
 			return false
 		}
 	}
 	return true
+}
+
+func instanceStateSignature(instance *caddy.Instance) string {
+	if instance == nil {
+		return ""
+	}
+	return instance.DeploymentName + "|" + instance.ServiceName + "|" + instance.PodName
 }
 
 func calculateConfigDigest(configData string) string {

@@ -38,7 +38,7 @@ type NodeEvent struct {
 type NodeHandler func(NodeEvent)
 
 type NodeWatcher struct {
-	clientset    *kubernetes.Clientset
+	clientset    kubernetes.Interface
 	labelKey     string
 	labelValue   string
 	nodeHandler  NodeHandler
@@ -76,7 +76,7 @@ func ParseLabelSelector(labelSelector string) (string, string) {
 }
 
 func NewNodeWatcher(
-	clientset *kubernetes.Clientset,
+	clientset kubernetes.Interface,
 	labelSelector string,
 	handler NodeHandler,
 ) *NodeWatcher {

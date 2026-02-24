@@ -23,7 +23,7 @@ type ExternalConfigUpdateFunc func(namespace, fragment string)
 type ExternalConfigRemoveFunc func(namespace string)
 
 type ExternalConfigWatcher struct {
-	clientset            *kubernetes.Clientset
+	clientset            kubernetes.Interface
 	ownNamespace         string
 	configMapName        string
 	labelSelector        string
@@ -47,7 +47,7 @@ const (
 )
 
 func NewExternalConfigWatcher(
-	clientset *kubernetes.Clientset,
+	clientset kubernetes.Interface,
 	ownNamespace, configMapName, labelSelector, nsMode, allowNamespaces, denyNamespaces string,
 	onUpdate ExternalConfigUpdateFunc,
 	onRemove ExternalConfigRemoveFunc,

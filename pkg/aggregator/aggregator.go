@@ -26,7 +26,7 @@ type NamespaceAggregator struct {
 	externals               map[string]string
 	lastPushedMerged        string
 	lastPublishedToMirror   string
-	clientset               *kubernetes.Clientset
+	clientset               kubernetes.Interface
 	namespace               string
 	publishAggregated       bool
 	aggregatedConfigMapName string
@@ -38,7 +38,7 @@ type NamespaceAggregator struct {
 const mirrorPublishTimeout = 30 * time.Second
 
 func NewNamespaceAggregator(
-	clientset *kubernetes.Clientset,
+	clientset kubernetes.Interface,
 	namespace string,
 	publishAggregated bool,
 	aggregatedConfigMapName string,

@@ -8,6 +8,7 @@ import (
 	"github.com/rs/zerolog/log"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -29,7 +30,7 @@ const (
 	caddyCapabilityDrop   = corev1.Capability("ALL")
 )
 
-//nolint:nestif
+//nolint:nestif,gocognit
 func DeployCaddy(
 	ctx context.Context,
 	clientset kubernetes.Interface,
@@ -54,7 +55,7 @@ func DeployCaddy(
 		ExternalIPs:    externalIPs,
 		KubeClient:     clientset,
 	}
-	if err := deployDeployment(
+	deploymentChanged, deploymentCreated, err := deployDeployment(
 		deployCtx,
 		clientset,
 		instance,
@@ -67,40 +68,54 @@ func DeployCaddy(
 		useHostNetwork,
 		httpHostPort,
 		httpsHostPort,
-	); err != nil {
+	)
+	if err != nil {
 		return nil, err
 	}
 	if !useHostNetwork {
-		if err := deployService(
+		_, err = deployService(
 			deployCtx,
 			clientset,
 			instance,
-		); err != nil {
-			cleanupDeployment(ctx, clientset, instance)
+		)
+		if err != nil {
+			if deploymentCreated {
+				cleanupDeployment(ctx, clientset, instance)
+			}
 			return nil, err
 		}
 		if enableLoadBalancer {
-			if err := deployLoadBalancerService(deployCtx, clientset, instance); err != nil {
-				cleanupDeployment(ctx, clientset, instance)
+			_, err = deployLoadBalancerService(deployCtx, clientset, instance)
+			if err != nil {
+				if deploymentCreated {
+					cleanupDeployment(ctx, clientset, instance)
+				}
 				return nil, err
 			}
 		}
 	} else {
 		logger.Info().Msg("Skipping service creation due to hostNetwork mode")
 	}
-	if err := waitForDeploymentReady(deployCtx, clientset, namespace, deploymentName); err != nil {
-		cleanupDeployment(ctx, clientset, instance)
-		return nil, fmt.Errorf(
-			"deployment %s/%s did not become ready: %w",
-			namespace,
-			deploymentName,
-			err,
-		)
+	if deploymentChanged {
+		err = waitForDeploymentReady(deployCtx, clientset, namespace, deploymentName)
+		if err != nil {
+			if deploymentCreated {
+				cleanupDeployment(ctx, clientset, instance)
+			}
+			return nil, fmt.Errorf(
+				"deployment %s/%s did not become ready: %w",
+				namespace,
+				deploymentName,
+				err,
+			)
+		}
 	}
 	podName, err := resolvePodName(deployCtx, clientset, namespace, nodeName)
 	if err != nil {
 		logger.Error().Err(err).Msg("Failed to resolve Caddy pod name")
-		cleanupDeployment(ctx, clientset, instance)
+		if deploymentCreated {
+			cleanupDeployment(ctx, clientset, instance)
+		}
 		return nil, err
 	}
 	instance.PodName = podName
@@ -167,7 +182,7 @@ func deployDeployment(
 	dataVolumePVC, configVolumePVC, configMapName string,
 	useHostNetwork bool,
 	httpHostPort, httpsHostPort int,
-) error {
+) (bool, bool, error) {
 	logger := log.With().Str("deployment", instance.DeploymentName).Logger()
 	replicas := int32(1)
 	containers := []corev1.Container{}
@@ -193,11 +208,11 @@ func deployDeployment(
 	if useHostNetwork {
 		httpPort32, err := normalizeHostPort(httpHostPort)
 		if err != nil {
-			return fmt.Errorf("invalid HTTP host port: %w", err)
+			return false, false, fmt.Errorf("invalid HTTP host port: %w", err)
 		}
 		httpsPort32, err := normalizeHostPort(httpsHostPort)
 		if err != nil {
-			return fmt.Errorf("invalid HTTPS host port: %w", err)
+			return false, false, fmt.Errorf("invalid HTTPS host port: %w", err)
 		}
 		logger.Info().
 			Int("httpPort", httpHostPort).
@@ -370,6 +385,8 @@ func deployDeployment(
 		podSpec.HostNetwork = true
 		podSpec.DNSPolicy = corev1.DNSClusterFirstWithHostNet
 		logger.Info().Msg("Enabled hostNetwork mode")
+	} else {
+		podSpec.DNSPolicy = corev1.DNSClusterFirst
 	}
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -407,34 +424,136 @@ func deployDeployment(
 		Get(ctx, instance.DeploymentName, metav1.GetOptions{})
 	switch {
 	case err == nil:
-		deployment.ResourceVersion = existingDeployment.ResourceVersion
+		if !deploymentNeedsUpdate(existingDeployment, deployment) {
+			logger.Debug().Msg("Caddy deployment already up-to-date")
+			return false, false, nil
+		}
+		mergeDeploymentForUpdate(existingDeployment, deployment)
 		_, err = clientset.AppsV1().
 			Deployments(instance.Namespace).
-			Update(ctx, deployment, metav1.UpdateOptions{})
+			Update(ctx, existingDeployment, metav1.UpdateOptions{})
 		if err != nil {
 			logger.Error().Err(err).Msg("Failed to update existing Caddy deployment")
-			return fmt.Errorf("failed to update deployment %s: %w", instance.DeploymentName, err)
+			return false, false, fmt.Errorf(
+				"failed to update deployment %s: %w",
+				instance.DeploymentName,
+				err,
+			)
 		}
 		logger.Info().Msg("Updated existing Caddy deployment")
+		if cleanupErr := clientset.PolicyV1().
+			PodDisruptionBudgets(instance.Namespace).
+			Delete(ctx, instance.DeploymentName, metav1.DeleteOptions{}); cleanupErr == nil {
+			logger.Info().Msg("Deleted legacy PodDisruptionBudget")
+		}
+		return true, false, nil
 	case apierrors.IsNotFound(err):
 		_, err = clientset.AppsV1().
 			Deployments(instance.Namespace).
 			Create(ctx, deployment, metav1.CreateOptions{})
 		if err != nil {
 			logger.Error().Err(err).Msg("Failed to create Caddy deployment")
-			return fmt.Errorf("failed to create deployment %s: %w", instance.DeploymentName, err)
+			return false, false, fmt.Errorf(
+				"failed to create deployment %s: %w",
+				instance.DeploymentName,
+				err,
+			)
 		}
 		logger.Info().Msg("Created Caddy deployment")
+		if cleanupErr := clientset.PolicyV1().
+			PodDisruptionBudgets(instance.Namespace).
+			Delete(ctx, instance.DeploymentName, metav1.DeleteOptions{}); cleanupErr == nil {
+			logger.Info().Msg("Deleted legacy PodDisruptionBudget")
+		}
+		return true, true, nil
 	default:
 		logger.Error().Err(err).Msg("Failed to fetch existing Caddy deployment")
-		return fmt.Errorf("failed to get deployment %s: %w", instance.DeploymentName, err)
+		return false, false, fmt.Errorf("failed to get deployment %s: %w", instance.DeploymentName, err)
 	}
-	if cleanupErr := clientset.PolicyV1().
-		PodDisruptionBudgets(instance.Namespace).
-		Delete(ctx, instance.DeploymentName, metav1.DeleteOptions{}); cleanupErr == nil {
-		logger.Info().Msg("Deleted legacy PodDisruptionBudget")
+}
+
+func deploymentNeedsUpdate(existing, desired *appsv1.Deployment) bool {
+	if !equality.Semantic.DeepEqual(existing.Labels, desired.Labels) {
+		return true
 	}
-	return nil
+	if !equality.Semantic.DeepEqual(existing.Spec.Replicas, desired.Spec.Replicas) {
+		return true
+	}
+	if !equality.Semantic.DeepEqual(existing.Spec.Strategy, desired.Spec.Strategy) {
+		return true
+	}
+	if !equality.Semantic.DeepEqual(existing.Spec.Selector, desired.Spec.Selector) {
+		return true
+	}
+	if !equality.Semantic.DeepEqual(existing.Spec.Template.Labels, desired.Spec.Template.Labels) {
+		return true
+	}
+	if podTemplateNeedsUpdate(existing.Spec.Template.Spec, desired.Spec.Template.Spec) {
+		return true
+	}
+	return false
+}
+
+func mergeDeploymentForUpdate(existing, desired *appsv1.Deployment) {
+	existing.Labels = desired.Labels
+	existing.Spec.Replicas = desired.Spec.Replicas
+	existing.Spec.Strategy = desired.Spec.Strategy
+	existing.Spec.Selector = desired.Spec.Selector
+	existing.Spec.Template.Labels = desired.Spec.Template.Labels
+	existing.Spec.Template.Spec.NodeSelector = desired.Spec.Template.Spec.NodeSelector
+	existing.Spec.Template.Spec.Volumes = desired.Spec.Template.Spec.Volumes
+	existing.Spec.Template.Spec.Containers = desired.Spec.Template.Spec.Containers
+	existing.Spec.Template.Spec.HostNetwork = desired.Spec.Template.Spec.HostNetwork
+	existing.Spec.Template.Spec.DNSPolicy = desired.Spec.Template.Spec.DNSPolicy
+}
+
+func podTemplateNeedsUpdate(existing, desired corev1.PodSpec) bool {
+	if !equality.Semantic.DeepEqual(existing.NodeSelector, desired.NodeSelector) {
+		return true
+	}
+	if !equality.Semantic.DeepEqual(existing.Volumes, desired.Volumes) {
+		return true
+	}
+	if existing.HostNetwork != desired.HostNetwork {
+		return true
+	}
+	if existing.DNSPolicy != desired.DNSPolicy {
+		return true
+	}
+	if len(existing.Containers) != len(desired.Containers) {
+		return true
+	}
+	for idx := range desired.Containers {
+		if containerNeedsUpdate(existing.Containers[idx], desired.Containers[idx]) {
+			return true
+		}
+	}
+	return false
+}
+
+func containerNeedsUpdate(existing, desired corev1.Container) bool {
+	if existing.Name != desired.Name {
+		return true
+	}
+	if existing.Image != desired.Image {
+		return true
+	}
+	if existing.ImagePullPolicy != desired.ImagePullPolicy {
+		return true
+	}
+	if !equality.Semantic.DeepEqual(existing.Ports, desired.Ports) {
+		return true
+	}
+	if !equality.Semantic.DeepEqual(existing.VolumeMounts, desired.VolumeMounts) {
+		return true
+	}
+	if !equality.Semantic.DeepEqual(existing.Env, desired.Env) {
+		return true
+	}
+	if !equality.Semantic.DeepEqual(existing.SecurityContext, desired.SecurityContext) {
+		return true
+	}
+	return false
 }
 
 func deploymentStrategy(useHostNetwork bool) appsv1.DeploymentStrategy {
@@ -470,7 +589,7 @@ func deployService(
 	ctx context.Context,
 	clientset kubernetes.Interface,
 	instance *Instance,
-) error {
+) (bool, error) {
 	logger := log.With().Str("service", instance.ServiceName).Logger()
 	service := desiredClusterIPService(instance)
 	existingService, err := clientset.CoreV1().
@@ -478,36 +597,42 @@ func deployService(
 		Get(ctx, instance.DeploymentName, metav1.GetOptions{})
 	switch {
 	case err == nil:
-		mergeServiceForUpdate(existingService, service)
+		updatedService := existingService.DeepCopy()
+		mergeServiceForUpdate(updatedService, service)
+		if !serviceNeedsUpdate(existingService, updatedService) {
+			logger.Debug().Msg("Caddy service already up-to-date")
+			return false, nil
+		}
 		_, err = clientset.CoreV1().
 			Services(instance.Namespace).
-			Update(ctx, existingService, metav1.UpdateOptions{})
+			Update(ctx, updatedService, metav1.UpdateOptions{})
 		if err != nil {
 			logger.Error().Err(err).Msg("Failed to update existing Caddy service")
-			return fmt.Errorf("failed to update service %s: %w", instance.DeploymentName, err)
+			return false, fmt.Errorf("failed to update service %s: %w", instance.DeploymentName, err)
 		}
 		logger.Info().Msg("Updated existing Caddy service")
+		return true, nil
 	case apierrors.IsNotFound(err):
 		_, err = clientset.CoreV1().
 			Services(instance.Namespace).
 			Create(ctx, service, metav1.CreateOptions{})
 		if err != nil {
 			logger.Error().Err(err).Msg("Failed to create Caddy service")
-			return fmt.Errorf("failed to create service %s: %w", instance.DeploymentName, err)
+			return false, fmt.Errorf("failed to create service %s: %w", instance.DeploymentName, err)
 		}
 		logger.Info().Msg("Created Caddy service")
+		return true, nil
 	default:
 		logger.Error().Err(err).Msg("Failed to fetch existing Caddy service")
-		return fmt.Errorf("failed to get service %s: %w", instance.DeploymentName, err)
+		return false, fmt.Errorf("failed to get service %s: %w", instance.DeploymentName, err)
 	}
-	return nil
 }
 
 func deployLoadBalancerService(
 	ctx context.Context,
 	clientset kubernetes.Interface,
 	instance *Instance,
-) error {
+) (bool, error) {
 	logger := log.With().
 		Str("loadbalancer_service", instance.DeploymentName+"-loadbalancer").
 		Logger()
@@ -524,41 +649,47 @@ func deployLoadBalancerService(
 		Get(ctx, loadBalancerServiceName, metav1.GetOptions{})
 	switch {
 	case err == nil:
-		mergeServiceForUpdate(existingNPService, loadBalancerService)
+		updatedService := existingNPService.DeepCopy()
+		mergeServiceForUpdate(updatedService, loadBalancerService)
+		if !serviceNeedsUpdate(existingNPService, updatedService) {
+			logger.Debug().Msg("LoadBalancer service already up-to-date")
+			return false, nil
+		}
 		_, err = clientset.CoreV1().
 			Services(instance.Namespace).
-			Update(ctx, existingNPService, metav1.UpdateOptions{})
+			Update(ctx, updatedService, metav1.UpdateOptions{})
 		if err != nil {
 			logger.Error().Err(err).Msg("Failed to update existing LoadBalancer service")
-			return fmt.Errorf(
+			return false, fmt.Errorf(
 				"failed to update LoadBalancer service %s: %w",
 				loadBalancerServiceName,
 				err,
 			)
 		}
 		logger.Info().Msg("Updated existing LoadBalancer service")
+		return true, nil
 	case apierrors.IsNotFound(err):
 		_, err = clientset.CoreV1().
 			Services(instance.Namespace).
 			Create(ctx, loadBalancerService, metav1.CreateOptions{})
 		if err != nil {
 			logger.Error().Err(err).Msg("Failed to create LoadBalancer service")
-			return fmt.Errorf(
+			return false, fmt.Errorf(
 				"failed to create LoadBalancer service %s: %w",
 				loadBalancerServiceName,
 				err,
 			)
 		}
 		logger.Info().Msg("Created LoadBalancer service")
+		return true, nil
 	default:
 		logger.Error().Err(err).Msg("Failed to fetch existing LoadBalancer service")
-		return fmt.Errorf(
+		return false, fmt.Errorf(
 			"failed to get LoadBalancer service %s: %w",
 			loadBalancerServiceName,
 			err,
 		)
 	}
-	return nil
 }
 
 func desiredClusterIPService(
@@ -679,6 +810,34 @@ func mergeServiceForUpdate(existing, desired *corev1.Service) {
 	existing.Spec.Ports = mergeServicePortsKeepingNodePorts(existing.Spec.Ports, desired.Spec.Ports)
 }
 
+func serviceNeedsUpdate(existing, desired *corev1.Service) bool {
+	if !equality.Semantic.DeepEqual(existing.Labels, desired.Labels) {
+		return true
+	}
+	if !equality.Semantic.DeepEqual(existing.Annotations, desired.Annotations) {
+		return true
+	}
+	if !equality.Semantic.DeepEqual(existing.Spec.Selector, desired.Spec.Selector) {
+		return true
+	}
+	if existing.Spec.Type != desired.Spec.Type {
+		return true
+	}
+	if !equality.Semantic.DeepEqual(existing.Spec.ExternalIPs, desired.Spec.ExternalIPs) {
+		return true
+	}
+	if existing.Spec.ExternalTrafficPolicy != desired.Spec.ExternalTrafficPolicy {
+		return true
+	}
+	if !equality.Semantic.DeepEqual(existing.Spec.LoadBalancerClass, desired.Spec.LoadBalancerClass) {
+		return true
+	}
+	if !equality.Semantic.DeepEqual(existing.Spec.Ports, desired.Spec.Ports) {
+		return true
+	}
+	return false
+}
+
 func mergeServicePortsKeepingNodePorts(
 	existingPorts []corev1.ServicePort,
 	desiredPorts []corev1.ServicePort,
@@ -711,39 +870,41 @@ func waitForDeploymentReady(
 	namespace, name string,
 ) error {
 	logger := log.With().Str("deployment", name).Str("namespace", namespace).Logger()
-	ticker := time.NewTicker(deploymentPollDelay)
-	defer ticker.Stop()
 	for {
+		deployment, err := clientset.AppsV1().
+			Deployments(namespace).
+			Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to get deployment %s: %w", name, err)
+		}
+		if deploymentRolloutComplete(deployment) {
+			logger.Info().Msg("Deployment is ready")
+			return nil
+		}
+		desiredReplicas := int32(1)
+		if deployment.Spec.Replicas != nil {
+			desiredReplicas = *deployment.Spec.Replicas
+		}
+		logger.Debug().
+			Int64("generation", deployment.Generation).
+			Int64("observedGeneration", deployment.Status.ObservedGeneration).
+			Int32("available", deployment.Status.AvailableReplicas).
+			Int32("ready", deployment.Status.ReadyReplicas).
+			Int32("updated", deployment.Status.UpdatedReplicas).
+			Int32("replicas", deployment.Status.Replicas).
+			Int32("desired", desiredReplicas).
+			Msg("Waiting for deployment to be ready")
+		timer := time.NewTimer(deploymentPollDelay)
 		select {
 		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
 			return fmt.Errorf(
 				"context deadline exceeded while waiting for deployment: %w",
 				ctx.Err(),
 			)
-		case <-ticker.C:
-			deployment, err := clientset.AppsV1().
-				Deployments(namespace).
-				Get(ctx, name, metav1.GetOptions{})
-			if err != nil {
-				return fmt.Errorf("failed to get deployment %s: %w", name, err)
-			}
-			if deploymentRolloutComplete(deployment) {
-				logger.Info().Msg("Deployment is ready")
-				return nil
-			}
-			desiredReplicas := int32(1)
-			if deployment.Spec.Replicas != nil {
-				desiredReplicas = *deployment.Spec.Replicas
-			}
-			logger.Debug().
-				Int64("generation", deployment.Generation).
-				Int64("observedGeneration", deployment.Status.ObservedGeneration).
-				Int32("available", deployment.Status.AvailableReplicas).
-				Int32("ready", deployment.Status.ReadyReplicas).
-				Int32("updated", deployment.Status.UpdatedReplicas).
-				Int32("replicas", deployment.Status.Replicas).
-				Int32("desired", desiredReplicas).
-				Msg("Waiting for deployment to be ready")
+		case <-timer.C:
 		}
 	}
 }

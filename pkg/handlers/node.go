@@ -26,7 +26,7 @@ type deploymentResult struct {
 }
 
 type NodeHandler struct {
-	Clientset          *kubernetes.Clientset
+	Clientset          kubernetes.Interface
 	Namespace          string
 	CaddyImage         string
 	EnableLoadBalancer bool
@@ -46,6 +46,18 @@ type NodeHandler struct {
 	inProgressNodes    map[string]struct{}
 	inProgressNodesMu  sync.Mutex
 	removedNodes       map[string]struct{}
+	deployFn           func(
+		ctx context.Context,
+		clientset kubernetes.Interface,
+		nodeName, namespace, caddyImage string,
+		enableLoadBalancer bool,
+		externalIPs []string,
+		envSecretName string,
+		envSecretKeys []string,
+		dataVolumePVC, configVolumePVC, configMapName string,
+		useHostNetwork bool,
+		httpHostPort, httpsHostPort int,
+	) (*caddy.Instance, error)
 }
 
 const (
@@ -54,7 +66,7 @@ const (
 )
 
 func NewNodeHandler(
-	clientset *kubernetes.Clientset,
+	clientset kubernetes.Interface,
 	namespace, caddyImage string,
 	enableLoadBalancer bool,
 	instances map[string]*caddy.Instance,
@@ -86,6 +98,7 @@ func NewNodeHandler(
 		HTTPSHostPort:      httpsHostPort,
 		inProgressNodes:    make(map[string]struct{}),
 		removedNodes:       make(map[string]struct{}),
+		deployFn:           caddy.DeployCaddy,
 	}
 }
 
@@ -105,8 +118,12 @@ func (h *NodeHandler) StartWorkerPool(ctx context.Context, workerCount int) {
 					if !ok {
 						return
 					}
+					deployFn := h.deployFn
+					if deployFn == nil {
+						deployFn = caddy.DeployCaddy
+					}
 					deployCtx, cancel := context.WithTimeout(ctx, deployJobTimeout)
-					instance, err := caddy.DeployCaddy(
+					instance, err := deployFn(
 						deployCtx,
 						h.Clientset,
 						job.nodeName,
@@ -144,10 +161,6 @@ func (h *NodeHandler) Handle(event watcher.NodeEvent) {
 		h.Mu.RLock()
 		_, alreadyDeployed := h.DeployedInstances[nodeName]
 		h.Mu.RUnlock()
-		if alreadyDeployed {
-			logger.Debug().Msg("Node already has a Caddy deployment, skipping")
-			return
-		}
 		h.inProgressNodesMu.Lock()
 		if _, inProgress := h.inProgressNodes[nodeName]; inProgress {
 			delete(h.removedNodes, nodeName)
@@ -157,7 +170,11 @@ func (h *NodeHandler) Handle(event watcher.NodeEvent) {
 		}
 		h.inProgressNodes[nodeName] = struct{}{}
 		h.inProgressNodesMu.Unlock()
-		logger.Info().Msg("Detected new node, deploying Caddy")
+		if alreadyDeployed {
+			logger.Debug().Msg("Node already has a Caddy deployment, reconciling desired state")
+		} else {
+			logger.Info().Msg("Detected new node, deploying Caddy")
+		}
 		resultCh := make(chan *deploymentResult, 1)
 		externalIPs, exists := h.ExternalEndpoints[nodeName]
 		if exists {
@@ -180,6 +197,7 @@ func (h *NodeHandler) Handle(event watcher.NodeEvent) {
 			h.inProgressNodesMu.Lock()
 			h.Mu.Lock()
 			delete(h.inProgressNodes, nodeName)
+			previousInstance := h.DeployedInstances[nodeName]
 			_, wasRemoved := h.removedNodes[nodeName]
 			if wasRemoved {
 				delete(h.removedNodes, nodeName)
@@ -194,9 +212,17 @@ func (h *NodeHandler) Handle(event watcher.NodeEvent) {
 				return
 			}
 			h.DeployedInstances[nodeName] = result.instance
+			instanceChanged := !instancesEquivalent(previousInstance, result.instance)
 			h.Mu.Unlock()
-			logger.Info().Msg("Successfully deployed Caddy instance")
-			if h.nodeChangeNotifier != nil {
+			switch {
+			case !alreadyDeployed:
+				logger.Info().Msg("Successfully deployed Caddy instance")
+			case instanceChanged:
+				logger.Info().Msg("Reconciled existing Caddy deployment")
+			default:
+				logger.Debug().Msg("Existing Caddy deployment is already up-to-date")
+			}
+			if h.nodeChangeNotifier != nil && (!alreadyDeployed || instanceChanged) {
 				h.nodeChangeNotifier()
 			}
 		}()
@@ -239,4 +265,15 @@ func (h *NodeHandler) Handle(event watcher.NodeEvent) {
 			h.nodeChangeNotifier()
 		}
 	}
+}
+
+func instancesEquivalent(a, b *caddy.Instance) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.NodeName == b.NodeName &&
+		a.Namespace == b.Namespace &&
+		a.DeploymentName == b.DeploymentName &&
+		a.ServiceName == b.ServiceName &&
+		a.PodName == b.PodName
 }
