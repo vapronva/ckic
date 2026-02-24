@@ -21,6 +21,7 @@ const (
 	caddyAdminPort        = 2019
 	caddyHTTPPort         = 80
 	caddyHTTPSPort        = 443
+	configMapDefaultMode  = int32(420)
 	hostPortMin           = 1
 	hostPortMax           = 65535
 	caddyContainerName    = "caddy"
@@ -511,7 +512,7 @@ func podTemplateNeedsUpdate(existing, desired corev1.PodSpec) bool {
 	if !equality.Semantic.DeepEqual(existing.NodeSelector, desired.NodeSelector) {
 		return true
 	}
-	if !equality.Semantic.DeepEqual(existing.Volumes, desired.Volumes) {
+	if volumesNeedUpdate(existing.Volumes, desired.Volumes) {
 		return true
 	}
 	if existing.HostNetwork != desired.HostNetwork {
@@ -529,6 +530,43 @@ func podTemplateNeedsUpdate(existing, desired corev1.PodSpec) bool {
 		}
 	}
 	return false
+}
+
+func volumesNeedUpdate(existing, desired []corev1.Volume) bool {
+	if len(existing) != len(desired) {
+		return true
+	}
+	existingByName := make(map[string]corev1.Volume, len(existing))
+	for _, existingVolume := range existing {
+		existingByName[existingVolume.Name] = normalizeVolumeForComparison(existingVolume)
+	}
+	for _, desiredVolume := range desired {
+		normalizedDesiredVolume := normalizeVolumeForComparison(desiredVolume)
+		normalizedExistingVolume, exists := existingByName[desiredVolume.Name]
+		if !exists {
+			return true
+		}
+		if !equality.Semantic.DeepEqual(normalizedExistingVolume, normalizedDesiredVolume) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeVolumeForComparison(volume corev1.Volume) corev1.Volume {
+	normalized := volume.DeepCopy()
+	if normalized.ConfigMap != nil {
+		normalized.ConfigMap.DefaultMode = normalizeConfigMapDefaultMode(normalized.ConfigMap.DefaultMode)
+	}
+	return *normalized
+}
+
+func normalizeConfigMapDefaultMode(defaultMode *int32) *int32 {
+	if defaultMode == nil || *defaultMode == configMapDefaultMode {
+		return nil
+	}
+	normalizedMode := *defaultMode
+	return &normalizedMode
 }
 
 func containerNeedsUpdate(existing, desired corev1.Container) bool {

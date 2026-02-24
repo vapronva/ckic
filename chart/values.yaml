@@ -1,6 +1,12 @@
 ---
 replicaCount: 1
 
+updateStrategy:
+  type: Recreate
+  rollingUpdate:
+    maxSurge: 0
+    maxUnavailable: 1
+
 image:
   repository: docker.horse
   image: vapronva/ckic/manager
@@ -37,6 +43,7 @@ affinity: {}
 
 leaderElection:
   enabled: true
+  readinessRequireLeader: false
   leaseName: ckic-manager-leader
   leaseNamespace: ""
   leaseDuration: 15s

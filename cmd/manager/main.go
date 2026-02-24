@@ -30,7 +30,7 @@ const (
 	probeShutdownTimeout          = 5 * time.Second
 	probeReadHeaderTimeout        = 10 * time.Second
 	leaderElectionShutdownMinWait = 1 * time.Second
-	leaderElectionShutdownMaxWait = 5 * time.Second
+	leaderElectionShutdownMaxWait = 30 * time.Second
 )
 
 type cliOptions struct {
@@ -63,6 +63,7 @@ type cliOptions struct {
 	externalPublishAggregated    bool
 	externalAggregatedConfigName string
 	leaderElectionEnabled        bool
+	readinessRequireLeader       bool
 	leaderElectionLeaseName      string
 	leaderElectionLeaseNamespace string
 	leaderElectionLeaseDuration  time.Duration
@@ -286,6 +287,11 @@ func parseCLIOptions() cliOptions {
 		true,
 		"Enable leader election so only one manager instance reconciles resources",
 	)
+	readinessRequireLeader := pflag.Bool(
+		"readiness-require-leader",
+		false,
+		"Report readiness only while leading (set true to keep legacy behavior)",
+	)
 	leaderElectionLeaseName := pflag.String(
 		"leader-election-lease-name",
 		"ckic-manager-leader",
@@ -342,6 +348,7 @@ func parseCLIOptions() cliOptions {
 		externalPublishAggregated:    *externalPublishAggregated,
 		externalAggregatedConfigName: *externalAggregatedConfigName,
 		leaderElectionEnabled:        *leaderElectionEnabled,
+		readinessRequireLeader:       *readinessRequireLeader,
 		leaderElectionLeaseName:      *leaderElectionLeaseName,
 		leaderElectionLeaseNamespace: *leaderElectionLeaseNamespace,
 		leaderElectionLeaseDuration:  *leaderElectionLeaseDuration,
@@ -430,7 +437,7 @@ func runControllerWithLeaderElectionWithRunner(
 	if !options.leaderElectionEnabled {
 		return runControllerWithoutLeaderElection(ctx, ctrl, readiness)
 	}
-	readiness.Store(false)
+	readiness.Store(!options.readinessRequireLeader)
 	defer readiness.Store(false)
 	leaseNamespace := leaderElectionLeaseNamespace(options)
 	identity := leaderElectionIdentity()
@@ -443,6 +450,7 @@ func runControllerWithLeaderElectionWithRunner(
 		identity,
 		ctrl,
 		readiness,
+		options.readinessRequireLeader,
 		runLeaderElection,
 		runErrCh,
 		leaseNamespace,
@@ -499,6 +507,7 @@ func startLeaderElectionLoop(
 	identity string,
 	ctrl controllerRunner,
 	readiness *atomic.Bool,
+	readinessRequireLeader bool,
 	runLeaderElection leaderElectionRunFunc,
 	runErrCh chan<- error,
 	leaseNamespace string,
@@ -515,10 +524,17 @@ func startLeaderElectionLoop(
 			RetryPeriod:     options.leaderElectionRetryPeriod,
 			Callbacks: leaderelection.LeaderCallbacks{
 				OnStartedLeading: func(leadCtx context.Context) {
-					onStartedLeading(leadCtx, identity, ctrl, readiness, runErrCh)
+					onStartedLeading(
+						leadCtx,
+						identity,
+						ctrl,
+						readiness,
+						readinessRequireLeader,
+						runErrCh,
+					)
 				},
 				OnStoppedLeading: func() {
-					onStoppedLeading(ctx, readiness, runErrCh)
+					onStoppedLeading(ctx, readiness, readinessRequireLeader, runErrCh)
 				},
 				OnNewLeader: func(newLeaderIdentity string) {
 					onNewLeader(identity, newLeaderIdentity)
@@ -536,6 +552,7 @@ func logLeaderElectionEnabled(options cliOptions, leaseNamespace string) {
 		Dur("leaseDuration", options.leaderElectionLeaseDuration).
 		Dur("renewDeadline", options.leaderElectionRenewDeadline).
 		Dur("retryPeriod", options.leaderElectionRetryPeriod).
+		Bool("readinessRequireLeader", options.readinessRequireLeader).
 		Msg("Leader election is enabled")
 }
 
@@ -544,11 +561,14 @@ func onStartedLeading(
 	identity string,
 	ctrl controllerRunner,
 	readiness *atomic.Bool,
+	readinessRequireLeader bool,
 	runErrCh chan<- error,
 ) {
 	log.Info().Str("identity", identity).Msg("Acquired leadership")
-	readiness.Store(true)
-	defer readiness.Store(false)
+	if readinessRequireLeader {
+		readiness.Store(true)
+		defer readiness.Store(false)
+	}
 	runErr := ctrl.Run(leadCtx)
 	if runErr != nil && !errors.Is(runErr, context.Canceled) {
 		reportRunResult(runErrCh, runErr)
@@ -560,9 +580,12 @@ func onStartedLeading(
 func onStoppedLeading(
 	ctx context.Context,
 	readiness *atomic.Bool,
+	readinessRequireLeader bool,
 	runErrCh chan<- error,
 ) {
-	readiness.Store(false)
+	if readinessRequireLeader {
+		readiness.Store(false)
+	}
 	if ctx.Err() != nil {
 		return
 	}

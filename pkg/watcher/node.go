@@ -11,8 +11,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
-
-	"git.horse/vapronva/ckic/pkg/constants"
 )
 
 type NodeEventType int
@@ -90,19 +88,6 @@ func NewNodeWatcher(
 	}
 }
 
-func (w *NodeWatcher) snapshotTrackedNodes() []string {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-	if len(w.currentNodes) == 0 {
-		return nil
-	}
-	nodes := make([]string, 0, len(w.currentNodes))
-	for nodeName := range w.currentNodes {
-		nodes = append(nodes, nodeName)
-	}
-	return nodes
-}
-
 //nolint:gocognit,cyclop,funlen
 func (w *NodeWatcher) Start(ctx context.Context) {
 	logger := log.With().
@@ -167,22 +152,13 @@ func (w *NodeWatcher) Start(ctx context.Context) {
 				continue
 			}
 			watchChan := watcher.ResultChan()
-			retryTicker := time.NewTicker(constants.NodeWatcherRetryInterval)
 		watchLoop:
 			for {
 				select {
 				case <-ctx.Done():
-					retryTicker.Stop()
 					watcher.Stop()
 					logger.Info().Msg("Node watcher shutting down")
 					return
-				case <-retryTicker.C:
-					for _, nodeName := range w.snapshotTrackedNodes() {
-						w.nodeHandler(NodeEvent{
-							Type:     NodeAdded,
-							NodeName: nodeName,
-						})
-					}
 				case event, ok := <-watchChan:
 					if !ok {
 						break watchLoop
@@ -240,7 +216,6 @@ func (w *NodeWatcher) Start(ctx context.Context) {
 					}
 				}
 			}
-			retryTicker.Stop()
 			logger.Info().Msg("Node watcher channel closed, restarting")
 			time.Sleep(nodeWatchRetryDelay)
 		}
