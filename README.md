@@ -8,12 +8,12 @@ flowchart LR
     LeaderElection["Leader election"] --> |"Only leader runs controller"| Controller
     LeaderElection --> |"Acquire/Renew <code>Lease</code>"| K8sAPI
     CLIFlags["CLI flags"] --> |"Parse"| Controller
-    CLIFlags --> |"<code>leader-elect</code> & <code>leader-election-*</code>"| LeaderElection
+    CLIFlags --> |"<code>leader-elect</code> & <code>leader-election-*</code> & <code>readiness-require-leader</code>"| LeaderElection
     CLIFlags --> |"<code>health-bind-address</code>"| ProbeServer
     CLIFlags --> |"<code>node-label</code>"| NodeWatcher
     CLIFlags --> |"<code>config-map</code> & <code>config-namespace</code> & <code>bootstrap-default-config</code>"| ConfigWatcher
-    CLIFlags --> |"<code>env-secret</code> & <code>env-keys</code>"| SecretEnvVars
-    CLIFlags --> |"<code>data-pvc</code> & <code>config-pvc</code>"| VolumeManager
+    CLIFlags --> |"<code>env-secret</code> & <code>env-keys</code>"| CaddyDeployer
+    CLIFlags --> |"<code>data-pvc</code> & <code>config-pvc</code>"| CaddyDeployer
     CLIFlags --> |"<code>external-endpoints</code> & <code>external-endpoints-file</code>"| ExternalIPParser
     CLIFlags --> |"<code>comm-method</code>"| ConfigHandler
     CLIFlags --> |"<code>caddy-admin-origin-key</code>"| CaddyAdminClient
@@ -41,20 +41,22 @@ flowchart LR
 
     ConfigWatcher["<code>pkg/watcher/config</code>"] <--> |"Watch <code>ConfigMap</code> events"| K8sAPI
     ConfigWatcher --> |"Base config changed"| Aggregator
-    ExternalConfigWatcher["<code>pkg/watcher/external</code>"] <--> |"Watch cluster-wide <code>ConfigMap</code> with label"| K8sAPI
-    ExternalConfigWatcher --> |"External fragment changed"| Aggregator
+    ExternalConfigWatcher["<code>pkg/watcher/external</code>"] <--> |"Initial list + watch labeled <code>ConfigMap</code>s; reconcile on expired resourceVersion"| K8sAPI
+    ExternalConfigWatcher --> |"Apply namespace filter (<code>all</code>/<code>allow</code>/<code>deny</code>, excluding own namespace)"| Aggregator
+    ExternalConfigWatcher --> |"Handle Add/Modify/Delete when <code>Caddyfile</code> fragment changes"| Aggregator
     Aggregator["<code>pkg/aggregator</code>"] --> |"Merge base + externals"| MirrorConfigMap
     Aggregator --> |"Push merged config"| ConfigHandler
     MirrorConfigMap[("<code>ckic-caddy-config-working</code>")] --> |"Write merged <code>Caddyfile</code>"| K8sAPI
-    ConfigHandler["<code>pkg/handlers/config</code>"] --> |"Process update"| ConfigUpdateDispatcher
-    ConfigUpdateDispatcher[("Config update dispatcher")] --> |"Concurrent updates"| CaddyAdminClient
+    ConfigHandler["<code>pkg/handlers/config</code>"] --> |"Bounded concurrent pushes with retries"| CaddyAdminClient
+    ConfigHandler --> |"Redeploy instances after repeated update failures"| CaddyDeployer
 
     CaddyAdminClient["<code>pkg/caddy/admin</code>"] --> |"HTTP POST to <code>/load</code>"| CaddyAdminAPI
 
     WatcherCoordinator["<code>pkg/controller/coordinator</code>"] -.-> |"Pause when no nodes"| ConfigWatcher
     WatcherCoordinator -.-> |"Resume when nodes available"| ConfigWatcher
 
-    CLIFlags --> |"<code>external-*</code> flags"| ExternalConfigWatcher
+    CLIFlags --> |"<code>external-enable</code> & <code>external-label</code> & <code>external-ns-*</code>"| ExternalConfigWatcher
+    CLIFlags --> |"<code>external-publish-aggregated</code> & <code>external-aggregated-config-name</code>"| Aggregator
 
     ExternalIPParser["<code>pkg/utils/external</code>"] --> |"Map node to IP"| InstanceRegistry
     ExternalIPParser --> |"Set <code>externalIPs</code>"| K8sLoadBalancer
@@ -63,8 +65,6 @@ flowchart LR
     ConfigMapStateStore["<code>pkg/state</code>"] <--> |"Read / write"| K8sAPI
     ConfigReconciliation["Periodic config reconciliation"] --> |"Reapply"| ConfigHandler
 
-    VolumeManager["Volume manager"] --> |"Configure PVC or HostPath"| CaddyDeployer
-    SecretEnvVars["Secret environment manager"] --> |"Inject environment vars"| CaddyDeployer
     ProbeServer["Probe server"] --> |"Serve <code>/healthz</code> & <code>/readyz</code>"| K8sProbes
 
     K8sAPI["Kubernetes API"]
@@ -96,15 +96,12 @@ flowchart LR
         Aggregator
         MirrorConfigMap
         ConfigHandler
-        ConfigUpdateDispatcher
         CaddyAdminClient
     end
 
     subgraph ResourceConfiguration
         CLIFlags
         ExternalIPParser
-        VolumeManager
-        SecretEnvVars
     end
 
     subgraph ExternalSystems
