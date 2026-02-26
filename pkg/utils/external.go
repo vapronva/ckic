@@ -36,16 +36,21 @@ func ParseExternalEndpoints(
 		if nodeName == "" {
 			return nil, errors.New("node name cannot be empty")
 		}
-		ipsRaw := strings.Split(parts[1], ",")
-		var ips []string
-		for _, ip := range ipsRaw {
-			ip = strings.TrimSpace(ip)
-			if !isValidIP(ip) {
-				return nil, fmt.Errorf("invalid IP address format for node %s: %s", nodeName, ip)
-			}
-			ips = append(ips, ip)
+		updatedIPs, appendErr := appendUniqueValidatedIPs(
+			result[nodeName],
+			strings.Split(parts[1], ","),
+			func(ip string) error {
+				return fmt.Errorf(
+					"invalid IP address format for node %s: %s",
+					nodeName,
+					ip,
+				)
+			},
+		)
+		if appendErr != nil {
+			return nil, appendErr
 		}
-		result[nodeName] = append(result[nodeName], ips...)
+		result[nodeName] = updatedIPs
 	}
 	return result, nil
 }
@@ -53,7 +58,10 @@ func ParseExternalEndpoints(
 func mergeExternalEndpointsFile(result ExternalEndpointsMap, endpointsFile string) error {
 	cleanPath := filepath.Clean(endpointsFile)
 	if !filepath.IsAbs(cleanPath) {
-		return fmt.Errorf("external endpoints file must be an absolute path: %s", endpointsFile)
+		return fmt.Errorf(
+			"external endpoints file must be an absolute path: %s",
+			endpointsFile,
+		)
 	}
 	fileData, err := os.ReadFile(cleanPath)
 	if err != nil {
@@ -68,14 +76,47 @@ func mergeExternalEndpointsFile(result ExternalEndpointsMap, endpointsFile strin
 		if trimmedNodeName == "" {
 			return errors.New("node name cannot be empty in external endpoints file")
 		}
-		for _, ip := range ips {
-			if !isValidIP(ip) {
-				return fmt.Errorf("invalid IP address in file for node %s: %s", trimmedNodeName, ip)
-			}
+		updatedIPs, appendErr := appendUniqueValidatedIPs(
+			result[trimmedNodeName],
+			ips,
+			func(ip string) error {
+				return fmt.Errorf(
+					"invalid IP address in file for node %s: %s",
+					trimmedNodeName,
+					ip,
+				)
+			},
+		)
+		if appendErr != nil {
+			return appendErr
 		}
-		result[trimmedNodeName] = append(result[trimmedNodeName], ips...)
+		result[trimmedNodeName] = updatedIPs
 	}
 	return nil
+}
+
+func appendUniqueValidatedIPs(
+	existing []string,
+	rawIPs []string,
+	invalidIPError func(string) error,
+) ([]string, error) {
+	seen := make(map[string]struct{}, len(existing))
+	for _, ip := range existing {
+		seen[ip] = struct{}{}
+	}
+	result := existing
+	for _, rawIP := range rawIPs {
+		ip := strings.TrimSpace(rawIP)
+		if !isValidIP(ip) {
+			return nil, invalidIPError(ip)
+		}
+		if _, ok := seen[ip]; ok {
+			continue
+		}
+		seen[ip] = struct{}{}
+		result = append(result, ip)
+	}
+	return result, nil
 }
 
 func isValidIP(ip string) bool {

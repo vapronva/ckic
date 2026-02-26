@@ -33,6 +33,8 @@ const (
 	leaderElectionShutdownMaxWait = 30 * time.Second
 )
 
+var errLeaderElectionLost = errors.New("leader election lost")
+
 type cliOptions struct {
 	kubeconfigPath               string
 	nodeLabel                    string
@@ -136,7 +138,9 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		sig := <-sigCh
-		log.Info().Str("signal", sig.String()).Msg("Received termination signal, shutting down")
+		log.Info().
+			Str("signal", sig.String()).
+			Msg("Received termination signal, shutting down")
 		cancel()
 	}()
 	log.Info().Msg("Starting CKIC manager")
@@ -163,7 +167,11 @@ func main() {
 //nolint:funlen
 func parseCLIOptions() cliOptions {
 	kubeconfigPath := pflag.String("kubeconfig", "", "Path to kubeconfig file")
-	nodeLabel := pflag.String("node-label", "ckic.cmld.ru/enabled", "Node label to watch for")
+	nodeLabel := pflag.String(
+		"node-label",
+		"ckic.cmld.ru/enabled=true",
+		"Kubernetes label selector used to choose managed nodes",
+	)
 	configMapName := pflag.String(
 		"config-map",
 		"caddy-config",
@@ -235,7 +243,11 @@ func parseCLIOptions() cliOptions {
 		"",
 		"Path to JSON file containing external endpoints mapping",
 	)
-	useHostNetwork := pflag.Bool("use-host-network", false, "Use hostNetwork for Caddy pods")
+	useHostNetwork := pflag.Bool(
+		"use-host-network",
+		false,
+		"Use hostNetwork for Caddy pods",
+	)
 	caddyAdminOriginKey := pflag.String(
 		"caddy-admin-origin-key",
 		"",
@@ -261,7 +273,11 @@ func parseCLIOptions() cliOptions {
 		"ckic.cmld.ru/aggregate=true",
 		"Label selector for external ConfigMaps",
 	)
-	externalNsMode := pflag.String("external-ns-mode", "all", "Namespace mode: all, allow, or deny")
+	externalNsMode := pflag.String(
+		"external-ns-mode",
+		"all",
+		"Namespace mode: all, allow, or deny",
+	)
 	externalAllowNamespaces := pflag.String(
 		"external-allow-namespaces",
 		"",
@@ -383,7 +399,8 @@ func resolveCommunicationMethod(
 	case "hostnetwork":
 		commMethod = caddy.CommunicationMethodHostNetwork
 	default:
-		log.Warn().Msgf("Unknown communication method %s, defaulting to clusterip", method)
+		log.Warn().
+			Msgf("Unknown communication method %s, defaulting to clusterip", method)
 	}
 	if useHostNetwork && commMethod != caddy.CommunicationMethodHostNetwork {
 		log.Info().
@@ -443,6 +460,8 @@ func runControllerWithLeaderElectionWithRunner(
 	identity := leaderElectionIdentity()
 	lock := leaderElectionLock(clientset, options, leaseNamespace, identity)
 	runErrCh := make(chan error, 1)
+	controllerDoneCh := make(chan error, 1)
+	controllerStarted := &atomic.Bool{}
 	electionDoneCh := startLeaderElectionLoop(
 		ctx,
 		lock,
@@ -453,9 +472,18 @@ func runControllerWithLeaderElectionWithRunner(
 		options.readinessRequireLeader,
 		runLeaderElection,
 		runErrCh,
+		controllerDoneCh,
+		controllerStarted,
 		leaseNamespace,
 	)
-	return waitForLeaderElectionResult(ctx, options, runErrCh, electionDoneCh)
+	return waitForLeaderElectionResult(
+		ctx,
+		options,
+		runErrCh,
+		controllerDoneCh,
+		controllerStarted,
+		electionDoneCh,
+	)
 }
 
 func runControllerWithoutLeaderElection(
@@ -510,6 +538,8 @@ func startLeaderElectionLoop(
 	readinessRequireLeader bool,
 	runLeaderElection leaderElectionRunFunc,
 	runErrCh chan<- error,
+	controllerDoneCh chan<- error,
+	controllerStarted *atomic.Bool,
 	leaseNamespace string,
 ) <-chan struct{} {
 	electionDoneCh := make(chan struct{})
@@ -531,6 +561,8 @@ func startLeaderElectionLoop(
 						readiness,
 						readinessRequireLeader,
 						runErrCh,
+						controllerDoneCh,
+						controllerStarted,
 					)
 				},
 				OnStoppedLeading: func() {
@@ -563,18 +595,21 @@ func onStartedLeading(
 	readiness *atomic.Bool,
 	readinessRequireLeader bool,
 	runErrCh chan<- error,
+	controllerDoneCh chan<- error,
+	controllerStarted *atomic.Bool,
 ) {
 	log.Info().Str("identity", identity).Msg("Acquired leadership")
+	controllerStarted.Store(true)
 	if readinessRequireLeader {
 		readiness.Store(true)
 		defer readiness.Store(false)
 	}
 	runErr := ctrl.Run(leadCtx)
-	if runErr != nil && !errors.Is(runErr, context.Canceled) {
-		reportRunResult(runErrCh, runErr)
-		return
+	if errors.Is(runErr, context.Canceled) {
+		runErr = nil
 	}
-	reportRunResult(runErrCh, nil)
+	reportRunResult(controllerDoneCh, runErr)
+	reportRunResult(runErrCh, runErr)
 }
 
 func onStoppedLeading(
@@ -589,7 +624,7 @@ func onStoppedLeading(
 	if ctx.Err() != nil {
 		return
 	}
-	reportRunResult(runErrCh, errors.New("leader election lost"))
+	reportRunResult(runErrCh, errLeaderElectionLost)
 }
 
 func onNewLeader(identity, newLeaderIdentity string) {
@@ -610,16 +645,37 @@ func waitForLeaderElectionResult(
 	ctx context.Context,
 	options cliOptions,
 	runErrCh <-chan error,
+	controllerDoneCh <-chan error,
+	controllerStarted *atomic.Bool,
 	electionDoneCh <-chan struct{},
 ) error {
 	for {
 		select {
 		case runErr := <-runErrCh:
-			return handleRunResult(ctx, options, runErr, electionDoneCh)
+			return handleRunResult(
+				ctx,
+				options,
+				runErr,
+				electionDoneCh,
+				controllerDoneCh,
+				controllerStarted,
+			)
 		case <-ctx.Done():
-			return handleContextDone(options, runErrCh, electionDoneCh)
+			return handleContextDone(
+				options,
+				runErrCh,
+				electionDoneCh,
+				controllerDoneCh,
+				controllerStarted,
+			)
 		case <-electionDoneCh:
-			return handleElectionDone(ctx, runErrCh)
+			return handleElectionDone(
+				ctx,
+				options,
+				runErrCh,
+				controllerDoneCh,
+				controllerStarted,
+			)
 		}
 	}
 }
@@ -629,8 +685,20 @@ func handleRunResult(
 	options cliOptions,
 	runErr error,
 	electionDoneCh <-chan struct{},
+	controllerDoneCh <-chan error,
+	controllerStarted *atomic.Bool,
 ) error {
 	if runErr != nil {
+		if errors.Is(runErr, errLeaderElectionLost) {
+			waitForElectionShutdown(options, electionDoneCh)
+			if controllerRunErr, hasControllerRunErr := waitForControllerShutdownResult(
+				options,
+				controllerStarted,
+				controllerDoneCh,
+			); hasControllerRunErr && controllerRunErr != nil {
+				return controllerRunErr
+			}
+		}
 		return runErr
 	}
 	waitForElectionShutdown(options, electionDoneCh)
@@ -644,19 +712,53 @@ func handleContextDone(
 	options cliOptions,
 	runErrCh <-chan error,
 	electionDoneCh <-chan struct{},
+	controllerDoneCh <-chan error,
+	controllerStarted *atomic.Bool,
 ) error {
 	waitForElectionShutdown(options, electionDoneCh)
+	if controllerRunErr, hasControllerRunErr := waitForControllerShutdownResult(
+		options,
+		controllerStarted,
+		controllerDoneCh,
+	); hasControllerRunErr {
+		if controllerRunErr != nil {
+			return controllerRunErr
+		}
+		return nil
+	}
 	if runErr, hasRunErr := readRunErrNonBlocking(runErrCh); hasRunErr && runErr != nil {
 		return runErr
 	}
 	return nil
 }
 
-func handleElectionDone(ctx context.Context, runErrCh <-chan error) error {
+func handleElectionDone(
+	ctx context.Context,
+	options cliOptions,
+	runErrCh <-chan error,
+	controllerDoneCh <-chan error,
+	controllerStarted *atomic.Bool,
+) error {
 	if runErr, hasRunErr := readRunErrNonBlocking(runErrCh); hasRunErr && runErr != nil {
+		if errors.Is(runErr, errLeaderElectionLost) {
+			if controllerRunErr, hasControllerRunErr := waitForControllerShutdownResult(
+				options,
+				controllerStarted,
+				controllerDoneCh,
+			); hasControllerRunErr && controllerRunErr != nil {
+				return controllerRunErr
+			}
+		}
 		return runErr
 	}
 	if isContextDone(ctx) {
+		if controllerRunErr, hasControllerRunErr := waitForControllerShutdownResult(
+			options,
+			controllerStarted,
+			controllerDoneCh,
+		); hasControllerRunErr && controllerRunErr != nil {
+			return controllerRunErr
+		}
 		return nil
 	}
 	return errors.New("leader election loop exited unexpectedly")
@@ -696,7 +798,34 @@ func waitForElectionShutdown(options cliOptions, electionDoneCh <-chan struct{})
 	}
 }
 
-func leaderElectionShutdownTimeout(renewDeadline, retryPeriod time.Duration) time.Duration {
+func waitForControllerShutdownResult(
+	options cliOptions,
+	controllerStarted *atomic.Bool,
+	controllerDoneCh <-chan error,
+) (error, bool) {
+	if controllerStarted == nil || !controllerStarted.Load() {
+		return nil, false
+	}
+	timeout := leaderElectionShutdownTimeout(
+		options.leaderElectionRenewDeadline,
+		options.leaderElectionRetryPeriod,
+	)
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case runErr := <-controllerDoneCh:
+		return runErr, true
+	case <-timer.C:
+		log.Warn().
+			Dur("timeout", timeout).
+			Msg("Timed out waiting for controller shutdown completion")
+		return nil, false
+	}
+}
+
+func leaderElectionShutdownTimeout(
+	renewDeadline, retryPeriod time.Duration,
+) time.Duration {
 	timeout := renewDeadline + retryPeriod
 	switch {
 	case timeout < leaderElectionShutdownMinWait:
@@ -738,13 +867,17 @@ func startHealthProbeServer(
 	}
 	go func() {
 		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), probeShutdownTimeout)
+		shutdownCtx, cancel := context.WithTimeout(
+			context.Background(),
+			probeShutdownTimeout,
+		)
 		defer cancel()
 		_ = server.Shutdown(shutdownCtx)
 	}()
 	go func() {
 		log.Info().Str("bindAddress", bindAddress).Msg("Starting probe server")
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := server.ListenAndServe(); err != nil &&
+			!errors.Is(err, http.ErrServerClosed) {
 			errCh <- fmt.Errorf("probe server failed: %w", err)
 			return
 		}

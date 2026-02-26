@@ -165,7 +165,9 @@ func (i *Instance) UpdateConfig(
 			Path: "/load",
 		}).String()
 	case CommunicationMethodDirect:
-		pod, err := i.KubeClient.CoreV1().Pods(i.Namespace).Get(ctx, i.PodName, metav1.GetOptions{})
+		pod, err := i.KubeClient.CoreV1().
+			Pods(i.Namespace).
+			Get(ctx, i.PodName, metav1.GetOptions{})
 		if err != nil {
 			logger.Error().Err(err).Msg("Failed to get pod information")
 			return &errors.ConfigurationFailedError{
@@ -186,7 +188,9 @@ func (i *Instance) UpdateConfig(
 		}
 		adminURL = (&url.URL{Scheme: scheme, Host: net.JoinHostPort(podIP, port), Path: "/load"}).String()
 	case CommunicationMethodHostNetwork:
-		node, err := i.KubeClient.CoreV1().Nodes().Get(ctx, i.NodeName, metav1.GetOptions{})
+		node, err := i.KubeClient.CoreV1().
+			Nodes().
+			Get(ctx, i.NodeName, metav1.GetOptions{})
 		if err != nil {
 			logger.Error().Err(err).Msg("Failed to get node information")
 			return &errors.ConfigurationFailedError{
@@ -212,7 +216,9 @@ func (i *Instance) UpdateConfig(
 		}
 		if nodeIP == "" {
 			nodeIPErr := stdErrors.New("no IP address found for node")
-			logger.Error().Err(nodeIPErr).Msg("Cannot get node IP for hostNetwork communication")
+			logger.Error().
+				Err(nodeIPErr).
+				Msg("Cannot get node IP for hostNetwork communication")
 			return &errors.ConfigurationFailedError{
 				NodeName: i.NodeName,
 				Reason:   "node IP not found",

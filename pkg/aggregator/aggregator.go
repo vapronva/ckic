@@ -98,7 +98,8 @@ func (a *NamespaceAggregator) UpdateBase(base string) {
 		a.publishMu.Unlock()
 	}
 	if nodeUnchanged {
-		logger.Debug().Msg("Base updated but merged config unchanged for nodes, skipping push")
+		logger.Debug().
+			Msg("Base updated but merged config unchanged for nodes, skipping push")
 		return
 	}
 	if a.nodeAvailabilityCheck != nil && !a.nodeAvailabilityCheck() {
@@ -127,7 +128,10 @@ func (a *NamespaceAggregator) UpdateBase(base string) {
 
 //nolint:gocognit,nestif
 func (a *NamespaceAggregator) SetExternal(namespace, fragment string) {
-	logger := log.With().Str("component", "aggregator").Str("namespace", namespace).Logger()
+	logger := log.With().
+		Str("component", "aggregator").
+		Str("namespace", namespace).
+		Logger()
 	a.mu.Lock()
 	changed := a.externals[namespace] != fragment
 	a.externals[namespace] = fragment
@@ -141,7 +145,8 @@ func (a *NamespaceAggregator) SetExternal(namespace, fragment string) {
 	nodeUnchanged := version <= a.lastPushedVersion
 	a.mu.Unlock()
 	if initializing {
-		logger.Debug().Msg("External fragment updated during initialization, deferring push")
+		logger.Debug().
+			Msg("External fragment updated during initialization, deferring push")
 		return
 	}
 	if a.publishAggregated && !mirrorUnchanged {
@@ -255,11 +260,13 @@ func (a *NamespaceAggregator) MarkInitialized() {
 		a.publishMu.Unlock()
 	}
 	if nodeUnchanged {
-		logger.Debug().Msg("Merged config unchanged for nodes after initialization, skipping push")
+		logger.Debug().
+			Msg("Merged config unchanged for nodes after initialization, skipping push")
 		return
 	}
 	if a.nodeAvailabilityCheck != nil && !a.nodeAvailabilityCheck() {
-		logger.Info().Msg("Initialization complete but no nodes available, skipping config push")
+		logger.Info().
+			Msg("Initialization complete but no nodes available, skipping config push")
 		return
 	}
 	if a.configUpdateHandler != nil {
@@ -284,7 +291,10 @@ func (a *NamespaceAggregator) MarkInitialized() {
 
 //nolint:gocognit,nestif
 func (a *NamespaceAggregator) RemoveExternal(namespace string) {
-	logger := log.With().Str("component", "aggregator").Str("namespace", namespace).Logger()
+	logger := log.With().
+		Str("component", "aggregator").
+		Str("namespace", namespace).
+		Logger()
 	a.mu.Lock()
 	_, changed := a.externals[namespace]
 	if changed {
@@ -381,7 +391,8 @@ func (a *NamespaceAggregator) CurrentMerged() string {
 func (a *NamespaceAggregator) EnsureNodeSync() {
 	logger := log.With().Str("component", "aggregator").Logger()
 	if a.nodeAvailabilityCheck != nil && !a.nodeAvailabilityCheck() {
-		logger.Debug().Msg("Forced node sync requested but no nodes available, skipping push")
+		logger.Debug().
+			Msg("Forced node sync requested but no nodes available, skipping push")
 		return
 	}
 	a.nodePushMu.Lock()

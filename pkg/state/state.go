@@ -44,8 +44,13 @@ func (s *ConfigMapStateStore) SaveState(state map[string]*caddy.Instance) error 
 	return s.upsertStateConfigMap(context.Background(), string(data))
 }
 
-func (s *ConfigMapStateStore) upsertStateConfigMap(ctx context.Context, data string) error {
-	cm, err := s.Client.CoreV1().ConfigMaps(s.Namespace).Get(ctx, s.Name, metav1.GetOptions{})
+func (s *ConfigMapStateStore) upsertStateConfigMap(
+	ctx context.Context,
+	data string,
+) error {
+	cm, err := s.Client.CoreV1().
+		ConfigMaps(s.Namespace).
+		Get(ctx, s.Name, metav1.GetOptions{})
 	if err == nil {
 		return s.updateStateConfigMap(ctx, cm, data)
 	}
@@ -71,7 +76,10 @@ func (s *ConfigMapStateStore) upsertStateConfigMap(ctx context.Context, data str
 			ConfigMaps(s.Namespace).
 			Get(ctx, s.Name, metav1.GetOptions{})
 		if getErr != nil {
-			return fmt.Errorf("failed to get state ConfigMap after create conflict: %w", getErr)
+			return fmt.Errorf(
+				"failed to get state ConfigMap after create conflict: %w",
+				getErr,
+			)
 		}
 		return s.updateStateConfigMap(ctx, existingCM, data)
 	}

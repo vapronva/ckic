@@ -124,7 +124,8 @@ func (h *ConfigHandler) Handle(configData string) {
 			Msg("No deployed instances, skipping config push")
 		return
 	}
-	if configDigest == h.lastConfigDigest && h.allInstancesAtDigest(instancesCopy, configDigest) {
+	if configDigest == h.lastConfigDigest &&
+		h.allInstancesAtDigest(instancesCopy, configDigest) {
 		logger.Info().
 			Str("configDigest", configDigest).
 			Msg("Configuration digest unchanged across all instances, skipping update")
@@ -154,7 +155,9 @@ func (h *ConfigHandler) Handle(configData string) {
 			var err error
 			for retry := range configUpdateRetryCount {
 				if retry > 0 {
-					instanceLogger.Info().Int("retry", retry).Msg("Retrying configuration update")
+					instanceLogger.Info().
+						Int("retry", retry).
+						Msg("Retrying configuration update")
 					time.Sleep(time.Duration(retry*configUpdateRetryFactor) * time.Second)
 				}
 				err = instance.UpdateConfig(
@@ -168,7 +171,9 @@ func (h *ConfigHandler) Handle(configData string) {
 				}
 			}
 			if err != nil {
-				instanceLogger.Error().Err(err).Msg("Failed to update Caddy configuration")
+				instanceLogger.Error().
+					Err(err).
+					Msg("Failed to update Caddy configuration")
 				var newCount int32
 				h.Mu.RLock()
 				current := h.DeployedInstances[nodeName] == instance
@@ -182,7 +187,8 @@ func (h *ConfigHandler) Handle(configData string) {
 					return
 				}
 				if newCount >= maxInstanceFailureCount {
-					instanceLogger.Warn().Msg("Too many update failures, marking for redeployment")
+					instanceLogger.Warn().
+						Msg("Too many update failures, marking for redeployment")
 					muFailed.Lock()
 					failedInstances = append(failedInstances, failedInstance{
 						nodeName: nodeName,
@@ -237,7 +243,9 @@ func (h *ConfigHandler) Handle(configData string) {
 			}
 			delete(h.DeployedInstances, failed.nodeName)
 			h.Mu.Unlock()
-			logger.Info().Str("node", failed.nodeName).Msg("Redeploying failed Caddy instance")
+			logger.Info().
+				Str("node", failed.nodeName).
+				Msg("Redeploying failed Caddy instance")
 			if err := failed.instance.Delete(); err != nil {
 				logger.Error().
 					Err(err).
@@ -307,7 +315,9 @@ func (h *ConfigHandler) Handle(configData string) {
 			}
 			h.instanceDigests[failed.nodeName] = configDigest
 			h.instanceSignatures[failed.nodeName] = instanceStateSignature(newInstance)
-			logger.Info().Str("node", failed.nodeName).Msg("Successfully redeployed Caddy instance")
+			logger.Info().
+				Str("node", failed.nodeName).
+				Msg("Successfully redeployed Caddy instance")
 		}
 	}
 	if h.allCurrentInstancesConverged(configDigest) {

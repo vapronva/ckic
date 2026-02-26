@@ -2,7 +2,6 @@ package controller
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"maps"
 	"sync"
@@ -76,7 +75,10 @@ type watcherBundle struct {
 	agg             *aggregator.NamespaceAggregator
 }
 
-func NewController(clientset kubernetes.Interface, config ControllerConfig) (*Controller, error) {
+func NewController(
+	clientset kubernetes.Interface,
+	config ControllerConfig,
+) (*Controller, error) {
 	deployedInstances := make(map[string]*caddy.Instance)
 	mutex := &sync.RWMutex{}
 	nodeAvailabilityCheck := func() bool {
@@ -102,7 +104,14 @@ func NewController(clientset kubernetes.Interface, config ControllerConfig) (*Co
 		config.HTTPHostPort,
 		config.HTTPSHostPort,
 	)
-	nodeWatcher := watcher.NewNodeWatcher(clientset, config.NodeLabel, nodeHandler.Handle)
+	nodeWatcher, err := watcher.NewNodeWatcher(
+		clientset,
+		config.NodeLabel,
+		nodeHandler.Handle,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create node watcher: %w", err)
+	}
 	configHandler := handlers.NewConfigHandler(
 		config.CommunicationMethod,
 		clientset,
@@ -122,7 +131,12 @@ func NewController(clientset kubernetes.Interface, config ControllerConfig) (*Co
 		config.HTTPHostPort,
 		config.HTTPSHostPort,
 	)
-	watchers := buildWatcherBundle(clientset, config, configHandler, nodeAvailabilityCheck)
+	watchers := buildWatcherBundle(
+		clientset,
+		config,
+		configHandler,
+		nodeAvailabilityCheck,
+	)
 	coordinator := NewWatcherCoordinator(
 		nodeWatcher,
 		watchers.configWatcher,
@@ -228,11 +242,10 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 	logger := log.With().Str("component", "reconcile").Logger()
 	logger.Info().Msg("Starting reconciliation process")
 	discovered := make(map[string]*caddy.Instance)
-	nodeLabelKey, nodeLabelValue := watcher.ParseLabelSelector(c.config.NodeLabel)
-	if nodeLabelKey == "" {
-		return errors.New("node label selector is empty")
+	nodeSelector, err := watcher.NormalizeNodeLabelSelector(c.config.NodeLabel)
+	if err != nil {
+		return fmt.Errorf("invalid node label selector for reconciliation: %w", err)
 	}
-	nodeSelector := nodeLabelKey + "=" + nodeLabelValue
 	nodes, err := c.clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{
 		LabelSelector: nodeSelector,
 	})
@@ -247,11 +260,13 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 	for _, node := range nodes.Items {
 		eligibleNodes[node.Name] = struct{}{}
 	}
-	deployments, err := c.clientset.AppsV1().Deployments(c.config.ConfigMapNamespace).List(
-		ctx, metav1.ListOptions{
-			LabelSelector: "ckic.cmld.ru/caddy-managed=true",
-		},
-	)
+	deployments, err := c.clientset.AppsV1().
+		Deployments(c.config.ConfigMapNamespace).
+		List(
+			ctx, metav1.ListOptions{
+				LabelSelector: "ckic.cmld.ru/caddy-managed=true",
+			},
+		)
 	if err != nil {
 		return fmt.Errorf("failed to list deployments for reconciliation: %w", err)
 	}
@@ -261,43 +276,18 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 			logger.Warn().Msg("Deployment missing instance label, skipping")
 			continue
 		}
+		instance := &caddy.Instance{
+			NodeName:       nodeName,
+			Namespace:      c.config.ConfigMapNamespace,
+			DeploymentName: dep.Name,
+			ServiceName:    dep.Name,
+			KubeClient:     c.clientset,
+		}
 		if _, matchesSelector := eligibleNodes[nodeName]; !matchesSelector {
-			logger.Debug().
+			logger.Warn().
 				Str("node", nodeName).
 				Str("selector", nodeSelector).
-				Msg("Skipping managed deployment outside NodeLabel selector scope")
-			continue
-		}
-		if dep.Status.ReadyReplicas > 0 {
-			podList, errPL := c.clientset.CoreV1().
-				Pods(c.config.ConfigMapNamespace).
-				List(ctx, metav1.ListOptions{
-					LabelSelector: "app=caddy,instance=" + nodeName,
-				})
-			if errPL != nil || len(podList.Items) == 0 {
-				logger.Warn().Msgf("No pods found for healthy deployment on node %s", nodeName)
-				continue
-			}
-			instance := &caddy.Instance{
-				NodeName:       nodeName,
-				Namespace:      c.config.ConfigMapNamespace,
-				DeploymentName: dep.Name,
-				ServiceName:    dep.Name,
-				PodName:        podList.Items[0].Name,
-				KubeClient:     c.clientset,
-			}
-			discovered[nodeName] = instance
-			logger.Info().Msgf("Adopted existing healthy deployment on node %s", nodeName)
-		} else {
-			logger.Warn().
-				Msgf("Deployment on node %s is not healthy, deleting orphaned deployment", nodeName)
-			instance := &caddy.Instance{
-				NodeName:       nodeName,
-				Namespace:      c.config.ConfigMapNamespace,
-				DeploymentName: dep.Name,
-				ServiceName:    dep.Name,
-				KubeClient:     c.clientset,
-			}
+				Msg("Deleting managed deployment outside NodeLabel selector scope")
 			if errID := instance.Delete(); errID != nil {
 				logger.Error().
 					Err(errID).
@@ -305,12 +295,47 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 			} else {
 				logger.Info().Msgf("Deleted orphaned deployment on node %s", nodeName)
 			}
+			continue
+		}
+		podList, errPL := c.clientset.CoreV1().
+			Pods(c.config.ConfigMapNamespace).
+			List(ctx, metav1.ListOptions{
+				LabelSelector: "app=caddy,instance=" + nodeName,
+			})
+		switch {
+		case errPL != nil:
+			logger.Warn().
+				Err(errPL).
+				Msgf("Failed to list pods while adopting deployment on node %s", nodeName)
+		case len(podList.Items) > 0:
+			if podName, selected := caddy.SelectNewestActivePodName(
+				podList.Items,
+			); selected {
+				instance.PodName = podName
+			} else {
+				logger.Debug().
+					Str("node", nodeName).
+					Msg("Only terminating pods found for managed deployment; adopting transitional deployment")
+			}
+		default:
+			logger.Debug().
+				Str("node", nodeName).
+				Msg("No pods found yet for managed deployment; adopting transitional deployment")
+		}
+		discovered[nodeName] = instance
+		if dep.Status.ReadyReplicas > 0 {
+			logger.Info().Msgf("Adopted existing healthy deployment on node %s", nodeName)
+		} else {
+			logger.Info().
+				Msgf("Adopted existing transitioning deployment on node %s", nodeName)
 		}
 	}
 	c.reconcileDiscoveredDeployments(ctx, discovered)
 	savedState, err := c.stateStore.LoadState()
 	if err != nil {
-		logger.Warn().Err(err).Msg("Could not load saved state, proceeding with discovered state")
+		logger.Warn().
+			Err(err).
+			Msg("Could not load saved state, proceeding with discovered state")
 	}
 	if c.config.PreferSavedState && len(savedState) > 0 {
 		logger.Info().
@@ -346,7 +371,9 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 			if c.externalWatcher != nil {
 				externals, errBatch := c.externalWatcher.InitialListBatch(ctx)
 				if errBatch != nil {
-					logger.Error().Err(errBatch).Msg("Failed to batch load external ConfigMaps")
+					logger.Error().
+						Err(errBatch).
+						Msg("Failed to batch load external ConfigMaps")
 				} else if len(externals) > 0 {
 					agg.SetExternalBatch(externals)
 				}
@@ -361,7 +388,8 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 			} else if configData, exists := configMap.Data["Caddyfile"]; exists {
 				agg.UpdateBase(configData)
 			} else {
-				logger.Warn().Msg("ConfigMap missing Caddyfile key, skipping base config setup")
+				logger.Warn().
+					Msg("ConfigMap missing Caddyfile key, skipping base config setup")
 			}
 			agg.MarkInitialized()
 			if len(c.deployedInstances) > 0 {
@@ -370,18 +398,24 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 				logger.Info().Msg("Aggregator initialized (no instances to push to yet)")
 			}
 		} else {
-			logger.Error().Msg("Failed to assert aggregator type, skipping initial config setup")
+			logger.Error().
+				Msg("Failed to assert aggregator type, skipping initial config setup")
 		}
 	} else if len(c.deployedInstances) > 0 {
 		logger.Info().Msg("Pushing initial configuration to discovered instances")
-		configMap, configMapErr := c.clientset.CoreV1().ConfigMaps(c.config.ConfigMapNamespace).Get(
-			ctx, c.config.ConfigMapName, metav1.GetOptions{})
+		configMap, configMapErr := c.clientset.CoreV1().
+			ConfigMaps(c.config.ConfigMapNamespace).
+			Get(
+				ctx, c.config.ConfigMapName, metav1.GetOptions{})
 		if configMapErr != nil {
-			logger.Error().Err(configMapErr).Msg("Failed to get ConfigMap for initial config push")
+			logger.Error().
+				Err(configMapErr).
+				Msg("Failed to get ConfigMap for initial config push")
 		} else if configData, exists := configMap.Data["Caddyfile"]; exists {
 			c.configHandler.Handle(configData)
 		} else {
-			logger.Warn().Msg("ConfigMap missing Caddyfile key, skipping initial config push")
+			logger.Warn().
+				Msg("ConfigMap missing Caddyfile key, skipping initial config push")
 		}
 	}
 	logger.Info().Msg("Reconciliation process completed")
@@ -423,7 +457,9 @@ func (c *Controller) reconcileDiscoveredDeployments(
 			logger.Info().Msgf("Reconciled adopted deployment on node %s", nodeName)
 			continue
 		}
-		logger.Debug().Str("node", nodeName).Msg("Adopted deployment already matches desired spec")
+		logger.Debug().
+			Str("node", nodeName).
+			Msg("Adopted deployment already matches desired spec")
 	}
 }
 
@@ -438,10 +474,14 @@ func (c *Controller) runPeriodicConfigReconciliation(ctx context.Context) {
 			return
 		case <-ticker.C:
 			logger.Info().Msg("Performing periodic configuration reconciliation")
-			configMap, err := c.clientset.CoreV1().ConfigMaps(c.config.ConfigMapNamespace).Get(
-				ctx, c.config.ConfigMapName, metav1.GetOptions{})
+			configMap, err := c.clientset.CoreV1().
+				ConfigMaps(c.config.ConfigMapNamespace).
+				Get(
+					ctx, c.config.ConfigMapName, metav1.GetOptions{})
 			if err != nil {
-				logger.Error().Err(err).Msg("Failed to get ConfigMap during reconciliation")
+				logger.Error().
+					Err(err).
+					Msg("Failed to get ConfigMap during reconciliation")
 				continue
 			}
 			configData, exists := configMap.Data["Caddyfile"]
@@ -491,7 +531,9 @@ func (c *Controller) runPeriodicStatePersistence(ctx context.Context) {
 			maps.Copy(instancesCopy, c.deployedInstances)
 			c.instancesMutex.RUnlock()
 			if err := c.stateStore.SaveState(instancesCopy); err != nil {
-				logger.Error().Err(err).Msg("Failed to persist state during periodic save")
+				logger.Error().
+					Err(err).
+					Msg("Failed to persist state during periodic save")
 			} else {
 				logger.Debug().
 					Int("instances", instanceCount).

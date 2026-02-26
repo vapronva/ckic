@@ -141,13 +141,17 @@ func resolvePodName(
 		pods, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
 			LabelSelector: labelSelector,
 		})
-		if err == nil && len(pods.Items) > 0 {
-			return pods.Items[0].Name, nil
-		}
-		if err != nil {
-			lastErr = fmt.Errorf("failed to list pods for node %s: %w", nodeName, err)
+		if err == nil {
+			if podName, ok := SelectNewestActivePodName(pods.Items); ok {
+				return podName, nil
+			}
+			if len(pods.Items) == 0 {
+				lastErr = fmt.Errorf("no pods found for node %s", nodeName)
+			} else {
+				lastErr = fmt.Errorf("no active pods found for node %s", nodeName)
+			}
 		} else {
-			lastErr = fmt.Errorf("no pods found for node %s", nodeName)
+			lastErr = fmt.Errorf("failed to list pods for node %s: %w", nodeName, err)
 		}
 		if attempt == maxAttempts {
 			break
@@ -173,6 +177,31 @@ func resolvePodName(
 	return "", lastErr
 }
 
+func SelectNewestActivePodName(pods []corev1.Pod) (string, bool) {
+	var selected *corev1.Pod
+	for idx := range pods {
+		pod := &pods[idx]
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
+		if selected == nil {
+			selected = pod
+			continue
+		}
+		switch {
+		case pod.CreationTimestamp.Time.After(selected.CreationTimestamp.Time):
+			selected = pod
+		case pod.CreationTimestamp.Time.Equal(selected.CreationTimestamp.Time) &&
+			pod.Name > selected.Name:
+			selected = pod
+		}
+	}
+	if selected == nil {
+		return "", false
+	}
+	return selected.Name, true
+}
+
 //nolint:gocognit,funlen
 func deployDeployment(
 	ctx context.Context,
@@ -194,7 +223,11 @@ func deployDeployment(
 			{Name: "admin", ContainerPort: caddyAdminPort, Protocol: corev1.ProtocolTCP},
 		},
 		VolumeMounts: []corev1.VolumeMount{
-			{Name: "caddy-config", MountPath: "/etc/caddy/Caddyfile", SubPath: "Caddyfile"},
+			{
+				Name:      "caddy-config",
+				MountPath: "/etc/caddy/Caddyfile",
+				SubPath:   "Caddyfile",
+			},
 			{Name: "opt-data", MountPath: "/data"},
 			{Name: "opt-config", MountPath: "/config"},
 		},
@@ -469,7 +502,11 @@ func deployDeployment(
 		return true, true, nil
 	default:
 		logger.Error().Err(err).Msg("Failed to fetch existing Caddy deployment")
-		return false, false, fmt.Errorf("failed to get deployment %s: %w", instance.DeploymentName, err)
+		return false, false, fmt.Errorf(
+			"failed to get deployment %s: %w",
+			instance.DeploymentName,
+			err,
+		)
 	}
 }
 
@@ -486,7 +523,10 @@ func deploymentNeedsUpdate(existing, desired *appsv1.Deployment) bool {
 	if !equality.Semantic.DeepEqual(existing.Spec.Selector, desired.Spec.Selector) {
 		return true
 	}
-	if !equality.Semantic.DeepEqual(existing.Spec.Template.Labels, desired.Spec.Template.Labels) {
+	if !equality.Semantic.DeepEqual(
+		existing.Spec.Template.Labels,
+		desired.Spec.Template.Labels,
+	) {
 		return true
 	}
 	if podTemplateNeedsUpdate(existing.Spec.Template.Spec, desired.Spec.Template.Spec) {
@@ -546,7 +586,10 @@ func volumesNeedUpdate(existing, desired []corev1.Volume) bool {
 		if !exists {
 			return true
 		}
-		if !equality.Semantic.DeepEqual(normalizedExistingVolume, normalizedDesiredVolume) {
+		if !equality.Semantic.DeepEqual(
+			normalizedExistingVolume,
+			normalizedDesiredVolume,
+		) {
 			return true
 		}
 	}
@@ -556,7 +599,9 @@ func volumesNeedUpdate(existing, desired []corev1.Volume) bool {
 func normalizeVolumeForComparison(volume corev1.Volume) corev1.Volume {
 	normalized := volume.DeepCopy()
 	if normalized.ConfigMap != nil {
-		normalized.ConfigMap.DefaultMode = normalizeConfigMapDefaultMode(normalized.ConfigMap.DefaultMode)
+		normalized.ConfigMap.DefaultMode = normalizeConfigMapDefaultMode(
+			normalized.ConfigMap.DefaultMode,
+		)
 	}
 	return *normalized
 }
@@ -646,7 +691,11 @@ func deployService(
 			Update(ctx, updatedService, metav1.UpdateOptions{})
 		if err != nil {
 			logger.Error().Err(err).Msg("Failed to update existing Caddy service")
-			return false, fmt.Errorf("failed to update service %s: %w", instance.DeploymentName, err)
+			return false, fmt.Errorf(
+				"failed to update service %s: %w",
+				instance.DeploymentName,
+				err,
+			)
 		}
 		logger.Info().Msg("Updated existing Caddy service")
 		return true, nil
@@ -656,13 +705,21 @@ func deployService(
 			Create(ctx, service, metav1.CreateOptions{})
 		if err != nil {
 			logger.Error().Err(err).Msg("Failed to create Caddy service")
-			return false, fmt.Errorf("failed to create service %s: %w", instance.DeploymentName, err)
+			return false, fmt.Errorf(
+				"failed to create service %s: %w",
+				instance.DeploymentName,
+				err,
+			)
 		}
 		logger.Info().Msg("Created Caddy service")
 		return true, nil
 	default:
 		logger.Error().Err(err).Msg("Failed to fetch existing Caddy service")
-		return false, fmt.Errorf("failed to get service %s: %w", instance.DeploymentName, err)
+		return false, fmt.Errorf(
+			"failed to get service %s: %w",
+			instance.DeploymentName,
+			err,
+		)
 	}
 }
 
@@ -845,7 +902,10 @@ func mergeServiceForUpdate(existing, desired *corev1.Service) {
 	existing.Spec.ExternalIPs = desired.Spec.ExternalIPs
 	existing.Spec.ExternalTrafficPolicy = desired.Spec.ExternalTrafficPolicy
 	existing.Spec.LoadBalancerClass = desired.Spec.LoadBalancerClass
-	existing.Spec.Ports = mergeServicePortsKeepingNodePorts(existing.Spec.Ports, desired.Spec.Ports)
+	existing.Spec.Ports = mergeServicePortsKeepingNodePorts(
+		existing.Spec.Ports,
+		desired.Spec.Ports,
+	)
 }
 
 func serviceNeedsUpdate(existing, desired *corev1.Service) bool {
@@ -867,7 +927,10 @@ func serviceNeedsUpdate(existing, desired *corev1.Service) bool {
 	if existing.Spec.ExternalTrafficPolicy != desired.Spec.ExternalTrafficPolicy {
 		return true
 	}
-	if !equality.Semantic.DeepEqual(existing.Spec.LoadBalancerClass, desired.Spec.LoadBalancerClass) {
+	if !equality.Semantic.DeepEqual(
+		existing.Spec.LoadBalancerClass,
+		desired.Spec.LoadBalancerClass,
+	) {
 		return true
 	}
 	if !equality.Semantic.DeepEqual(existing.Spec.Ports, desired.Spec.Ports) {
@@ -970,8 +1033,14 @@ func deploymentRolloutComplete(deployment *appsv1.Deployment) bool {
 	return true
 }
 
-func cleanupDeployment(ctx context.Context, clientset kubernetes.Interface, instance *Instance) {
-	log.Warn().Str("deployment", instance.DeploymentName).Msg("Cleaning up failed deployment")
+func cleanupDeployment(
+	ctx context.Context,
+	clientset kubernetes.Interface,
+	instance *Instance,
+) {
+	log.Warn().
+		Str("deployment", instance.DeploymentName).
+		Msg("Cleaning up failed deployment")
 	if err := clientset.CoreV1().
 		Services(instance.Namespace).
 		Delete(ctx, instance.ServiceName, metav1.DeleteOptions{}); err != nil {

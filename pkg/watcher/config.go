@@ -81,7 +81,8 @@ func (w *ConfigWatcher) Resume() {
 		w.isPaused = false
 		log.Info().Msg("ConfigMap watcher resumed")
 	}
-	shouldProcess := w.hasCachedConfig && w.nodeAvailableCheck != nil && w.nodeAvailableCheck()
+	shouldProcess := w.hasCachedConfig && w.nodeAvailableCheck != nil &&
+		w.nodeAvailableCheck()
 	var configToProcess string
 	shouldSkip := false
 	if shouldProcess {
@@ -143,6 +144,10 @@ func (w *ConfigWatcher) EnsureSync() {
 	}
 	if forceSyncHandler != nil {
 		forceSyncHandler()
+		w.mu.Lock()
+		w.lastSuccess = time.Now()
+		w.failureCount = 0
+		w.mu.Unlock()
 		return
 	}
 	if shouldProcessCached || lastProcessed == "" || configHandler == nil {
@@ -162,7 +167,10 @@ func minDuration(a, b time.Duration) time.Duration {
 	return b
 }
 
-func (w *ConfigWatcher) refreshResourceVersion(ctx context.Context, logger zerolog.Logger) error {
+func (w *ConfigWatcher) refreshResourceVersion(
+	ctx context.Context,
+	logger zerolog.Logger,
+) error {
 	cm, err := w.clientset.CoreV1().
 		ConfigMaps(w.namespace).
 		Get(ctx, w.configMapName, metav1.GetOptions{})
@@ -170,7 +178,9 @@ func (w *ConfigWatcher) refreshResourceVersion(ctx context.Context, logger zerol
 		return err
 	}
 	w.lastResourceVersion = cm.ResourceVersion
-	logger.Info().Str("resourceVersion", w.lastResourceVersion).Msg("Resource version refreshed")
+	logger.Info().
+		Str("resourceVersion", w.lastResourceVersion).
+		Msg("Resource version refreshed")
 	if configData, exists := cm.Data["Caddyfile"]; exists {
 		w.mu.RLock()
 		lastProcessed := w.lastProcessedConfig
@@ -187,7 +197,8 @@ func (w *ConfigWatcher) refreshResourceVersion(ctx context.Context, logger zerol
 			w.lastSuccess = time.Now()
 			w.mu.Unlock()
 		} else {
-			logger.Info().Msg("Refreshed ConfigMap loaded but no eligible nodes, caching config")
+			logger.Info().
+				Msg("Refreshed ConfigMap loaded but no eligible nodes, caching config")
 			w.mu.Lock()
 			w.cachedConfig = configData
 			w.hasCachedConfig = true
@@ -228,16 +239,19 @@ func (w *ConfigWatcher) Start(ctx context.Context) {
 			FieldSelector:   "metadata.name=" + w.configMapName,
 			ResourceVersion: "",
 		}
-		cmWatcher, watchErr := w.clientset.CoreV1().ConfigMaps(w.namespace).Watch(ctx, watchOptions)
+		cmWatcher, watchErr := w.clientset.CoreV1().
+			ConfigMaps(w.namespace).
+			Watch(ctx, watchOptions)
 		if watchErr != nil {
-			logger.Error().Err(watchErr).Msg("Failed to create ConfigMap watcher, retrying")
+			logger.Error().
+				Err(watchErr).
+				Msg("Failed to create ConfigMap watcher, retrying")
 			w.mu.Lock()
 			w.failureCount++
 			failureCount := w.failureCount
-			lastSuccess := w.lastSuccess
 			w.mu.Unlock()
 			if failureCount >= w.maxFailures {
-				sleepTime := w.resetTimeout - time.Since(lastSuccess)
+				sleepTime := w.resetTimeout
 				if sleepTime > 0 {
 					logger.Warn().Msgf("Circuit breaker open, sleeping for %v", sleepTime)
 					time.Sleep(sleepTime)

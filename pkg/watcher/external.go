@@ -131,7 +131,14 @@ func (w *ExternalConfigWatcher) Start(ctx context.Context) {
 		}
 		watcher, err := w.clientset.CoreV1().ConfigMaps("").Watch(ctx, watchOptions)
 		if err != nil {
-			delay = w.handleWatchCreateError(ctx, logger, err, delay, maxDelay, multiplier)
+			delay = w.handleWatchCreateError(
+				ctx,
+				logger,
+				err,
+				delay,
+				maxDelay,
+				multiplier,
+			)
 			continue
 		}
 		delay = constants.ConfigMapWatcherInitialDelay
@@ -161,45 +168,9 @@ func (w *ExternalConfigWatcher) Start(ctx context.Context) {
 			}
 			switch event.Type {
 			case watch.Added, watch.Modified:
-				if fragment, exists := cm.Data["Caddyfile"]; exists {
-					sourceKey := fmt.Sprintf("%s/%s", cm.Namespace, cm.Name)
-					if w.lastProcessedConfigs[sourceKey] == fragment {
-						logger.Debug().
-							Str("event", string(event.Type)).
-							Str("namespace", cm.Namespace).
-							Str("name", cm.Name).
-							Msg("External ConfigMap content unchanged, skipping")
-						continue
-					}
-					logger.Info().
-						Str("event", string(event.Type)).
-						Str("namespace", cm.Namespace).
-						Str("name", cm.Name).
-						Msg("External ConfigMap updated")
-					if w.onUpdate != nil {
-						w.onUpdate(sourceKey, fragment)
-					}
-					w.lastProcessedConfigs[sourceKey] = fragment
-					w.lastSuccess = time.Now()
-					w.failureCount = 0
-				} else {
-					logger.Warn().
-						Str("namespace", cm.Namespace).
-						Str("name", cm.Name).
-						Msg("External ConfigMap missing 'Caddyfile' key")
-				}
+				w.handleWatchUpsert(cm, event.Type, logger)
 			case watch.Deleted:
-				sourceKey := fmt.Sprintf("%s/%s", cm.Namespace, cm.Name)
-				logger.Info().
-					Str("namespace", cm.Namespace).
-					Str("name", cm.Name).
-					Msg("External ConfigMap deleted")
-				if w.onRemove != nil {
-					w.onRemove(sourceKey)
-				}
-				delete(w.lastProcessedConfigs, sourceKey)
-				w.lastSuccess = time.Now()
-				w.failureCount = 0
+				w.handleWatchDelete(cm, logger)
 			case watch.Bookmark:
 				logger.Debug().Msg("Received external ConfigMap bookmark event")
 			case watch.Error:
@@ -209,6 +180,74 @@ func (w *ExternalConfigWatcher) Start(ctx context.Context) {
 		time.Sleep(delay)
 		delay = minExternalDuration(time.Duration(float64(delay)*multiplier), maxDelay)
 	}
+}
+
+func (w *ExternalConfigWatcher) handleWatchUpsert(
+	cm *corev1.ConfigMap,
+	eventType watch.EventType,
+	logger zerolog.Logger,
+) {
+	sourceKey := fmt.Sprintf("%s/%s", cm.Namespace, cm.Name)
+	fragment, exists := cm.Data["Caddyfile"]
+	if !exists {
+		logger.Warn().
+			Str("namespace", cm.Namespace).
+			Str("name", cm.Name).
+			Msg("External ConfigMap missing 'Caddyfile' key")
+		if _, processed := w.lastProcessedConfigs[sourceKey]; !processed {
+			return
+		}
+		logger.Info().
+			Str("namespace", cm.Namespace).
+			Str("name", cm.Name).
+			Msg("Removing stale external fragment after missing 'Caddyfile' key")
+		w.removeExternalSource(sourceKey)
+		w.markWatchSuccess()
+		return
+	}
+	if w.lastProcessedConfigs[sourceKey] == fragment {
+		logger.Debug().
+			Str("event", string(eventType)).
+			Str("namespace", cm.Namespace).
+			Str("name", cm.Name).
+			Msg("External ConfigMap content unchanged, skipping")
+		return
+	}
+	logger.Info().
+		Str("event", string(eventType)).
+		Str("namespace", cm.Namespace).
+		Str("name", cm.Name).
+		Msg("External ConfigMap updated")
+	if w.onUpdate != nil {
+		w.onUpdate(sourceKey, fragment)
+	}
+	w.lastProcessedConfigs[sourceKey] = fragment
+	w.markWatchSuccess()
+}
+
+func (w *ExternalConfigWatcher) handleWatchDelete(
+	cm *corev1.ConfigMap,
+	logger zerolog.Logger,
+) {
+	sourceKey := fmt.Sprintf("%s/%s", cm.Namespace, cm.Name)
+	logger.Info().
+		Str("namespace", cm.Namespace).
+		Str("name", cm.Name).
+		Msg("External ConfigMap deleted")
+	w.removeExternalSource(sourceKey)
+	w.markWatchSuccess()
+}
+
+func (w *ExternalConfigWatcher) removeExternalSource(sourceKey string) {
+	if w.onRemove != nil {
+		w.onRemove(sourceKey)
+	}
+	delete(w.lastProcessedConfigs, sourceKey)
+}
+
+func (w *ExternalConfigWatcher) markWatchSuccess() {
+	w.lastSuccess = time.Now()
+	w.failureCount = 0
 }
 
 func (w *ExternalConfigWatcher) handleWatchCreateError(
@@ -317,7 +356,10 @@ func (w *ExternalConfigWatcher) reconcileFromList(
 	}
 	configMaps, err := w.clientset.CoreV1().ConfigMaps("").List(ctx, listOptions)
 	if err != nil {
-		return fmt.Errorf("failed to list external ConfigMaps for reconciliation: %w", err)
+		return fmt.Errorf(
+			"failed to list external ConfigMaps for reconciliation: %w",
+			err,
+		)
 	}
 	w.reconcileSnapshot(configMaps, logger)
 	return nil
@@ -331,45 +373,11 @@ func (w *ExternalConfigWatcher) reconcileSnapshot(
 	updates := 0
 	removals := 0
 	for _, cm := range configMaps.Items {
-		if !w.isNamespaceAllowed(cm.Namespace) {
-			continue
-		}
-		sourceKey := fmt.Sprintf("%s/%s", cm.Namespace, cm.Name)
-		seen[sourceKey] = struct{}{}
-		fragment, exists := cm.Data["Caddyfile"]
-		if !exists {
-			logger.Warn().
-				Str("namespace", cm.Namespace).
-				Str("name", cm.Name).
-				Msg("External ConfigMap missing 'Caddyfile' key during reconciliation")
-			continue
-		}
-		if w.lastProcessedConfigs[sourceKey] == fragment {
-			continue
-		}
-		logger.Info().
-			Str("namespace", cm.Namespace).
-			Str("name", cm.Name).
-			Msg("Reconciling external ConfigMap update")
-		if w.onUpdate != nil {
-			w.onUpdate(sourceKey, fragment)
-		}
-		w.lastProcessedConfigs[sourceKey] = fragment
-		updates++
+		deltaUpdates, deltaRemovals := w.reconcileSnapshotConfigMap(cm, seen, logger)
+		updates += deltaUpdates
+		removals += deltaRemovals
 	}
-	for sourceKey := range w.lastProcessedConfigs {
-		if _, exists := seen[sourceKey]; exists {
-			continue
-		}
-		logger.Info().
-			Str("source", sourceKey).
-			Msg("Reconciling stale external ConfigMap removal")
-		if w.onRemove != nil {
-			w.onRemove(sourceKey)
-		}
-		delete(w.lastProcessedConfigs, sourceKey)
-		removals++
-	}
+	removals += w.reconcileSnapshotStaleEntries(seen, logger)
 	w.lastResourceVersion = configMaps.ResourceVersion
 	w.lastSuccess = time.Now()
 	w.failureCount = 0
@@ -381,14 +389,76 @@ func (w *ExternalConfigWatcher) reconcileSnapshot(
 		Msg("External ConfigMap reconciliation complete")
 }
 
-func (w *ExternalConfigWatcher) InitialListBatch(ctx context.Context) (map[string]string, error) {
+func (w *ExternalConfigWatcher) reconcileSnapshotConfigMap(
+	cm corev1.ConfigMap,
+	seen map[string]struct{},
+	logger zerolog.Logger,
+) (int, int) {
+	if !w.isNamespaceAllowed(cm.Namespace) {
+		return 0, 0
+	}
+	sourceKey := fmt.Sprintf("%s/%s", cm.Namespace, cm.Name)
+	fragment, exists := cm.Data["Caddyfile"]
+	if !exists {
+		logger.Warn().
+			Str("namespace", cm.Namespace).
+			Str("name", cm.Name).
+			Msg("External ConfigMap missing 'Caddyfile' key during reconciliation")
+		if _, processed := w.lastProcessedConfigs[sourceKey]; !processed {
+			return 0, 0
+		}
+		logger.Info().
+			Str("namespace", cm.Namespace).
+			Str("name", cm.Name).
+			Msg("Reconciling stale external fragment removal after missing 'Caddyfile' key")
+		w.removeExternalSource(sourceKey)
+		return 0, 1
+	}
+	seen[sourceKey] = struct{}{}
+	if w.lastProcessedConfigs[sourceKey] == fragment {
+		return 0, 0
+	}
+	logger.Info().
+		Str("namespace", cm.Namespace).
+		Str("name", cm.Name).
+		Msg("Reconciling external ConfigMap update")
+	if w.onUpdate != nil {
+		w.onUpdate(sourceKey, fragment)
+	}
+	w.lastProcessedConfigs[sourceKey] = fragment
+	return 1, 0
+}
+
+func (w *ExternalConfigWatcher) reconcileSnapshotStaleEntries(
+	seen map[string]struct{},
+	logger zerolog.Logger,
+) int {
+	removals := 0
+	for sourceKey := range w.lastProcessedConfigs {
+		if _, exists := seen[sourceKey]; exists {
+			continue
+		}
+		logger.Info().
+			Str("source", sourceKey).
+			Msg("Reconciling stale external ConfigMap removal")
+		w.removeExternalSource(sourceKey)
+		removals++
+	}
+	return removals
+}
+
+func (w *ExternalConfigWatcher) InitialListBatch(
+	ctx context.Context,
+) (map[string]string, error) {
 	logger := log.With().Str("component", "external_config_watcher").Logger()
 	listOptions := metav1.ListOptions{
 		LabelSelector: w.labelSelector,
 	}
 	configMaps, err := w.clientset.CoreV1().ConfigMaps("").List(ctx, listOptions)
 	if err != nil {
-		logger.Error().Err(err).Msg("Failed to list external ConfigMaps for batch initialization")
+		logger.Error().
+			Err(err).
+			Msg("Failed to list external ConfigMaps for batch initialization")
 		return nil, fmt.Errorf("failed to list external ConfigMaps: %w", err)
 	}
 	w.lastResourceVersion = configMaps.ResourceVersion

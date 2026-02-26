@@ -2,6 +2,8 @@ package watcher
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -9,6 +11,7 @@ import (
 	"github.com/rs/zerolog/log"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 )
@@ -20,10 +23,7 @@ const (
 	NodeRemoved
 )
 
-const defaultLabelSelectorValue = "true"
-
 const (
-	labelSelectorParts  = 2
 	nodeListRetryDelay  = 10 * time.Second
 	nodeWatchRetryDelay = 5 * time.Second
 )
@@ -36,63 +36,74 @@ type NodeEvent struct {
 type NodeHandler func(NodeEvent)
 
 type NodeWatcher struct {
-	clientset    kubernetes.Interface
-	labelKey     string
-	labelValue   string
-	nodeHandler  NodeHandler
-	mu           sync.RWMutex
-	currentNodes map[string]bool
+	clientset     kubernetes.Interface
+	labelSelector string
+	nodeHandler   NodeHandler
+	mu            sync.RWMutex
+	currentNodes  map[string]bool
 }
 
-func ParseLabelSelector(labelSelector string) (string, string) {
+func normalizeLegacyNodeSelector(labelSelector string) string {
+	const legacyNodeSelectorParts = 2
+
+	selector := strings.TrimSpace(labelSelector)
+	if strings.Count(selector, ":") != 1 {
+		return selector
+	}
+	if strings.Contains(selector, "=") ||
+		strings.Contains(selector, ",") ||
+		strings.Contains(selector, "(") ||
+		strings.Contains(selector, ")") ||
+		strings.Contains(selector, "!") ||
+		strings.Contains(selector, " in ") ||
+		strings.Contains(selector, " notin ") {
+		return selector
+	}
+	parts := strings.SplitN(selector, ":", legacyNodeSelectorParts)
+	key := strings.TrimSpace(parts[0])
+	value := strings.TrimSpace(parts[1])
+	value = strings.Trim(value, "\"' ")
+	if key == "" || value == "" {
+		return selector
+	}
+	return key + "=" + value
+}
+
+func NormalizeNodeLabelSelector(labelSelector string) (string, error) {
 	selector := strings.TrimSpace(labelSelector)
 	if selector == "" {
-		return "", defaultLabelSelectorValue
+		return "", errors.New("node label selector is empty")
 	}
-	var key string
-	var value string
-	switch {
-	case strings.Contains(selector, "="):
-		parts := strings.SplitN(selector, "=", labelSelectorParts)
-		key = parts[0]
-		value = parts[1]
-	case strings.Contains(selector, ":"):
-		parts := strings.SplitN(selector, ":", labelSelectorParts)
-		key = parts[0]
-		value = parts[1]
-	default:
-		key = selector
-		value = defaultLabelSelectorValue
+	selector = normalizeLegacyNodeSelector(selector)
+	parsed, err := labels.Parse(selector)
+	if err != nil {
+		return "", fmt.Errorf("invalid node label selector %q: %w", selector, err)
 	}
-	key = strings.TrimSpace(key)
-	value = strings.TrimSpace(value)
-	value = strings.Trim(value, "\"' ")
-	if value == "" {
-		value = defaultLabelSelectorValue
-	}
-	return key, value
+	return parsed.String(), nil
 }
 
 func NewNodeWatcher(
 	clientset kubernetes.Interface,
 	labelSelector string,
 	handler NodeHandler,
-) *NodeWatcher {
-	labelKey, labelValue := ParseLabelSelector(labelSelector)
-	return &NodeWatcher{
-		clientset:    clientset,
-		labelKey:     labelKey,
-		labelValue:   labelValue,
-		nodeHandler:  handler,
-		currentNodes: make(map[string]bool),
+) (*NodeWatcher, error) {
+	normalizedSelector, err := NormalizeNodeLabelSelector(labelSelector)
+	if err != nil {
+		return nil, err
 	}
+	return &NodeWatcher{
+		clientset:     clientset,
+		labelSelector: normalizedSelector,
+		nodeHandler:   handler,
+		currentNodes:  make(map[string]bool),
+	}, nil
 }
 
 //nolint:gocognit,cyclop,funlen
 func (w *NodeWatcher) Start(ctx context.Context) {
 	logger := log.With().
 		Str("component", "node_watcher").
-		Str("label", w.labelKey+"="+w.labelValue).
+		Str("label_selector", w.labelSelector).
 		Logger()
 	logger.Info().Msg("Starting node watcher")
 	for {
@@ -102,7 +113,7 @@ func (w *NodeWatcher) Start(ctx context.Context) {
 			return
 		default:
 			nodes, err := w.clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{
-				LabelSelector: w.labelKey + "=" + w.labelValue,
+				LabelSelector: w.labelSelector,
 			})
 			if err != nil {
 				logger.Error().Err(err).Msg("Failed to list nodes")
@@ -144,7 +155,7 @@ func (w *NodeWatcher) Start(ctx context.Context) {
 				})
 			}
 			watcher, err := w.clientset.CoreV1().Nodes().Watch(ctx, metav1.ListOptions{
-				LabelSelector: w.labelKey + "=" + w.labelValue,
+				LabelSelector: w.labelSelector,
 			})
 			if err != nil {
 				logger.Error().Err(err).Msg("Failed to create node watcher")
@@ -193,24 +204,14 @@ func (w *NodeWatcher) Start(ctx context.Context) {
 						}
 						continue
 					}
-					hasLabel := node.Labels[w.labelKey] == w.labelValue
-					if hasLabel && !wasTracked {
+					if (event.Type == watch.Added || event.Type == watch.Modified) && !wasTracked {
 						w.currentNodes[node.Name] = true
 						notifyAdd = true
-					} else if !hasLabel && wasTracked {
-						delete(w.currentNodes, node.Name)
-						notifyRemove = true
 					}
 					w.mu.Unlock()
 					if notifyAdd {
 						w.nodeHandler(NodeEvent{
 							Type:     NodeAdded,
-							NodeName: node.Name,
-						})
-					}
-					if notifyRemove {
-						w.nodeHandler(NodeEvent{
-							Type:     NodeRemoved,
 							NodeName: node.Name,
 						})
 					}

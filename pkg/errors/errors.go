@@ -13,7 +13,11 @@ func (e *ConfigurationFailedError) Error() string {
 		return "failed to update configuration: <nil pointer>"
 	}
 	if e.Err == nil {
-		return fmt.Sprintf("failed to update configuration on node %s: %s", e.NodeName, e.Reason)
+		return fmt.Sprintf(
+			"failed to update configuration on node %s: %s",
+			e.NodeName,
+			e.Reason,
+		)
 	}
 	return fmt.Sprintf(
 		"failed to update configuration on node %s: %s: %v",

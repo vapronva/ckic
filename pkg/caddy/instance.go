@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 
 	"github.com/rs/zerolog/log"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 )
@@ -61,7 +62,10 @@ func (i *Instance) UnmarshalJSON(data []byte) error {
 
 func (i *Instance) Delete() error {
 	ctx := context.Background()
-	logger := log.With().Str("node", i.NodeName).Str("deployment", i.DeploymentName).Logger()
+	logger := log.With().
+		Str("node", i.NodeName).
+		Str("deployment", i.DeploymentName).
+		Logger()
 	if err := i.KubeClient.CoreV1().Services(i.Namespace).Delete(
 		ctx, i.ServiceName, metav1.DeleteOptions{}); err != nil {
 		logger.Warn().Err(err).Msg("Failed to delete ClusterIP Caddy service")
@@ -71,7 +75,9 @@ func (i *Instance) Delete() error {
 	loadBalancerServiceName := i.DeploymentName + "-loadbalancer"
 	if err := i.KubeClient.CoreV1().Services(i.Namespace).Delete(
 		ctx, loadBalancerServiceName, metav1.DeleteOptions{}); err != nil {
-		logger.Warn().Err(err).Msg("Failed to delete LoadBalancer Caddy service (if exists)")
+		logger.Warn().
+			Err(err).
+			Msg("Failed to delete LoadBalancer Caddy service (if exists)")
 	} else {
 		logger.Info().Msg("Deleted LoadBalancer Caddy service")
 	}
@@ -83,6 +89,10 @@ func (i *Instance) Delete() error {
 	}
 	if err := i.KubeClient.AppsV1().Deployments(i.Namespace).Delete(
 		ctx, i.DeploymentName, metav1.DeleteOptions{}); err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.Debug().Msg("Caddy deployment already deleted")
+			return nil
+		}
 		logger.Error().Err(err).Msg("Failed to delete Caddy deployment")
 		return fmt.Errorf("failed to delete deployment %s: %w", i.DeploymentName, err)
 	}

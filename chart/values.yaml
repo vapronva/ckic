@@ -61,7 +61,7 @@ probes:
   readinessPeriodSeconds: 10
 
 config:
-  nodeLabel: ckic.cmld.ru/enabled
+  nodeLabel: ckic.cmld.ru/enabled=true
   configMapName: caddy-config
   configMapNamespace: caddy-system
   bootstrapDefaultConfig: false
