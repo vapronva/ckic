@@ -5,6 +5,16 @@ stages:
   - post-test
   - publish
 
+workflow:
+  rules:
+    - if: $CI_COMMIT_TAG
+      variables:
+        CI_IMAGE_TAGS: latest,$CI_COMMIT_REF_NAME
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      variables:
+        CI_IMAGE_TAGS: $CI_COMMIT_REF_NAME
+    - when: always
+
 variables:
   CT_IMAGE: quay.io/helmpack/chart-testing:latest
 
@@ -21,7 +31,7 @@ include:
   - component: $CI_SERVER_FQDN/ci/docker/build-buildah@3
     inputs:
       ci_image_name: manager
-      ci_image_tags: latest,$CI_COMMIT_REF_NAME
+      ci_image_tags: $CI_IMAGE_TAGS
       dockerfile_path: Dockerfile
   - component: $CI_SERVER_FQDN/ci/container-scanning/cs@1
     inputs:
@@ -42,6 +52,10 @@ include:
         - "**/*.go"
         - $CI_CONFIG_PATH
 
+.publish rules (tag only): &publish-rules
+  rules:
+    - if: $CI_COMMIT_TAG
+
 build container image:
   <<:
     - *build-rules
@@ -58,17 +72,15 @@ compile binaries:
     - build_binary "ckic-manager-$VERSION" linux arm64
 
 container scanning:
-  <<: *build-rules
+  <<:
+    - *build-rules
   needs:
     - job: build container image
     - job: create manifest
 
 .chart build and publish rules: &chart-build-and-publish-rules
   rules:
-    - if: $CI_COMMIT_TAG || $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      changes:
-        - chart/**/*
-        - $CI_CONFIG_PATH
+    - if: $CI_COMMIT_TAG
 
 validate + lint (helm chart):
   <<:
