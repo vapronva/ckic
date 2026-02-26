@@ -12,7 +12,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"git.horse/vapronva/ckic/pkg/constants"
@@ -105,8 +107,7 @@ func readinessProbe(
 	if apiConfig != nil && apiConfig.OriginKey != "" {
 		req.Header.Set("Origin", adminOrigin(apiConfig.OriginKey))
 	}
-	//nolint:gosec
-	resp, doErr := client.Do(req)
+	resp, doErr := doAdminRequest(client, req)
 	if doErr != nil {
 		return false, doErr
 	}
@@ -138,101 +139,25 @@ func drainAndCloseReadinessBody(resp *http.Response, adminURL, readyURL string) 
 	}
 }
 
-//nolint:gocognit,funlen
 func (i *Instance) UpdateConfig(
 	ctx context.Context,
 	configData string,
 	method CommunicationMethod,
 	apiConfig *AdminAPIConfig,
 ) error {
-	var adminURL string
-	scheme := "http"
-	port := "2019"
 	logger := log.With().
 		Str("node", i.NodeName).
 		Str("pod", i.PodName).
 		Str("method", fmt.Sprintf("%d", method)).
 		Logger()
 	logger.Debug().Msg("Updating Caddy configuration")
-	switch method {
-	case CommunicationMethodClusterIP:
-		adminURL = (&url.URL{
-			Scheme: scheme,
-			Host: net.JoinHostPort(
-				fmt.Sprintf("%s.%s.svc.cluster.local", i.ServiceName, i.Namespace),
-				port,
-			),
-			Path: "/load",
-		}).String()
-	case CommunicationMethodDirect:
-		pod, err := i.KubeClient.CoreV1().
-			Pods(i.Namespace).
-			Get(ctx, i.PodName, metav1.GetOptions{})
-		if err != nil {
-			logger.Error().Err(err).Msg("Failed to get pod information")
-			return &errors.ConfigurationFailedError{
-				NodeName: i.NodeName,
-				Reason:   "failed to get pod info",
-				Err:      err,
-			}
-		}
-		podIP := pod.Status.PodIP
-		if podIP == "" {
-			podIPErr := stdErrors.New("pod IP is empty")
-			logger.Error().Err(podIPErr).Msg("Cannot get pod IP for direct communication")
-			return &errors.ConfigurationFailedError{
-				NodeName: i.NodeName,
-				Reason:   "pod IP is empty",
-				Err:      podIPErr,
-			}
-		}
-		adminURL = (&url.URL{Scheme: scheme, Host: net.JoinHostPort(podIP, port), Path: "/load"}).String()
-	case CommunicationMethodHostNetwork:
-		node, err := i.KubeClient.CoreV1().
-			Nodes().
-			Get(ctx, i.NodeName, metav1.GetOptions{})
-		if err != nil {
-			logger.Error().Err(err).Msg("Failed to get node information")
-			return &errors.ConfigurationFailedError{
-				NodeName: i.NodeName,
-				Reason:   "failed to get node info",
-				Err:      err,
-			}
-		}
-		var nodeIP string
-		for _, addr := range node.Status.Addresses {
-			if addr.Type == "InternalIP" {
-				nodeIP = addr.Address
-				break
-			}
-		}
-		if nodeIP == "" {
-			for _, addr := range node.Status.Addresses {
-				if addr.Type == "ExternalIP" {
-					nodeIP = addr.Address
-					break
-				}
-			}
-		}
-		if nodeIP == "" {
-			nodeIPErr := stdErrors.New("no IP address found for node")
-			logger.Error().
-				Err(nodeIPErr).
-				Msg("Cannot get node IP for hostNetwork communication")
-			return &errors.ConfigurationFailedError{
-				NodeName: i.NodeName,
-				Reason:   "node IP not found",
-				Err:      nodeIPErr,
-			}
-		}
-		adminURL = (&url.URL{Scheme: scheme, Host: net.JoinHostPort(nodeIP, port), Path: "/load"}).String()
-	default:
-		err := fmt.Errorf("unknown communication method: %d", method)
-		logger.Error().Err(err).Msg("Invalid communication method")
+	adminURL, resolveErr := i.resolveAdminURL(ctx, method, logger)
+	if resolveErr != nil {
+		logger.Error().Err(resolveErr).Msg("Failed to resolve admin URL")
 		return &errors.ConfigurationFailedError{
 			NodeName: i.NodeName,
-			Reason:   "unknown communication method",
-			Err:      err,
+			Reason:   "failed to resolve admin URL",
+			Err:      resolveErr,
 		}
 	}
 	readinessClient := buildAdminHTTPClient(apiConfig, readinessRequestTimeout)
@@ -251,39 +176,28 @@ func (i *Instance) UpdateConfig(
 			Err:      readyErr,
 		}
 	}
-	client := buildAdminHTTPClient(apiConfig, configPushTimeout)
-	req, err := http.NewRequestWithContext(
+	req, reqErr := i.buildConfigUpdateRequest(
 		ctx,
-		http.MethodPost,
 		adminURL,
-		bytes.NewBufferString(configData),
+		configData,
+		apiConfig,
+		logger,
 	)
-	if err != nil {
-		logger.Error().Err(err).Msg("Failed to create HTTP request")
+	if reqErr != nil {
+		logger.Error().Err(reqErr).Msg("Failed to create HTTP request")
 		return &errors.ConfigurationFailedError{
 			NodeName: i.NodeName,
 			Reason:   "failed to create HTTP request",
-			Err:      err,
+			Err:      reqErr,
 		}
 	}
-	req.Header.Set("Content-Type", "text/caddyfile")
-	if apiConfig != nil && apiConfig.OriginKey != "" {
-		req.Header.Set(
-			"Origin",
-			fmt.Sprintf("http://%s.caddy-admin-api.ckic.cmld.ru", apiConfig.OriginKey),
-		)
-		logger.Debug().
-			Str("origin", req.Header.Get("Origin")).
-			Msg("Added Origin header for admin API security")
-	}
-	//nolint:gosec
-	resp, err := client.Do(req)
-	if err != nil {
-		logger.Error().Err(err).Msg("Failed to send configuration to Caddy")
+	resp, doErr := i.sendConfigUpdateRequest(req)
+	if doErr != nil {
+		logger.Error().Err(doErr).Msg("Failed to send configuration to Caddy")
 		return &errors.ConfigurationFailedError{
 			NodeName: i.NodeName,
 			Reason:   "failed to send configuration",
-			Err:      err,
+			Err:      doErr,
 		}
 	}
 	defer func() {
@@ -291,28 +205,17 @@ func (i *Instance) UpdateConfig(
 			logger.Warn().Err(closeErr).Msg("Failed to close response body")
 		}
 	}()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		logger.Error().Err(err).Msg("Failed to read response body")
+	body, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		logger.Error().Err(readErr).Msg("Failed to read response body")
 		return &errors.ConfigurationFailedError{
 			NodeName: i.NodeName,
 			Reason:   "failed to read response",
-			Err:      err,
+			Err:      readErr,
 		}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		err = fmt.Errorf("caddy returned status %d: %s", resp.StatusCode, string(body))
-		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-			logger.Error().
-				Err(err).
-				Int("status", resp.StatusCode).
-				Msg("Caddy configuration update failed with client error")
-		} else {
-			logger.Error().
-				Err(err).
-				Int("status", resp.StatusCode).
-				Msg("Caddy configuration update failed")
-		}
+		err := i.logConfigUpdateFailure(resp.StatusCode, body, logger)
 		return &errors.ConfigurationFailedError{
 			NodeName: i.NodeName,
 			Reason:   "non-2xx response",
@@ -321,6 +224,157 @@ func (i *Instance) UpdateConfig(
 	}
 	logger.Info().Msg("Successfully updated Caddy configuration")
 	return nil
+}
+
+func (i *Instance) resolveAdminURL(
+	ctx context.Context,
+	method CommunicationMethod,
+	logger zerolog.Logger,
+) (string, error) {
+	switch method {
+	case CommunicationMethodClusterIP:
+		return clusterIPAdminURL(i.ServiceName, i.Namespace), nil
+	case CommunicationMethodDirect:
+		return i.directAdminURL(ctx, logger)
+	case CommunicationMethodHostNetwork:
+		return i.hostNetworkAdminURL(ctx, logger)
+	default:
+		return "", fmt.Errorf("unknown communication method: %d", method)
+	}
+}
+
+func clusterIPAdminURL(serviceName, namespace string) string {
+	return (&url.URL{
+		Scheme: "http",
+		Host: net.JoinHostPort(
+			fmt.Sprintf("%s.%s.svc.cluster.local", serviceName, namespace),
+			"2019",
+		),
+		Path: "/load",
+	}).String()
+}
+
+func (i *Instance) directAdminURL(
+	ctx context.Context,
+	logger zerolog.Logger,
+) (string, error) {
+	pod, err := i.KubeClient.CoreV1().
+		Pods(i.Namespace).
+		Get(ctx, i.PodName, metav1.GetOptions{})
+	if err != nil {
+		logger.Error().Err(err).Msg("Failed to get pod information")
+		return "", fmt.Errorf("failed to get pod info: %w", err)
+	}
+	podIP := pod.Status.PodIP
+	if podIP == "" {
+		return "", stdErrors.New("pod IP is empty")
+	}
+	return (&url.URL{
+		Scheme: "http",
+		Host:   net.JoinHostPort(podIP, "2019"),
+		Path:   "/load",
+	}).String(), nil
+}
+
+func (i *Instance) hostNetworkAdminURL(
+	ctx context.Context,
+	logger zerolog.Logger,
+) (string, error) {
+	node, err := i.KubeClient.CoreV1().
+		Nodes().
+		Get(ctx, i.NodeName, metav1.GetOptions{})
+	if err != nil {
+		logger.Error().Err(err).Msg("Failed to get node information")
+		return "", fmt.Errorf("failed to get node info: %w", err)
+	}
+	nodeIP := preferredNodeIP(node)
+	if nodeIP == "" {
+		return "", stdErrors.New("no IP address found for node")
+	}
+	return (&url.URL{
+		Scheme: "http",
+		Host:   net.JoinHostPort(nodeIP, "2019"),
+		Path:   "/load",
+	}).String(), nil
+}
+
+func preferredNodeIP(node *corev1.Node) string {
+	if node == nil {
+		return ""
+	}
+	if internalIP := nodeAddressByType(node, "InternalIP"); internalIP != "" {
+		return internalIP
+	}
+	return nodeAddressByType(node, "ExternalIP")
+}
+
+func nodeAddressByType(node *corev1.Node, addrType corev1.NodeAddressType) string {
+	for _, addr := range node.Status.Addresses {
+		if addr.Type == addrType {
+			return addr.Address
+		}
+	}
+	return ""
+}
+
+func (i *Instance) buildConfigUpdateRequest(
+	ctx context.Context,
+	adminURL string,
+	configData string,
+	apiConfig *AdminAPIConfig,
+	logger zerolog.Logger,
+) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		adminURL,
+		bytes.NewBufferString(configData),
+	)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "text/caddyfile")
+	if apiConfig == nil || apiConfig.OriginKey == "" {
+		return req, nil
+	}
+	req.Header.Set("Origin", adminOrigin(apiConfig.OriginKey))
+	logger.Debug().
+		Str("origin", req.Header.Get("Origin")).
+		Msg("Added Origin header for admin API security")
+	return req, nil
+}
+
+func (i *Instance) sendConfigUpdateRequest(req *http.Request) (*http.Response, error) {
+	client := buildAdminHTTPClient(nil, configPushTimeout)
+	return doAdminRequest(client, req)
+}
+
+func (i *Instance) logConfigUpdateFailure(
+	statusCode int,
+	body []byte,
+	logger zerolog.Logger,
+) error {
+	err := fmt.Errorf("caddy returned status %d: %s", statusCode, string(body))
+	if statusCode >= 400 && statusCode < 500 {
+		logger.Error().
+			Err(err).
+			Int("status", statusCode).
+			Msg("Caddy configuration update failed with client error")
+		return err
+	}
+	logger.Error().
+		Err(err).
+		Int("status", statusCode).
+		Msg("Caddy configuration update failed")
+	return err
+}
+
+func doAdminRequest(client *http.Client, req *http.Request) (*http.Response, error) {
+	transport := client.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	return transport.RoundTrip(req)
 }
 
 func buildAdminHTTPClient(apiConfig *AdminAPIConfig, timeout time.Duration) *http.Client {

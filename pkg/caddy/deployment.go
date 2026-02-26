@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -16,22 +17,22 @@ import (
 )
 
 const (
-	deploymentTimeout     = 3 * time.Minute
-	deploymentPollDelay   = 5 * time.Second
-	caddyAdminPort        = 2019
-	caddyHTTPPort         = 80
-	caddyHTTPSPort        = 443
-	configMapDefaultMode  = int32(420)
-	hostPortMin           = 1
-	hostPortMax           = 65535
-	caddyContainerName    = "caddy"
-	caddyImagePullPolicy  = corev1.PullPolicy("Always")
-	caddyCapabilityNetAdm = corev1.Capability("NET_ADMIN")
-	caddyCapabilityBind   = corev1.Capability("NET_BIND_SERVICE")
-	caddyCapabilityDrop   = corev1.Capability("ALL")
+	deploymentTimeout      = 3 * time.Minute
+	deploymentPollDelay    = 5 * time.Second
+	caddyAdminPort         = 2019
+	caddyHTTPPort          = 80
+	caddyHTTPSPort         = 443
+	configMapDefaultMode   = int32(420)
+	hostPortMin            = 1
+	hostPortMax            = 65535
+	caddyContainerName     = "caddy"
+	caddyImagePullPolicy   = corev1.PullPolicy("Always")
+	caddyCapabilityNetAdm  = corev1.Capability("NET_ADMIN")
+	caddyCapabilityBind    = corev1.Capability("NET_BIND_SERVICE")
+	caddyCapabilityDrop    = corev1.Capability("ALL")
+	downwardAPIEnvVarCount = 3
 )
 
-//nolint:nestif,gocognit
 func DeployCaddy(
 	ctx context.Context,
 	clientset kubernetes.Interface,
@@ -73,55 +74,124 @@ func DeployCaddy(
 	if err != nil {
 		return nil, err
 	}
-	if !useHostNetwork {
-		_, err = deployService(
-			deployCtx,
-			clientset,
-			instance,
-		)
-		if err != nil {
-			if deploymentCreated {
-				cleanupDeployment(ctx, clientset, instance)
-			}
-			return nil, err
-		}
-		if enableLoadBalancer {
-			_, err = deployLoadBalancerService(deployCtx, clientset, instance)
-			if err != nil {
-				if deploymentCreated {
-					cleanupDeployment(ctx, clientset, instance)
-				}
-				return nil, err
-			}
-		}
-	} else {
+	if err = deployCaddyServices(
+		deployCtx,
+		ctx,
+		clientset,
+		instance,
+		useHostNetwork,
+		enableLoadBalancer,
+		deploymentCreated,
+		logger,
+	); err != nil {
+		return nil, err
+	}
+	if err = waitForDeploymentReadyIfChanged(
+		deployCtx,
+		ctx,
+		clientset,
+		namespace,
+		deploymentName,
+		deploymentChanged,
+		deploymentCreated,
+		instance,
+	); err != nil {
+		return nil, err
+	}
+	if err = resolveAndAssignPodName(
+		deployCtx,
+		ctx,
+		clientset,
+		namespace,
+		nodeName,
+		instance,
+		deploymentCreated,
+		logger,
+	); err != nil {
+		return nil, err
+	}
+	logger.Info().Str("pod", instance.PodName).Msg("Caddy instance deployed successfully")
+	return instance, nil
+}
+
+func deployCaddyServices(
+	deployCtx context.Context,
+	cleanupCtx context.Context,
+	clientset kubernetes.Interface,
+	instance *Instance,
+	useHostNetwork, enableLoadBalancer, deploymentCreated bool,
+	logger zerolog.Logger,
+) error {
+	if useHostNetwork {
 		logger.Info().Msg("Skipping service creation due to hostNetwork mode")
+		return nil
 	}
-	if deploymentChanged {
-		err = waitForDeploymentReady(deployCtx, clientset, namespace, deploymentName)
-		if err != nil {
-			if deploymentCreated {
-				cleanupDeployment(ctx, clientset, instance)
-			}
-			return nil, fmt.Errorf(
-				"deployment %s/%s did not become ready: %w",
-				namespace,
-				deploymentName,
-				err,
-			)
-		}
+	if _, err := deployService(deployCtx, clientset, instance); err != nil {
+		rollbackCreatedDeployment(cleanupCtx, clientset, instance, deploymentCreated)
+		return err
 	}
+	if !enableLoadBalancer {
+		return nil
+	}
+	if _, err := deployLoadBalancerService(deployCtx, clientset, instance); err != nil {
+		rollbackCreatedDeployment(cleanupCtx, clientset, instance, deploymentCreated)
+		return err
+	}
+	return nil
+}
+
+func waitForDeploymentReadyIfChanged(
+	deployCtx context.Context,
+	cleanupCtx context.Context,
+	clientset kubernetes.Interface,
+	namespace, deploymentName string,
+	deploymentChanged, deploymentCreated bool,
+	instance *Instance,
+) error {
+	if !deploymentChanged {
+		return nil
+	}
+	err := waitForDeploymentReady(deployCtx, clientset, namespace, deploymentName)
+	if err == nil {
+		return nil
+	}
+	rollbackCreatedDeployment(cleanupCtx, clientset, instance, deploymentCreated)
+	return fmt.Errorf(
+		"deployment %s/%s did not become ready: %w",
+		namespace,
+		deploymentName,
+		err,
+	)
+}
+
+func resolveAndAssignPodName(
+	deployCtx context.Context,
+	cleanupCtx context.Context,
+	clientset kubernetes.Interface,
+	namespace, nodeName string,
+	instance *Instance,
+	deploymentCreated bool,
+	logger zerolog.Logger,
+) error {
 	podName, err := resolvePodName(deployCtx, clientset, namespace, nodeName)
 	if err != nil {
 		logger.Error().Err(err).Msg("Failed to resolve Caddy pod name")
-		if deploymentCreated {
-			cleanupDeployment(ctx, clientset, instance)
-		}
-		return nil, err
+		rollbackCreatedDeployment(cleanupCtx, clientset, instance, deploymentCreated)
+		return err
 	}
 	instance.PodName = podName
-	logger.Info().Str("pod", instance.PodName).Msg("Caddy instance deployed successfully")
-	return instance, nil
+	return nil
+}
+
+func rollbackCreatedDeployment(
+	ctx context.Context,
+	clientset kubernetes.Interface,
+	instance *Instance,
+	deploymentCreated bool,
+) {
+	if deploymentCreated {
+		cleanupDeployment(ctx, clientset, instance)
+	}
 }
 
 func resolvePodName(
@@ -202,7 +272,6 @@ func SelectNewestActivePodName(pods []corev1.Pod) (string, bool) {
 	return selected.Name, true
 }
 
-//nolint:gocognit,funlen
 func deployDeployment(
 	ctx context.Context,
 	clientset kubernetes.Interface,
@@ -214,14 +283,115 @@ func deployDeployment(
 	httpHostPort, httpsHostPort int,
 ) (bool, bool, error) {
 	logger := log.With().Str("deployment", instance.DeploymentName).Logger()
+	options := deploymentBuildOptions{
+		caddyImage:      caddyImage,
+		envSecretName:   envSecretName,
+		envSecretKeys:   envSecretKeys,
+		dataVolumePVC:   dataVolumePVC,
+		configVolumePVC: configVolumePVC,
+		configMapName:   configMapName,
+		useHostNetwork:  useHostNetwork,
+		httpHostPort:    httpHostPort,
+		httpsHostPort:   httpsHostPort,
+	}
+	deployment, err := buildDesiredDeployment(instance, options, logger)
+	if err != nil {
+		return false, false, err
+	}
+	return upsertDeployment(ctx, clientset, instance, deployment, logger)
+}
+
+type deploymentBuildOptions struct {
+	caddyImage      string
+	envSecretName   string
+	envSecretKeys   []string
+	dataVolumePVC   string
+	configVolumePVC string
+	configMapName   string
+	useHostNetwork  bool
+	httpHostPort    int
+	httpsHostPort   int
+}
+
+func buildDesiredDeployment(
+	instance *Instance,
+	options deploymentBuildOptions,
+	logger zerolog.Logger,
+) (*appsv1.Deployment, error) {
 	replicas := int32(1)
-	containers := []corev1.Container{}
-	caddyContainer := corev1.Container{
-		Name:  caddyContainerName,
-		Image: caddyImage,
-		Ports: []corev1.ContainerPort{
-			{Name: "admin", ContainerPort: caddyAdminPort, Protocol: corev1.ProtocolTCP},
+	labels := map[string]string{
+		"app":                        "caddy",
+		"instance":                   instance.NodeName,
+		"ckic.cmld.ru/caddy-managed": "true",
+	}
+	caddyContainer, err := buildCaddyContainer(options, logger)
+	if err != nil {
+		return nil, err
+	}
+	volumes := buildCaddyVolumes(options, logger)
+	podSpec := corev1.PodSpec{
+		NodeSelector: map[string]string{
+			"kubernetes.io/hostname": instance.NodeName,
 		},
+		Containers: []corev1.Container{caddyContainer},
+		Volumes:    volumes,
+	}
+	if options.useHostNetwork {
+		podSpec.HostNetwork = true
+		podSpec.DNSPolicy = corev1.DNSClusterFirstWithHostNet
+		logger.Info().Msg("Enabled hostNetwork mode")
+	} else {
+		podSpec.DNSPolicy = corev1.DNSClusterFirst
+	}
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      instance.DeploymentName,
+			Namespace: instance.Namespace,
+			Labels:    labels,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Strategy: deploymentStrategy(options.useHostNetwork),
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"app":      "caddy",
+					"instance": instance.NodeName,
+				},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				Spec:       podSpec,
+			},
+		},
+	}, nil
+}
+
+func buildCaddyContainer(
+	options deploymentBuildOptions,
+	logger zerolog.Logger,
+) (corev1.Container, error) {
+	trafficPorts, err := buildTrafficPorts(
+		options.useHostNetwork,
+		options.httpHostPort,
+		options.httpsHostPort,
+		logger,
+	)
+	if err != nil {
+		return corev1.Container{}, err
+	}
+	container := corev1.Container{
+		Name:  caddyContainerName,
+		Image: options.caddyImage,
+		Ports: append(
+			[]corev1.ContainerPort{
+				{
+					Name:          "admin",
+					ContainerPort: caddyAdminPort,
+					Protocol:      corev1.ProtocolTCP,
+				},
+			},
+			trafficPorts...,
+		),
 		VolumeMounts: []corev1.VolumeMount{
 			{
 				Name:      "caddy-config",
@@ -231,6 +401,11 @@ func deployDeployment(
 			{Name: "opt-data", MountPath: "/data"},
 			{Name: "opt-config", MountPath: "/config"},
 		},
+		Env: buildCaddyEnvVars(
+			options.envSecretName,
+			options.envSecretKeys,
+			logger,
+		),
 		ImagePullPolicy: caddyImagePullPolicy,
 		SecurityContext: &corev1.SecurityContext{
 			Capabilities: &corev1.Capabilities{
@@ -239,71 +414,84 @@ func deployDeployment(
 			},
 		},
 	}
-	if useHostNetwork {
-		httpPort32, err := normalizeHostPort(httpHostPort)
-		if err != nil {
-			return false, false, fmt.Errorf("invalid HTTP host port: %w", err)
-		}
-		httpsPort32, err := normalizeHostPort(httpsHostPort)
-		if err != nil {
-			return false, false, fmt.Errorf("invalid HTTPS host port: %w", err)
-		}
-		logger.Info().
-			Int("httpPort", httpHostPort).
-			Int("httpsPort", httpsHostPort).
-			Msg("Configuring hostNetwork with host ports")
-		caddyContainer.Ports = append(caddyContainer.Ports,
-			corev1.ContainerPort{
-				Name:          "http-tcp",
-				ContainerPort: caddyHTTPPort,
-				Protocol:      corev1.ProtocolTCP,
-				HostPort:      httpPort32,
-			},
-			corev1.ContainerPort{
-				Name:          "http-udp",
-				ContainerPort: caddyHTTPPort,
-				Protocol:      corev1.ProtocolUDP,
-				HostPort:      httpPort32,
-			},
-			corev1.ContainerPort{
-				Name:          "https-tcp",
-				ContainerPort: caddyHTTPSPort,
-				Protocol:      corev1.ProtocolTCP,
-				HostPort:      httpsPort32,
-			},
-			corev1.ContainerPort{
-				Name:          "https-udp",
-				ContainerPort: caddyHTTPSPort,
-				Protocol:      corev1.ProtocolUDP,
-				HostPort:      httpsPort32,
-			},
-		)
-	} else {
-		caddyContainer.Ports = append(
-			caddyContainer.Ports,
-			corev1.ContainerPort{
+	return container, nil
+}
+
+func buildTrafficPorts(
+	useHostNetwork bool,
+	httpHostPort, httpsHostPort int,
+	logger zerolog.Logger,
+) ([]corev1.ContainerPort, error) {
+	if !useHostNetwork {
+		return []corev1.ContainerPort{
+			{
 				Name:          "http-tcp",
 				ContainerPort: caddyHTTPPort,
 				Protocol:      corev1.ProtocolTCP,
 			},
-			corev1.ContainerPort{
+			{
 				Name:          "http-udp",
 				ContainerPort: caddyHTTPPort,
 				Protocol:      corev1.ProtocolUDP,
 			},
-			corev1.ContainerPort{
+			{
 				Name:          "https-tcp",
 				ContainerPort: caddyHTTPSPort,
 				Protocol:      corev1.ProtocolTCP,
 			},
-			corev1.ContainerPort{
+			{
 				Name:          "https-udp",
 				ContainerPort: caddyHTTPSPort,
 				Protocol:      corev1.ProtocolUDP,
 			},
-		)
+		}, nil
 	}
-	var envVars []corev1.EnvVar
+	httpPort32, err := normalizeHostPort(httpHostPort)
+	if err != nil {
+		return nil, fmt.Errorf("invalid HTTP host port: %w", err)
+	}
+	httpsPort32, err := normalizeHostPort(httpsHostPort)
+	if err != nil {
+		return nil, fmt.Errorf("invalid HTTPS host port: %w", err)
+	}
+	logger.Info().
+		Int("httpPort", httpHostPort).
+		Int("httpsPort", httpsHostPort).
+		Msg("Configuring hostNetwork with host ports")
+	return []corev1.ContainerPort{
+		{
+			Name:          "http-tcp",
+			ContainerPort: caddyHTTPPort,
+			Protocol:      corev1.ProtocolTCP,
+			HostPort:      httpPort32,
+		},
+		{
+			Name:          "http-udp",
+			ContainerPort: caddyHTTPPort,
+			Protocol:      corev1.ProtocolUDP,
+			HostPort:      httpPort32,
+		},
+		{
+			Name:          "https-tcp",
+			ContainerPort: caddyHTTPSPort,
+			Protocol:      corev1.ProtocolTCP,
+			HostPort:      httpsPort32,
+		},
+		{
+			Name:          "https-udp",
+			ContainerPort: caddyHTTPSPort,
+			Protocol:      corev1.ProtocolUDP,
+			HostPort:      httpsPort32,
+		},
+	}, nil
+}
+
+func buildCaddyEnvVars(
+	envSecretName string,
+	envSecretKeys []string,
+	logger zerolog.Logger,
+) []corev1.EnvVar {
+	envVars := make([]corev1.EnvVar, 0, len(envSecretKeys)+downwardAPIEnvVarCount)
 	if envSecretName != "" && len(envSecretKeys) > 0 {
 		logger.Info().
 			Str("secret", envSecretName).
@@ -323,39 +511,45 @@ func deployDeployment(
 			})
 		}
 	}
-	envVars = append(envVars, corev1.EnvVar{
-		Name: "CKIC_POD_NAME",
-		ValueFrom: &corev1.EnvVarSource{
-			FieldRef: &corev1.ObjectFieldSelector{
-				FieldPath: "metadata.name",
+	return append(envVars,
+		corev1.EnvVar{
+			Name: "CKIC_POD_NAME",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{
+					FieldPath: "metadata.name",
+				},
 			},
 		},
-	})
-	envVars = append(envVars, corev1.EnvVar{
-		Name: "CKIC_NODE_NAME",
-		ValueFrom: &corev1.EnvVarSource{
-			FieldRef: &corev1.ObjectFieldSelector{
-				FieldPath: "spec.nodeName",
+		corev1.EnvVar{
+			Name: "CKIC_NODE_NAME",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{
+					FieldPath: "spec.nodeName",
+				},
 			},
 		},
-	})
-	envVars = append(envVars, corev1.EnvVar{
-		Name: "CKIC_POD_IP",
-		ValueFrom: &corev1.EnvVarSource{
-			FieldRef: &corev1.ObjectFieldSelector{
-				FieldPath: "status.podIP",
+		corev1.EnvVar{
+			Name: "CKIC_POD_IP",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{
+					FieldPath: "status.podIP",
+				},
 			},
 		},
-	})
-	caddyContainer.Env = envVars
-	containers = append(containers, caddyContainer)
+	)
+}
+
+func buildCaddyVolumes(
+	options deploymentBuildOptions,
+	logger zerolog.Logger,
+) []corev1.Volume {
 	volumes := []corev1.Volume{
 		{
 			Name: "caddy-config",
 			VolumeSource: corev1.VolumeSource{
 				ConfigMap: &corev1.ConfigMapVolumeSource{
 					LocalObjectReference: corev1.LocalObjectReference{
-						Name: configMapName,
+						Name: options.configMapName,
 					},
 					Items: []corev1.KeyToPath{
 						{Key: "Caddyfile", Path: "Caddyfile"},
@@ -364,95 +558,66 @@ func deployDeployment(
 			},
 		},
 	}
+	volumes = append(volumes, dataVolume(options.dataVolumePVC, logger))
+	volumes = append(volumes, configVolume(options.configVolumePVC, logger))
+	return volumes
+}
+
+func dataVolume(dataVolumePVC string, logger zerolog.Logger) corev1.Volume {
 	if dataVolumePVC != "" {
 		logger.Info().Str("pvc", dataVolumePVC).Msg("Using PVC for data volume")
-		volumes = append(volumes, corev1.Volume{
+		return corev1.Volume{
 			Name: "opt-data",
 			VolumeSource: corev1.VolumeSource{
 				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
 					ClaimName: dataVolumePVC,
 				},
 			},
-		})
-	} else {
-		logger.Info().Msg("Using HostPath for data volume")
-		volumes = append(volumes, corev1.Volume{
-			Name: "opt-data",
-			VolumeSource: corev1.VolumeSource{
-				HostPath: &corev1.HostPathVolumeSource{
-					Path: "/opt/cmld/caddy/data",
-					Type: hostPathTypePtr(corev1.HostPathDirectoryOrCreate),
-				},
-			},
-		})
+		}
 	}
+	logger.Info().Msg("Using HostPath for data volume")
+	return corev1.Volume{
+		Name: "opt-data",
+		VolumeSource: corev1.VolumeSource{
+			HostPath: &corev1.HostPathVolumeSource{
+				Path: "/opt/cmld/caddy/data",
+				Type: hostPathTypePtr(corev1.HostPathDirectoryOrCreate),
+			},
+		},
+	}
+}
+
+func configVolume(configVolumePVC string, logger zerolog.Logger) corev1.Volume {
 	if configVolumePVC != "" {
 		logger.Info().Str("pvc", configVolumePVC).Msg("Using PVC for config volume")
-		volumes = append(volumes, corev1.Volume{
+		return corev1.Volume{
 			Name: "opt-config",
 			VolumeSource: corev1.VolumeSource{
 				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
 					ClaimName: configVolumePVC,
 				},
 			},
-		})
-	} else {
-		logger.Info().Msg("Using HostPath for config volume")
-		volumes = append(volumes, corev1.Volume{
-			Name: "opt-config",
-			VolumeSource: corev1.VolumeSource{
-				HostPath: &corev1.HostPathVolumeSource{
-					Path: "/opt/cmld/caddy/config",
-					Type: hostPathTypePtr(corev1.HostPathDirectoryOrCreate),
-				},
-			},
-		})
+		}
 	}
-	podSpec := corev1.PodSpec{
-		NodeSelector: map[string]string{
-			"kubernetes.io/hostname": instance.NodeName,
-		},
-		Containers: containers,
-		Volumes:    volumes,
-	}
-	if useHostNetwork {
-		podSpec.HostNetwork = true
-		podSpec.DNSPolicy = corev1.DNSClusterFirstWithHostNet
-		logger.Info().Msg("Enabled hostNetwork mode")
-	} else {
-		podSpec.DNSPolicy = corev1.DNSClusterFirst
-	}
-	deployment := &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      instance.DeploymentName,
-			Namespace: instance.Namespace,
-			Labels: map[string]string{
-				"app":                        "caddy",
-				"instance":                   instance.NodeName,
-				"ckic.cmld.ru/caddy-managed": "true",
-			},
-		},
-		Spec: appsv1.DeploymentSpec{
-			Replicas: &replicas,
-			Strategy: deploymentStrategy(useHostNetwork),
-			Selector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					"app":      "caddy",
-					"instance": instance.NodeName,
-				},
-			},
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{
-						"app":                        "caddy",
-						"instance":                   instance.NodeName,
-						"ckic.cmld.ru/caddy-managed": "true",
-					},
-				},
-				Spec: podSpec,
+	logger.Info().Msg("Using HostPath for config volume")
+	return corev1.Volume{
+		Name: "opt-config",
+		VolumeSource: corev1.VolumeSource{
+			HostPath: &corev1.HostPathVolumeSource{
+				Path: "/opt/cmld/caddy/config",
+				Type: hostPathTypePtr(corev1.HostPathDirectoryOrCreate),
 			},
 		},
 	}
+}
+
+func upsertDeployment(
+	ctx context.Context,
+	clientset kubernetes.Interface,
+	instance *Instance,
+	deployment *appsv1.Deployment,
+	logger zerolog.Logger,
+) (bool, bool, error) {
 	existingDeployment, err := clientset.AppsV1().
 		Deployments(instance.Namespace).
 		Get(ctx, instance.DeploymentName, metav1.GetOptions{})
@@ -475,11 +640,7 @@ func deployDeployment(
 			)
 		}
 		logger.Info().Msg("Updated existing Caddy deployment")
-		if cleanupErr := clientset.PolicyV1().
-			PodDisruptionBudgets(instance.Namespace).
-			Delete(ctx, instance.DeploymentName, metav1.DeleteOptions{}); cleanupErr == nil {
-			logger.Info().Msg("Deleted legacy PodDisruptionBudget")
-		}
+		deleteLegacyPodDisruptionBudget(ctx, clientset, instance, logger)
 		return true, false, nil
 	case apierrors.IsNotFound(err):
 		_, err = clientset.AppsV1().
@@ -494,11 +655,7 @@ func deployDeployment(
 			)
 		}
 		logger.Info().Msg("Created Caddy deployment")
-		if cleanupErr := clientset.PolicyV1().
-			PodDisruptionBudgets(instance.Namespace).
-			Delete(ctx, instance.DeploymentName, metav1.DeleteOptions{}); cleanupErr == nil {
-			logger.Info().Msg("Deleted legacy PodDisruptionBudget")
-		}
+		deleteLegacyPodDisruptionBudget(ctx, clientset, instance, logger)
 		return true, true, nil
 	default:
 		logger.Error().Err(err).Msg("Failed to fetch existing Caddy deployment")
@@ -507,6 +664,19 @@ func deployDeployment(
 			instance.DeploymentName,
 			err,
 		)
+	}
+}
+
+func deleteLegacyPodDisruptionBudget(
+	ctx context.Context,
+	clientset kubernetes.Interface,
+	instance *Instance,
+	logger zerolog.Logger,
+) {
+	if cleanupErr := clientset.PolicyV1().
+		PodDisruptionBudgets(instance.Namespace).
+		Delete(ctx, instance.DeploymentName, metav1.DeleteOptions{}); cleanupErr == nil {
+		logger.Info().Msg("Deleted legacy PodDisruptionBudget")
 	}
 }
 

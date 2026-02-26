@@ -103,7 +103,6 @@ func (w *ExternalConfigWatcher) isNamespaceAllowed(namespace string) bool {
 	}
 }
 
-//nolint:gocognit,funlen
 func (w *ExternalConfigWatcher) Start(ctx context.Context) {
 	logger := log.With().Str("component", "external_config_watcher").Logger()
 	logger.Info().
@@ -125,61 +124,102 @@ func (w *ExternalConfigWatcher) Start(ctx context.Context) {
 			return
 		default:
 		}
-		watchOptions := metav1.ListOptions{
-			LabelSelector:   w.labelSelector,
-			ResourceVersion: w.lastResourceVersion,
+		newDelay, keepRunning := w.runWatchCycle(
+			ctx,
+			logger,
+			delay,
+			maxDelay,
+			multiplier,
+		)
+		if !keepRunning {
+			return
 		}
-		watcher, err := w.clientset.CoreV1().ConfigMaps("").Watch(ctx, watchOptions)
-		if err != nil {
-			delay = w.handleWatchCreateError(
-				ctx,
-				logger,
-				err,
-				delay,
-				maxDelay,
-				multiplier,
-			)
-			continue
-		}
-		delay = constants.ConfigMapWatcherInitialDelay
-		for event := range watcher.ResultChan() {
-			select {
-			case <-ctx.Done():
-				watcher.Stop()
-				logger.Info().Msg("External config watcher shutting down")
-				return
-			default:
-			}
-			if event.Type == watch.Error {
-				w.handleWatchErrorEvent(ctx, logger, event)
-				break
-			}
-			cm, ok := event.Object.(*corev1.ConfigMap)
-			if !ok {
-				logger.Warn().Msg("Unexpected object in external ConfigMap watch")
-				continue
-			}
-			w.lastResourceVersion = cm.ResourceVersion
-			if !w.isNamespaceAllowed(cm.Namespace) {
-				logger.Debug().
-					Str("namespace", cm.Namespace).
-					Msg("Skipping ConfigMap from excluded namespace")
-				continue
-			}
-			switch event.Type {
-			case watch.Added, watch.Modified:
-				w.handleWatchUpsert(cm, event.Type, logger)
-			case watch.Deleted:
-				w.handleWatchDelete(cm, logger)
-			case watch.Bookmark:
-				logger.Debug().Msg("Received external ConfigMap bookmark event")
-			case watch.Error:
-			}
-		}
-		logger.Info().Msg("External ConfigMap watch channel closed, restarting")
-		time.Sleep(delay)
-		delay = minExternalDuration(time.Duration(float64(delay)*multiplier), maxDelay)
+		delay = newDelay
 	}
+}
+
+func (w *ExternalConfigWatcher) runWatchCycle(
+	ctx context.Context,
+	logger zerolog.Logger,
+	delay, maxDelay time.Duration,
+	multiplier float64,
+) (time.Duration, bool) {
+	watchOptions := metav1.ListOptions{
+		LabelSelector:   w.labelSelector,
+		ResourceVersion: w.lastResourceVersion,
+	}
+	watcher, err := w.clientset.CoreV1().ConfigMaps("").Watch(ctx, watchOptions)
+	if err != nil {
+		nextDelay := w.handleWatchCreateError(
+			ctx,
+			logger,
+			err,
+			delay,
+			maxDelay,
+			multiplier,
+		)
+		return nextDelay, true
+	}
+	delay = constants.ConfigMapWatcherInitialDelay
+	if !w.consumeExternalEvents(ctx, watcher, logger) {
+		return delay, false
+	}
+	logger.Info().Msg("External ConfigMap watch channel closed, restarting")
+	time.Sleep(delay)
+	return minExternalDuration(time.Duration(float64(delay)*multiplier), maxDelay), true
+}
+
+func (w *ExternalConfigWatcher) consumeExternalEvents(
+	ctx context.Context,
+	watcher watch.Interface,
+	logger zerolog.Logger,
+) bool {
+	for event := range watcher.ResultChan() {
+		select {
+		case <-ctx.Done():
+			watcher.Stop()
+			logger.Info().Msg("External config watcher shutting down")
+			return false
+		default:
+		}
+		if w.handleExternalEvent(ctx, event, logger) {
+			return true
+		}
+	}
+	return true
+}
+
+func (w *ExternalConfigWatcher) handleExternalEvent(
+	ctx context.Context,
+	event watch.Event,
+	logger zerolog.Logger,
+) bool {
+	if event.Type == watch.Error {
+		w.handleWatchErrorEvent(ctx, logger, event)
+		return true
+	}
+	cm, ok := event.Object.(*corev1.ConfigMap)
+	if !ok {
+		logger.Warn().Msg("Unexpected object in external ConfigMap watch")
+		return false
+	}
+	w.lastResourceVersion = cm.ResourceVersion
+	if !w.isNamespaceAllowed(cm.Namespace) {
+		logger.Debug().
+			Str("namespace", cm.Namespace).
+			Msg("Skipping ConfigMap from excluded namespace")
+		return false
+	}
+	switch event.Type {
+	case watch.Added, watch.Modified:
+		w.handleWatchUpsert(cm, event.Type, logger)
+	case watch.Deleted:
+		w.handleWatchDelete(cm, logger)
+	case watch.Bookmark:
+		logger.Debug().Msg("Received external ConfigMap bookmark event")
+	case watch.Error:
+	}
+	return false
 }
 
 func (w *ExternalConfigWatcher) handleWatchUpsert(

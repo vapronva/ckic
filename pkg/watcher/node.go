@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -45,7 +46,6 @@ type NodeWatcher struct {
 
 func normalizeLegacyNodeSelector(labelSelector string) string {
 	const legacyNodeSelectorParts = 2
-
 	selector := strings.TrimSpace(labelSelector)
 	if strings.Count(selector, ":") != 1 {
 		return selector
@@ -99,7 +99,6 @@ func NewNodeWatcher(
 	}, nil
 }
 
-//nolint:gocognit,cyclop,funlen
 func (w *NodeWatcher) Start(ctx context.Context) {
 	logger := log.With().
 		Str("component", "node_watcher").
@@ -112,113 +111,144 @@ func (w *NodeWatcher) Start(ctx context.Context) {
 			logger.Info().Msg("Node watcher shutting down")
 			return
 		default:
-			nodes, err := w.clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{
-				LabelSelector: w.labelSelector,
-			})
-			if err != nil {
-				logger.Error().Err(err).Msg("Failed to list nodes")
-				time.Sleep(nodeListRetryDelay)
-				continue
-			}
-			var addedNodes []string
-			var removedNodes []string
-			newNodes := make(map[string]bool, len(nodes.Items))
-			for _, node := range nodes.Items {
-				newNodes[node.Name] = true
-			}
-			w.mu.Lock()
-			if w.currentNodes == nil {
-				w.currentNodes = make(map[string]bool)
-			}
-			for nodeName := range newNodes {
-				if !w.currentNodes[nodeName] {
-					addedNodes = append(addedNodes, nodeName)
-				}
-			}
-			for nodeName := range w.currentNodes {
-				if !newNodes[nodeName] {
-					removedNodes = append(removedNodes, nodeName)
-				}
-			}
-			w.currentNodes = newNodes
-			w.mu.Unlock()
-			for _, nodeName := range addedNodes {
-				w.nodeHandler(NodeEvent{
-					Type:     NodeAdded,
-					NodeName: nodeName,
-				})
-			}
-			for _, nodeName := range removedNodes {
-				w.nodeHandler(NodeEvent{
-					Type:     NodeRemoved,
-					NodeName: nodeName,
-				})
-			}
-			watcher, err := w.clientset.CoreV1().Nodes().Watch(ctx, metav1.ListOptions{
-				LabelSelector: w.labelSelector,
-			})
-			if err != nil {
-				logger.Error().Err(err).Msg("Failed to create node watcher")
-				time.Sleep(nodeListRetryDelay)
-				continue
-			}
-			watchChan := watcher.ResultChan()
-		watchLoop:
-			for {
-				select {
-				case <-ctx.Done():
-					watcher.Stop()
-					logger.Info().Msg("Node watcher shutting down")
-					return
-				case event, ok := <-watchChan:
-					if !ok {
-						break watchLoop
-					}
-					if event.Type == watch.Error {
-						logger.Error().Msg("Error watching nodes")
-						break watchLoop
-					}
-					node, ok := event.Object.(*v1.Node)
-					if !ok {
-						logger.Warn().Msg("Unexpected object type in node watcher")
-						continue
-					}
-					var notifyAdd bool
-					var notifyRemove bool
-					w.mu.Lock()
-					if w.currentNodes == nil {
-						w.currentNodes = make(map[string]bool)
-					}
-					wasTracked := w.currentNodes[node.Name]
-					if event.Type == watch.Deleted {
-						if wasTracked {
-							delete(w.currentNodes, node.Name)
-							notifyRemove = true
-						}
-						w.mu.Unlock()
-						if notifyRemove {
-							w.nodeHandler(NodeEvent{
-								Type:     NodeRemoved,
-								NodeName: node.Name,
-							})
-						}
-						continue
-					}
-					if (event.Type == watch.Added || event.Type == watch.Modified) && !wasTracked {
-						w.currentNodes[node.Name] = true
-						notifyAdd = true
-					}
-					w.mu.Unlock()
-					if notifyAdd {
-						w.nodeHandler(NodeEvent{
-							Type:     NodeAdded,
-							NodeName: node.Name,
-						})
-					}
-				}
-			}
-			logger.Info().Msg("Node watcher channel closed, restarting")
-			time.Sleep(nodeWatchRetryDelay)
+		}
+		if err := w.syncCurrentNodes(ctx); err != nil {
+			logger.Error().Err(err).Msg("Failed to list nodes")
+			time.Sleep(nodeListRetryDelay)
+			continue
+		}
+		watcher, err := w.clientset.CoreV1().Nodes().Watch(ctx, metav1.ListOptions{
+			LabelSelector: w.labelSelector,
+		})
+		if err != nil {
+			logger.Error().Err(err).Msg("Failed to create node watcher")
+			time.Sleep(nodeListRetryDelay)
+			continue
+		}
+		if !w.consumeWatchEvents(ctx, watcher, logger) {
+			return
+		}
+		logger.Info().Msg("Node watcher channel closed, restarting")
+		time.Sleep(nodeWatchRetryDelay)
+	}
+}
+
+func (w *NodeWatcher) syncCurrentNodes(ctx context.Context) error {
+	nodes, err := w.clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{
+		LabelSelector: w.labelSelector,
+	})
+	if err != nil {
+		return err
+	}
+	newNodes := make(map[string]bool, len(nodes.Items))
+	for _, node := range nodes.Items {
+		newNodes[node.Name] = true
+	}
+	addedNodes, removedNodes := w.replaceCurrentNodes(newNodes)
+	w.emitNodeEvents(NodeAdded, addedNodes)
+	w.emitNodeEvents(NodeRemoved, removedNodes)
+	return nil
+}
+
+func (w *NodeWatcher) replaceCurrentNodes(
+	newNodes map[string]bool,
+) ([]string, []string) {
+	var addedNodes []string
+	var removedNodes []string
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.currentNodes == nil {
+		w.currentNodes = make(map[string]bool)
+	}
+	for nodeName := range newNodes {
+		if !w.currentNodes[nodeName] {
+			addedNodes = append(addedNodes, nodeName)
 		}
 	}
+	for nodeName := range w.currentNodes {
+		if !newNodes[nodeName] {
+			removedNodes = append(removedNodes, nodeName)
+		}
+	}
+	w.currentNodes = newNodes
+	return addedNodes, removedNodes
+}
+
+func (w *NodeWatcher) emitNodeEvents(eventType NodeEventType, nodeNames []string) {
+	for _, nodeName := range nodeNames {
+		w.nodeHandler(NodeEvent{
+			Type:     eventType,
+			NodeName: nodeName,
+		})
+	}
+}
+
+func (w *NodeWatcher) consumeWatchEvents(
+	ctx context.Context,
+	watcher watch.Interface,
+	logger zerolog.Logger,
+) bool {
+	watchChan := watcher.ResultChan()
+	for {
+		select {
+		case <-ctx.Done():
+			watcher.Stop()
+			logger.Info().Msg("Node watcher shutting down")
+			return false
+		case event, ok := <-watchChan:
+			if !ok {
+				return true
+			}
+			if w.handleNodeWatchEvent(event, logger) {
+				return true
+			}
+		}
+	}
+}
+
+func (w *NodeWatcher) handleNodeWatchEvent(
+	event watch.Event,
+	logger zerolog.Logger,
+) bool {
+	if event.Type == watch.Error {
+		logger.Error().Msg("Error watching nodes")
+		return true
+	}
+	node, ok := event.Object.(*v1.Node)
+	if !ok {
+		logger.Warn().Msg("Unexpected object type in node watcher")
+		return false
+	}
+	notifyAdd, notifyRemove := w.applyNodeWatchEvent(event.Type, node.Name)
+	if notifyAdd {
+		w.emitNodeEvents(NodeAdded, []string{node.Name})
+	}
+	if notifyRemove {
+		w.emitNodeEvents(NodeRemoved, []string{node.Name})
+	}
+	return false
+}
+
+func (w *NodeWatcher) applyNodeWatchEvent(
+	eventType watch.EventType,
+	nodeName string,
+) (bool, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.currentNodes == nil {
+		w.currentNodes = make(map[string]bool)
+	}
+	wasTracked := w.currentNodes[nodeName]
+	if eventType == watch.Deleted {
+		if !wasTracked {
+			return false, false
+		}
+		delete(w.currentNodes, nodeName)
+		return false, true
+	}
+	if (eventType == watch.Added || eventType == watch.Modified) && !wasTracked {
+		w.currentNodes[nodeName] = true
+		return true, false
+	}
+	return false, false
 }

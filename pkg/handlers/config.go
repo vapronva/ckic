@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"k8s.io/client-go/kubernetes"
 
@@ -43,6 +44,11 @@ type ConfigHandler struct {
 type failedInstance struct {
 	nodeName string
 	instance *caddy.Instance
+}
+
+type configUpdateResult struct {
+	successfulNodes []string
+	failedInstances []failedInstance
 }
 
 const (
@@ -90,33 +96,15 @@ func NewConfigHandler(
 	}
 }
 
-//nolint:gocognit,nestif,funlen,cyclop
 func (h *ConfigHandler) Handle(configData string) {
 	h.handleMu.Lock()
 	defer h.handleMu.Unlock()
-	if h.instanceDigests == nil {
-		h.instanceDigests = make(map[string]string)
-	}
-	if h.instanceSignatures == nil {
-		h.instanceSignatures = make(map[string]string)
-	}
+	h.ensureTrackingMaps()
 	logger := log.With().Str("component", "config_handler").Logger()
 	configDigest := calculateConfigDigest(configData)
 	logger.Info().Msg("Detected configuration change, updating Caddy instances")
-	h.Mu.RLock()
-	instancesCopy := make(map[string]*caddy.Instance)
-	maps.Copy(instancesCopy, h.DeployedInstances)
-	h.Mu.RUnlock()
-	for nodeName := range h.instanceDigests {
-		if _, exists := instancesCopy[nodeName]; !exists {
-			delete(h.instanceDigests, nodeName)
-		}
-	}
-	for nodeName := range h.instanceSignatures {
-		if _, exists := instancesCopy[nodeName]; !exists {
-			delete(h.instanceSignatures, nodeName)
-		}
-	}
+	instancesCopy := h.snapshotInstances()
+	h.pruneTrackingMaps(instancesCopy)
 	if len(instancesCopy) == 0 {
 		h.lastConfigDigest = configDigest
 		logger.Debug().
@@ -132,197 +120,350 @@ func (h *ConfigHandler) Handle(configData string) {
 		return
 	}
 	time.Sleep(constants.ConfigUpdateDelay)
-	var wg sync.WaitGroup
-	var muFailed sync.Mutex
-	var muSuccess sync.Mutex
-	var failedInstances []failedInstance
-	var successfulNodes []string
-	semaphore := make(chan struct{}, configUpdateConcurrency)
-	var apiConfig *caddy.AdminAPIConfig
-	if h.CaddyAdminOriginKey != "" {
-		apiConfig = &caddy.AdminAPIConfig{
-			OriginKey: h.CaddyAdminOriginKey,
+	updateResult := h.updateAllInstances(
+		instancesCopy,
+		configData,
+		h.adminAPIConfig(),
+		logger,
+	)
+	h.applySuccessfulUpdates(updateResult.successfulNodes, instancesCopy, configDigest)
+	h.redeployFailedInstances(updateResult.failedInstances, configDigest, logger)
+	if h.allCurrentInstancesConverged(configDigest) {
+		h.lastConfigDigest = configDigest
+	}
+}
+
+func (h *ConfigHandler) ensureTrackingMaps() {
+	if h.instanceDigests == nil {
+		h.instanceDigests = make(map[string]string)
+	}
+	if h.instanceSignatures == nil {
+		h.instanceSignatures = make(map[string]string)
+	}
+}
+
+func (h *ConfigHandler) snapshotInstances() map[string]*caddy.Instance {
+	h.Mu.RLock()
+	defer h.Mu.RUnlock()
+	instancesCopy := make(map[string]*caddy.Instance, len(h.DeployedInstances))
+	maps.Copy(instancesCopy, h.DeployedInstances)
+	return instancesCopy
+}
+
+func (h *ConfigHandler) pruneTrackingMaps(instancesCopy map[string]*caddy.Instance) {
+	for nodeName := range h.instanceDigests {
+		if _, exists := instancesCopy[nodeName]; !exists {
+			delete(h.instanceDigests, nodeName)
 		}
 	}
+	for nodeName := range h.instanceSignatures {
+		if _, exists := instancesCopy[nodeName]; !exists {
+			delete(h.instanceSignatures, nodeName)
+		}
+	}
+}
+
+func (h *ConfigHandler) adminAPIConfig() *caddy.AdminAPIConfig {
+	if h.CaddyAdminOriginKey == "" {
+		return nil
+	}
+	return &caddy.AdminAPIConfig{OriginKey: h.CaddyAdminOriginKey}
+}
+
+func (h *ConfigHandler) updateAllInstances(
+	instancesCopy map[string]*caddy.Instance,
+	effectiveConfig string,
+	apiConfig *caddy.AdminAPIConfig,
+	logger zerolog.Logger,
+) configUpdateResult {
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	result := configUpdateResult{
+		successfulNodes: make([]string, 0, len(instancesCopy)),
+		failedInstances: make([]failedInstance, 0),
+	}
+	semaphore := make(chan struct{}, configUpdateConcurrency)
 	for nodeName, instance := range instancesCopy {
 		wg.Add(1)
 		go func(nodeName string, instance *caddy.Instance) {
 			defer wg.Done()
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
-			instanceLogger := logger.With().Str("node", nodeName).Logger()
-			instanceLogger.Debug().Msg("Updating Caddy configuration")
-			var err error
-			for retry := range configUpdateRetryCount {
-				if retry > 0 {
-					instanceLogger.Info().
-						Int("retry", retry).
-						Msg("Retrying configuration update")
-					time.Sleep(time.Duration(retry*configUpdateRetryFactor) * time.Second)
-				}
-				err = instance.UpdateConfig(
-					context.Background(),
-					configData,
-					h.CommunicationMethod,
-					apiConfig,
-				)
-				if err == nil {
-					break
-				}
-			}
-			if err != nil {
-				instanceLogger.Error().
-					Err(err).
-					Msg("Failed to update Caddy configuration")
-				var newCount int32
-				h.Mu.RLock()
-				current := h.DeployedInstances[nodeName] == instance
-				if current {
-					newCount = instance.FailureCount.Add(1)
-				}
-				h.Mu.RUnlock()
-				if !current {
-					instanceLogger.Debug().
-						Msg("Instance replaced during update, skipping failure tracking")
-					return
-				}
-				if newCount >= maxInstanceFailureCount {
-					instanceLogger.Warn().
-						Msg("Too many update failures, marking for redeployment")
-					muFailed.Lock()
-					failedInstances = append(failedInstances, failedInstance{
-						nodeName: nodeName,
-						instance: instance,
-					})
-					muFailed.Unlock()
-				}
-			} else {
-				instanceLogger.Info().Msg("Successfully updated Caddy configuration")
-				h.Mu.RLock()
-				current := h.DeployedInstances[nodeName] == instance
-				if current {
-					instance.FailureCount.Store(0)
-				}
-				h.Mu.RUnlock()
-				if !current {
-					instanceLogger.Debug().
-						Msg("Instance replaced during update, skipping failure reset")
-					return
-				}
-				muSuccess.Lock()
-				successfulNodes = append(successfulNodes, nodeName)
-				muSuccess.Unlock()
+			if failed, successfulNode, hasFailure := h.updateSingleInstance(
+				nodeName,
+				instance,
+				effectiveConfig,
+				apiConfig,
+				logger,
+			); hasFailure {
+				mu.Lock()
+				result.failedInstances = append(result.failedInstances, failed)
+				mu.Unlock()
+			} else if successfulNode != "" {
+				mu.Lock()
+				result.successfulNodes = append(result.successfulNodes, successfulNode)
+				mu.Unlock()
 			}
 		}(nodeName, instance)
 	}
 	wg.Wait()
+	return result
+}
+
+func (h *ConfigHandler) updateSingleInstance(
+	nodeName string,
+	instance *caddy.Instance,
+	effectiveConfig string,
+	apiConfig *caddy.AdminAPIConfig,
+	logger zerolog.Logger,
+) (failedInstance, string, bool) {
+	instanceLogger := logger.With().Str("node", nodeName).Logger()
+	instanceLogger.Debug().Msg("Updating Caddy configuration")
+	err := h.updateInstanceWithRetry(
+		instance,
+		effectiveConfig,
+		apiConfig,
+		instanceLogger,
+	)
+	if err != nil {
+		return h.handleInstanceUpdateFailure(nodeName, instance, err, instanceLogger)
+	}
+	return h.handleInstanceUpdateSuccess(nodeName, instance, instanceLogger)
+}
+
+func (h *ConfigHandler) updateInstanceWithRetry(
+	instance *caddy.Instance,
+	effectiveConfig string,
+	apiConfig *caddy.AdminAPIConfig,
+	instanceLogger zerolog.Logger,
+) error {
+	var err error
+	for retry := range configUpdateRetryCount {
+		if retry > 0 {
+			instanceLogger.Info().
+				Int("retry", retry).
+				Msg("Retrying configuration update")
+			time.Sleep(time.Duration(retry*configUpdateRetryFactor) * time.Second)
+		}
+		err = instance.UpdateConfig(
+			context.Background(),
+			effectiveConfig,
+			h.CommunicationMethod,
+			apiConfig,
+		)
+		if err == nil {
+			return nil
+		}
+	}
+	return err
+}
+
+func (h *ConfigHandler) handleInstanceUpdateFailure(
+	nodeName string,
+	instance *caddy.Instance,
+	updateErr error,
+	instanceLogger zerolog.Logger,
+) (failedInstance, string, bool) {
+	instanceLogger.Error().
+		Err(updateErr).
+		Msg("Failed to update Caddy configuration")
+	h.Mu.RLock()
+	current := h.DeployedInstances[nodeName] == instance
+	var newCount int32
+	if current {
+		newCount = instance.FailureCount.Add(1)
+	}
+	h.Mu.RUnlock()
+	if !current {
+		instanceLogger.Debug().
+			Msg("Instance replaced during update, skipping failure tracking")
+		return failedInstance{}, "", false
+	}
+	if newCount < maxInstanceFailureCount {
+		return failedInstance{}, "", false
+	}
+	instanceLogger.Warn().
+		Msg("Too many update failures, marking for redeployment")
+	return failedInstance{
+		nodeName: nodeName,
+		instance: instance,
+	}, "", true
+}
+
+func (h *ConfigHandler) handleInstanceUpdateSuccess(
+	nodeName string,
+	instance *caddy.Instance,
+	instanceLogger zerolog.Logger,
+) (failedInstance, string, bool) {
+	instanceLogger.Info().Msg("Successfully updated Caddy configuration")
+	h.Mu.RLock()
+	current := h.DeployedInstances[nodeName] == instance
+	if current {
+		instance.FailureCount.Store(0)
+	}
+	h.Mu.RUnlock()
+	if !current {
+		instanceLogger.Debug().
+			Msg("Instance replaced during update, skipping failure reset")
+		return failedInstance{}, "", false
+	}
+	return failedInstance{}, nodeName, false
+}
+
+func (h *ConfigHandler) applySuccessfulUpdates(
+	successfulNodes []string,
+	instancesCopy map[string]*caddy.Instance,
+	configDigest string,
+) {
 	for _, nodeName := range successfulNodes {
 		h.instanceDigests[nodeName] = configDigest
 		if instance, exists := instancesCopy[nodeName]; exists {
 			h.instanceSignatures[nodeName] = instanceStateSignature(instance)
 		}
 	}
-	if len(failedInstances) > 0 {
-		logger.Info().Msgf("Redeploying %d failed instances", len(failedInstances))
-		for _, failed := range failedInstances {
-			h.Mu.Lock()
-			current := h.DeployedInstances[failed.nodeName]
-			if current == nil {
-				h.Mu.Unlock()
-				logger.Debug().
-					Str("node", failed.nodeName).
-					Msg("Failed instance no longer exists, skipping redeployment")
-				continue
-			}
-			if current != failed.instance {
-				h.Mu.Unlock()
-				logger.Debug().
-					Str("node", failed.nodeName).
-					Msg("Failed instance was replaced, skipping redeployment")
-				continue
-			}
-			delete(h.DeployedInstances, failed.nodeName)
-			h.Mu.Unlock()
-			logger.Info().
+}
+
+func (h *ConfigHandler) redeployFailedInstances(
+	failedInstances []failedInstance,
+	configDigest string,
+	logger zerolog.Logger,
+) {
+	if len(failedInstances) == 0 {
+		return
+	}
+	logger.Info().Msgf("Redeploying %d failed instances", len(failedInstances))
+	for _, failed := range failedInstances {
+		h.redeployFailedInstance(failed, configDigest, logger)
+	}
+}
+
+func (h *ConfigHandler) redeployFailedInstance(
+	failed failedInstance,
+	configDigest string,
+	logger zerolog.Logger,
+) {
+	current, shouldRedeploy := h.prepareFailedInstanceRedeploy(failed, logger)
+	if !shouldRedeploy {
+		return
+	}
+	if deleteErr := failed.instance.Delete(); deleteErr != nil {
+		logger.Error().
+			Err(deleteErr).
+			Str("node", failed.nodeName).
+			Msg("Failed to delete failed Caddy instance")
+		h.restoreFailedInstanceIfMissing(failed.nodeName, current)
+		h.clearInstanceTracking(failed.nodeName)
+		return
+	}
+	newInstance, redeployErr := h.deployReplacementInstance(failed.nodeName)
+	if redeployErr != nil {
+		logger.Error().
+			Err(redeployErr).
+			Str("node", failed.nodeName).
+			Msg("Failed to redeploy Caddy instance")
+		h.restoreFailedInstanceIfMissing(failed.nodeName, current)
+		h.clearInstanceTracking(failed.nodeName)
+		return
+	}
+	if !h.registerReplacementInstance(failed.nodeName, newInstance) {
+		logger.Debug().
+			Str("node", failed.nodeName).
+			Msg("Failed instance was replaced during redeployment; cleaning up stale redeploy")
+		if cleanupErr := newInstance.Delete(); cleanupErr != nil {
+			logger.Warn().
+				Err(cleanupErr).
 				Str("node", failed.nodeName).
-				Msg("Redeploying failed Caddy instance")
-			if err := failed.instance.Delete(); err != nil {
-				logger.Error().
-					Err(err).
-					Str("node", failed.nodeName).
-					Msg("Failed to delete failed Caddy instance")
-				h.Mu.Lock()
-				if _, exists := h.DeployedInstances[failed.nodeName]; !exists {
-					h.DeployedInstances[failed.nodeName] = failed.instance
-				}
-				h.Mu.Unlock()
-				delete(h.instanceDigests, failed.nodeName)
-				delete(h.instanceSignatures, failed.nodeName)
-				continue
-			}
-			externalIPs := h.ExternalEndpoints[failed.nodeName]
-			newInstance, err := caddy.DeployCaddy(
-				context.Background(),
-				h.Clientset,
-				failed.nodeName,
-				h.Namespace,
-				h.CaddyImage,
-				h.EnableLoadBalancer,
-				externalIPs,
-				h.EnvSecretName,
-				h.EnvSecretKeys,
-				h.DataVolumePVC,
-				h.ConfigVolumePVC,
-				h.ConfigMapName,
-				h.UseHostNetwork,
-				h.HTTPHostPort,
-				h.HTTPSHostPort,
-			)
-			if err != nil {
-				logger.Error().
-					Err(err).
-					Str("node", failed.nodeName).
-					Msg("Failed to redeploy Caddy instance")
-				h.Mu.Lock()
-				if _, exists := h.DeployedInstances[failed.nodeName]; !exists {
-					h.DeployedInstances[failed.nodeName] = failed.instance
-				}
-				h.Mu.Unlock()
-				delete(h.instanceDigests, failed.nodeName)
-				delete(h.instanceSignatures, failed.nodeName)
-				continue
-			}
-			replaced := false
-			h.Mu.Lock()
-			if _, exists := h.DeployedInstances[failed.nodeName]; !exists {
-				h.DeployedInstances[failed.nodeName] = newInstance
-				replaced = true
-			}
-			h.Mu.Unlock()
-			if !replaced {
-				logger.Debug().
-					Str("node", failed.nodeName).
-					Msg("Failed instance was replaced during redeployment; cleaning up stale redeploy")
-				if cleanupErr := newInstance.Delete(); cleanupErr != nil {
-					logger.Warn().
-						Err(cleanupErr).
-						Str("node", failed.nodeName).
-						Msg("Failed to clean up stale redeployed Caddy instance")
-				}
-				delete(h.instanceDigests, failed.nodeName)
-				delete(h.instanceSignatures, failed.nodeName)
-				continue
-			}
-			h.instanceDigests[failed.nodeName] = configDigest
-			h.instanceSignatures[failed.nodeName] = instanceStateSignature(newInstance)
-			logger.Info().
-				Str("node", failed.nodeName).
-				Msg("Successfully redeployed Caddy instance")
+				Msg("Failed to clean up stale redeployed Caddy instance")
 		}
+		h.clearInstanceTracking(failed.nodeName)
+		return
 	}
-	if h.allCurrentInstancesConverged(configDigest) {
-		h.lastConfigDigest = configDigest
+	h.instanceDigests[failed.nodeName] = configDigest
+	h.instanceSignatures[failed.nodeName] = instanceStateSignature(newInstance)
+	logger.Info().
+		Str("node", failed.nodeName).
+		Msg("Successfully redeployed Caddy instance")
+}
+
+func (h *ConfigHandler) prepareFailedInstanceRedeploy(
+	failed failedInstance,
+	logger zerolog.Logger,
+) (*caddy.Instance, bool) {
+	h.Mu.Lock()
+	defer h.Mu.Unlock()
+	current := h.DeployedInstances[failed.nodeName]
+	if current == nil {
+		logger.Debug().
+			Str("node", failed.nodeName).
+			Msg("Failed instance no longer exists, skipping redeployment")
+		return nil, false
 	}
+	if current != failed.instance {
+		logger.Debug().
+			Str("node", failed.nodeName).
+			Msg("Failed instance was replaced, skipping redeployment")
+		return nil, false
+	}
+	delete(h.DeployedInstances, failed.nodeName)
+	logger.Info().
+		Str("node", failed.nodeName).
+		Msg("Redeploying failed Caddy instance")
+	return current, true
+}
+
+func (h *ConfigHandler) restoreFailedInstanceIfMissing(
+	nodeName string,
+	instance *caddy.Instance,
+) {
+	if instance == nil {
+		return
+	}
+	h.Mu.Lock()
+	if _, exists := h.DeployedInstances[nodeName]; !exists {
+		h.DeployedInstances[nodeName] = instance
+	}
+	h.Mu.Unlock()
+}
+
+func (h *ConfigHandler) clearInstanceTracking(nodeName string) {
+	delete(h.instanceDigests, nodeName)
+	delete(h.instanceSignatures, nodeName)
+}
+
+func (h *ConfigHandler) deployReplacementInstance(
+	nodeName string,
+) (*caddy.Instance, error) {
+	externalIPs := h.ExternalEndpoints[nodeName]
+	return caddy.DeployCaddy(
+		context.Background(),
+		h.Clientset,
+		nodeName,
+		h.Namespace,
+		h.CaddyImage,
+		h.EnableLoadBalancer,
+		externalIPs,
+		h.EnvSecretName,
+		h.EnvSecretKeys,
+		h.DataVolumePVC,
+		h.ConfigVolumePVC,
+		h.ConfigMapName,
+		h.UseHostNetwork,
+		h.HTTPHostPort,
+		h.HTTPSHostPort,
+	)
+}
+
+func (h *ConfigHandler) registerReplacementInstance(
+	nodeName string,
+	newInstance *caddy.Instance,
+) bool {
+	h.Mu.Lock()
+	defer h.Mu.Unlock()
+	if _, exists := h.DeployedInstances[nodeName]; exists {
+		return false
+	}
+	h.DeployedInstances[nodeName] = newInstance
+	return true
 }
 
 func (h *ConfigHandler) allInstancesAtDigest(

@@ -164,212 +164,279 @@ func main() {
 	}
 }
 
-//nolint:funlen
 func parseCLIOptions() cliOptions {
-	kubeconfigPath := pflag.String("kubeconfig", "", "Path to kubeconfig file")
-	nodeLabel := pflag.String(
+	flags := registerCLIOptionsFlags()
+	pflag.Parse()
+	return flags.toCLIOptions()
+}
+
+type cliOptionFlags struct {
+	kubeconfigPath               *string
+	nodeLabel                    *string
+	configMapName                *string
+	configMapNamespace           *string
+	bootstrapDefaultConfig       *bool
+	healthBindAddress            *string
+	communicationMethod          *string
+	logLevel                     *string
+	caddyImage                   *string
+	enableLoadBalancer           *bool
+	preferSavedState             *bool
+	secretName                   *string
+	secretEnvKeys                *[]string
+	dataVolumePVC                *string
+	configVolumePVC              *string
+	externalEndpoints            *[]string
+	externalEndpointsFile        *string
+	useHostNetwork               *bool
+	caddyAdminOriginKey          *string
+	httpHostPort                 *int
+	httpsHostPort                *int
+	externalEnable               *bool
+	externalLabel                *string
+	externalNsMode               *string
+	externalAllowNamespaces      *string
+	externalDenyNamespaces       *string
+	externalPublishAggregated    *bool
+	externalAggregatedConfigName *string
+	leaderElectionEnabled        *bool
+	readinessRequireLeader       *bool
+	leaderElectionLeaseName      *string
+	leaderElectionLeaseNamespace *string
+	leaderElectionLeaseDuration  *time.Duration
+	leaderElectionRenewDeadline  *time.Duration
+	leaderElectionRetryPeriod    *time.Duration
+}
+
+func registerCLIOptionsFlags() cliOptionFlags {
+	flags := cliOptionFlags{}
+	registerCoreCLIFlags(&flags)
+	registerExternalCLIFlags(&flags)
+	registerLeaderElectionCLIFlags(&flags)
+	return flags
+}
+
+func registerCoreCLIFlags(flags *cliOptionFlags) {
+	flags.kubeconfigPath = pflag.String("kubeconfig", "", "Path to kubeconfig file")
+	flags.nodeLabel = pflag.String(
 		"node-label",
 		"ckic.cmld.ru/enabled=true",
 		"Kubernetes label selector used to choose managed nodes",
 	)
-	configMapName := pflag.String(
+	flags.configMapName = pflag.String(
 		"config-map",
 		"caddy-config",
 		"ConfigMap containing Caddy configuration",
 	)
-	configMapNamespace := pflag.String(
+	flags.configMapNamespace = pflag.String(
 		"config-namespace",
 		"caddy-system",
 		"Namespace of the ConfigMap and deployments",
 	)
-	bootstrapDefaultConfig := pflag.Bool(
+	flags.bootstrapDefaultConfig = pflag.Bool(
 		"bootstrap-default-config",
 		false,
 		"Create a default ConfigMap on startup only when it is missing",
 	)
-	healthBindAddress := pflag.String(
+	flags.healthBindAddress = pflag.String(
 		"health-bind-address",
 		":8081",
 		"Address where health and readiness probes are served (set empty to disable)",
 	)
-	communicationMethod := pflag.String(
+	flags.communicationMethod = pflag.String(
 		"comm-method",
 		"clusterip",
 		"Communication method (clusterip, direct, hostnetwork)",
 	)
-	logLevel := pflag.String("log-level", "info", "Log level (debug, info, warn, error)")
-	caddyImage := pflag.String(
+	flags.logLevel = pflag.String(
+		"log-level",
+		"info",
+		"Log level (debug, info, warn, error)",
+	)
+	flags.caddyImage = pflag.String(
 		"caddy-image",
 		"docker.horse/oss-images/zerossl-caddy/caddy:2.11.1-alpine",
 		"Caddy image (format image:tag)",
 	)
-	enableLoadBalancer := pflag.Bool(
+	flags.enableLoadBalancer = pflag.Bool(
 		"enable-loadbalancer",
 		false,
 		"Enable LoadBalancer service exposure",
 	)
-	preferSavedState := pflag.Bool(
+	flags.preferSavedState = pflag.Bool(
 		"prefer-saved-state",
 		false,
 		"Prefer saved (aka persistent) state during reconciliation",
 	)
-	secretName := pflag.String(
+	flags.secretName = pflag.String(
 		"env-secret",
 		"",
 		"Name of the Kubernetes Secret to use for environment variables",
 	)
-	secretEnvKeys := pflag.StringSlice(
+	flags.secretEnvKeys = pflag.StringSlice(
 		"env-keys",
 		[]string{},
 		"Keys from the Secret to use as environment variables",
 	)
-	dataVolumePVC := pflag.String(
+	flags.dataVolumePVC = pflag.String(
 		"data-pvc",
 		"",
 		"Name of PVC to use for the /data volume (defaults to HostPath if empty)",
 	)
-	configVolumePVC := pflag.String(
+	flags.configVolumePVC = pflag.String(
 		"config-pvc",
 		"",
 		"Name of PVC to use for the /config volume (defaults to HostPath if empty)",
 	)
-	externalEndpoints := pflag.StringArray(
+	registerCoreNetworkingCLIFlags(flags)
+}
+
+func registerCoreNetworkingCLIFlags(flags *cliOptionFlags) {
+	flags.externalEndpoints = pflag.StringArray(
 		"external-endpoints",
 		[]string{},
 		"External endpoints for nodes (format: nodeName=ip1,ip2,...)",
 	)
-	externalEndpointsFile := pflag.String(
+	flags.externalEndpointsFile = pflag.String(
 		"external-endpoints-file",
 		"",
 		"Path to JSON file containing external endpoints mapping",
 	)
-	useHostNetwork := pflag.Bool(
+	flags.useHostNetwork = pflag.Bool(
 		"use-host-network",
 		false,
 		"Use hostNetwork for Caddy pods",
 	)
-	caddyAdminOriginKey := pflag.String(
+	flags.caddyAdminOriginKey = pflag.String(
 		"caddy-admin-origin-key",
 		"",
 		"Origin key for Caddy admin API security",
 	)
-	httpHostPort := pflag.Int(
+	flags.httpHostPort = pflag.Int(
 		"http-host-port",
 		defaultHTTPHostPort,
 		"Host port for HTTP when using hostNetwork",
 	)
-	httpsHostPort := pflag.Int(
+	flags.httpsHostPort = pflag.Int(
 		"https-host-port",
 		defaultHTTPSHostPort,
 		"Host port for HTTPS when using hostNetwork",
 	)
-	externalEnable := pflag.Bool(
+}
+
+func registerExternalCLIFlags(flags *cliOptionFlags) {
+	flags.externalEnable = pflag.Bool(
 		"external-enable",
 		false,
 		"Enable external namespace ConfigMap aggregation",
 	)
-	externalLabel := pflag.String(
+	flags.externalLabel = pflag.String(
 		"external-label",
 		"ckic.cmld.ru/aggregate=true",
 		"Label selector for external ConfigMaps",
 	)
-	externalNsMode := pflag.String(
+	flags.externalNsMode = pflag.String(
 		"external-ns-mode",
 		"all",
 		"Namespace mode: all, allow, or deny",
 	)
-	externalAllowNamespaces := pflag.String(
+	flags.externalAllowNamespaces = pflag.String(
 		"external-allow-namespaces",
 		"",
 		"Comma-separated list of allowed namespaces (for allow mode)",
 	)
-	externalDenyNamespaces := pflag.String(
+	flags.externalDenyNamespaces = pflag.String(
 		"external-deny-namespaces",
 		"",
 		"Comma-separated list of denied namespaces (for deny mode)",
 	)
-	externalPublishAggregated := pflag.Bool(
+	flags.externalPublishAggregated = pflag.Bool(
 		"external-publish-aggregated",
 		true,
 		"Publish aggregated Caddyfile to a mirror ConfigMap",
 	)
-	externalAggregatedConfigName := pflag.String(
+	flags.externalAggregatedConfigName = pflag.String(
 		"external-aggregated-config-name",
 		"ckic-caddy-config-working",
 		"Name of the mirror ConfigMap for aggregated config",
 	)
-	leaderElectionEnabled := pflag.Bool(
+}
+
+func registerLeaderElectionCLIFlags(flags *cliOptionFlags) {
+	flags.leaderElectionEnabled = pflag.Bool(
 		"leader-elect",
 		true,
 		"Enable leader election so only one manager instance reconciles resources",
 	)
-	readinessRequireLeader := pflag.Bool(
+	flags.readinessRequireLeader = pflag.Bool(
 		"readiness-require-leader",
 		false,
 		"Report readiness only while leading (set true to keep legacy behavior)",
 	)
-	leaderElectionLeaseName := pflag.String(
+	flags.leaderElectionLeaseName = pflag.String(
 		"leader-election-lease-name",
 		"ckic-manager-leader",
 		"Name of the Lease resource used for leader election",
 	)
-	leaderElectionLeaseNamespace := pflag.String(
+	flags.leaderElectionLeaseNamespace = pflag.String(
 		"leader-election-lease-namespace",
 		"",
 		"Namespace of the Lease resource used for leader election (defaults to --config-namespace)",
 	)
-	leaderElectionLeaseDuration := pflag.Duration(
+	flags.leaderElectionLeaseDuration = pflag.Duration(
 		"leader-election-lease-duration",
 		15*time.Second,
 		"Duration non-leaders wait before forcing a leader election",
 	)
-	leaderElectionRenewDeadline := pflag.Duration(
+	flags.leaderElectionRenewDeadline = pflag.Duration(
 		"leader-election-renew-deadline",
 		10*time.Second,
 		"Duration the acting leader retries refreshing leadership before giving up",
 	)
-	leaderElectionRetryPeriod := pflag.Duration(
+	flags.leaderElectionRetryPeriod = pflag.Duration(
 		"leader-election-retry-period",
 		2*time.Second,
 		"Time between attempts by clients to acquire or renew leadership",
 	)
-	pflag.Parse()
+}
+
+func (flags cliOptionFlags) toCLIOptions() cliOptions {
 	return cliOptions{
-		kubeconfigPath:               *kubeconfigPath,
-		nodeLabel:                    *nodeLabel,
-		configMapName:                *configMapName,
-		configMapNamespace:           *configMapNamespace,
-		bootstrapDefaultConfig:       *bootstrapDefaultConfig,
-		healthBindAddress:            *healthBindAddress,
-		communicationMethod:          *communicationMethod,
-		logLevel:                     *logLevel,
-		caddyImage:                   *caddyImage,
-		enableLoadBalancer:           *enableLoadBalancer,
-		preferSavedState:             *preferSavedState,
-		secretName:                   *secretName,
-		secretEnvKeys:                *secretEnvKeys,
-		dataVolumePVC:                *dataVolumePVC,
-		configVolumePVC:              *configVolumePVC,
-		externalEndpoints:            *externalEndpoints,
-		externalEndpointsFile:        *externalEndpointsFile,
-		useHostNetwork:               *useHostNetwork,
-		caddyAdminOriginKey:          *caddyAdminOriginKey,
-		httpHostPort:                 *httpHostPort,
-		httpsHostPort:                *httpsHostPort,
-		externalEnable:               *externalEnable,
-		externalLabel:                *externalLabel,
-		externalNsMode:               *externalNsMode,
-		externalAllowNamespaces:      *externalAllowNamespaces,
-		externalDenyNamespaces:       *externalDenyNamespaces,
-		externalPublishAggregated:    *externalPublishAggregated,
-		externalAggregatedConfigName: *externalAggregatedConfigName,
-		leaderElectionEnabled:        *leaderElectionEnabled,
-		readinessRequireLeader:       *readinessRequireLeader,
-		leaderElectionLeaseName:      *leaderElectionLeaseName,
-		leaderElectionLeaseNamespace: *leaderElectionLeaseNamespace,
-		leaderElectionLeaseDuration:  *leaderElectionLeaseDuration,
-		leaderElectionRenewDeadline:  *leaderElectionRenewDeadline,
-		leaderElectionRetryPeriod:    *leaderElectionRetryPeriod,
+		kubeconfigPath:               *flags.kubeconfigPath,
+		nodeLabel:                    *flags.nodeLabel,
+		configMapName:                *flags.configMapName,
+		configMapNamespace:           *flags.configMapNamespace,
+		bootstrapDefaultConfig:       *flags.bootstrapDefaultConfig,
+		healthBindAddress:            *flags.healthBindAddress,
+		communicationMethod:          *flags.communicationMethod,
+		logLevel:                     *flags.logLevel,
+		caddyImage:                   *flags.caddyImage,
+		enableLoadBalancer:           *flags.enableLoadBalancer,
+		preferSavedState:             *flags.preferSavedState,
+		secretName:                   *flags.secretName,
+		secretEnvKeys:                *flags.secretEnvKeys,
+		dataVolumePVC:                *flags.dataVolumePVC,
+		configVolumePVC:              *flags.configVolumePVC,
+		externalEndpoints:            *flags.externalEndpoints,
+		externalEndpointsFile:        *flags.externalEndpointsFile,
+		useHostNetwork:               *flags.useHostNetwork,
+		caddyAdminOriginKey:          *flags.caddyAdminOriginKey,
+		httpHostPort:                 *flags.httpHostPort,
+		httpsHostPort:                *flags.httpsHostPort,
+		externalEnable:               *flags.externalEnable,
+		externalLabel:                *flags.externalLabel,
+		externalNsMode:               *flags.externalNsMode,
+		externalAllowNamespaces:      *flags.externalAllowNamespaces,
+		externalDenyNamespaces:       *flags.externalDenyNamespaces,
+		externalPublishAggregated:    *flags.externalPublishAggregated,
+		externalAggregatedConfigName: *flags.externalAggregatedConfigName,
+		leaderElectionEnabled:        *flags.leaderElectionEnabled,
+		readinessRequireLeader:       *flags.readinessRequireLeader,
+		leaderElectionLeaseName:      *flags.leaderElectionLeaseName,
+		leaderElectionLeaseNamespace: *flags.leaderElectionLeaseNamespace,
+		leaderElectionLeaseDuration:  *flags.leaderElectionLeaseDuration,
+		leaderElectionRenewDeadline:  *flags.leaderElectionRenewDeadline,
+		leaderElectionRetryPeriod:    *flags.leaderElectionRetryPeriod,
 	}
 }
 

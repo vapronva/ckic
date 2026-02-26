@@ -152,85 +152,92 @@ func (h *NodeHandler) StartWorkerPool(ctx context.Context, workerCount int) {
 	}
 }
 
-//nolint:gocognit,funlen
 func (h *NodeHandler) Handle(event watcher.NodeEvent) {
-	nodeName := event.NodeName
-	logger := log.With().Str("node", nodeName).Logger()
 	switch event.Type {
 	case watcher.NodeAdded:
-		h.Mu.RLock()
-		_, alreadyDeployed := h.DeployedInstances[nodeName]
-		h.Mu.RUnlock()
-		h.inProgressNodesMu.Lock()
-		if _, inProgress := h.inProgressNodes[nodeName]; inProgress {
-			delete(h.removedNodes, nodeName)
-			h.inProgressNodesMu.Unlock()
-			logger.Debug().
-				Msg("Deployment already in progress for node, cleared removal flag")
-			return
-		}
-		h.inProgressNodes[nodeName] = struct{}{}
-		h.inProgressNodesMu.Unlock()
-		if alreadyDeployed {
-			logger.Debug().
-				Msg("Node already has a Caddy deployment, reconciling desired state")
-		} else {
-			logger.Info().Msg("Detected new node, deploying Caddy")
-		}
-		resultCh := make(chan *deploymentResult, 1)
-		externalIPs, exists := h.ExternalEndpoints[nodeName]
-		if exists {
-			logger.Info().
-				Strs("externalIPs", externalIPs).
-				Msg("Found external endpoints for node")
-		}
-		h.jobCh <- deploymentJob{
-			nodeName:    nodeName,
-			resultCh:    resultCh,
-			externalIPs: externalIPs,
-		}
-		go func() {
-			h.handleNodeAddedResult(nodeName, alreadyDeployed, <-resultCh)
-		}()
+		h.handleNodeAdded(event.NodeName)
 	case watcher.NodeRemoved:
-		var (
-			shouldNotify bool
-			instance     *caddy.Instance
-			exists       bool
-		)
-		h.inProgressNodesMu.Lock()
-		if _, inProgress := h.inProgressNodes[nodeName]; inProgress {
-			h.removedNodes[nodeName] = struct{}{}
-			h.inProgressNodesMu.Unlock()
-			logger.Info().
-				Msg("Node removed while deployment in progress, marking for cleanup")
-			return
-		}
+		h.handleNodeRemoved(event.NodeName)
+	}
+}
+
+func (h *NodeHandler) handleNodeAdded(nodeName string) {
+	logger := log.With().Str("node", nodeName).Logger()
+	h.Mu.RLock()
+	_, alreadyDeployed := h.DeployedInstances[nodeName]
+	h.Mu.RUnlock()
+	h.inProgressNodesMu.Lock()
+	if _, inProgress := h.inProgressNodes[nodeName]; inProgress {
+		delete(h.removedNodes, nodeName)
 		h.inProgressNodesMu.Unlock()
+		logger.Debug().
+			Msg("Deployment already in progress for node, cleared removal flag")
+		return
+	}
+	h.inProgressNodes[nodeName] = struct{}{}
+	h.inProgressNodesMu.Unlock()
+	if alreadyDeployed {
+		logger.Debug().
+			Msg("Node already has a Caddy deployment, reconciling desired state")
+	} else {
+		logger.Info().Msg("Detected new node, deploying Caddy")
+	}
+	resultCh := make(chan *deploymentResult, 1)
+	externalIPs, exists := h.ExternalEndpoints[nodeName]
+	if exists {
+		logger.Info().
+			Strs("externalIPs", externalIPs).
+			Msg("Found external endpoints for node")
+	}
+	h.jobCh <- deploymentJob{
+		nodeName:    nodeName,
+		resultCh:    resultCh,
+		externalIPs: externalIPs,
+	}
+	go func() {
+		h.handleNodeAddedResult(nodeName, alreadyDeployed, <-resultCh)
+	}()
+}
+
+func (h *NodeHandler) handleNodeRemoved(nodeName string) {
+	logger := log.With().Str("node", nodeName).Logger()
+	var (
+		shouldNotify bool
+		instance     *caddy.Instance
+		exists       bool
+	)
+	h.inProgressNodesMu.Lock()
+	if _, inProgress := h.inProgressNodes[nodeName]; inProgress {
+		h.removedNodes[nodeName] = struct{}{}
+		h.inProgressNodesMu.Unlock()
+		logger.Info().
+			Msg("Node removed while deployment in progress, marking for cleanup")
+		return
+	}
+	h.inProgressNodesMu.Unlock()
+	h.Mu.Lock()
+	instance, exists = h.DeployedInstances[nodeName]
+	if exists {
+		delete(h.DeployedInstances, nodeName)
+		shouldNotify = h.nodeChangeNotifier != nil
+	}
+	h.Mu.Unlock()
+	if !exists {
+		return
+	}
+	logger.Info().Msg("Node removed, cleaning up Caddy instance")
+	if err := instance.Delete(); err != nil {
+		logger.Error().Err(err).Msg("Failed to delete Caddy instance")
 		h.Mu.Lock()
-		instance, exists = h.DeployedInstances[nodeName]
-		if exists {
-			delete(h.DeployedInstances, nodeName)
-			shouldNotify = h.nodeChangeNotifier != nil
+		if _, alreadyPresent := h.DeployedInstances[nodeName]; !alreadyPresent {
+			h.DeployedInstances[nodeName] = instance
 		}
 		h.Mu.Unlock()
-		if !exists {
-			return
-		}
-		logger.Info().Msg("Node removed, cleaning up Caddy instance")
-		if err := instance.Delete(); err != nil {
-			logger.Error().Err(err).Msg("Failed to delete Caddy instance")
-			h.Mu.Lock()
-			if _, alreadyPresent := h.DeployedInstances[nodeName]; !alreadyPresent {
-				h.DeployedInstances[nodeName] = instance
-			}
-			h.Mu.Unlock()
-			return
-		}
-		logger.Info().Msg("Successfully removed Caddy instance")
-		if shouldNotify {
-			h.nodeChangeNotifier()
-		}
+		return
+	}
+	logger.Info().Msg("Successfully removed Caddy instance")
+	if shouldNotify {
+		h.nodeChangeNotifier()
 	}
 }
 
