@@ -189,9 +189,9 @@ func SelectNewestActivePodName(pods []corev1.Pod) (string, bool) {
 			continue
 		}
 		switch {
-		case pod.CreationTimestamp.Time.After(selected.CreationTimestamp.Time):
+		case pod.CreationTimestamp.After(selected.CreationTimestamp.Time):
 			selected = pod
-		case pod.CreationTimestamp.Time.Equal(selected.CreationTimestamp.Time) &&
+		case pod.CreationTimestamp.Equal(&selected.CreationTimestamp) &&
 			pod.Name > selected.Name:
 			selected = pod
 		}
