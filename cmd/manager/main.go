@@ -255,7 +255,7 @@ func registerCoreCLIFlags(flags *cliOptionFlags) {
 	)
 	flags.caddyImage = pflag.String(
 		"caddy-image",
-		"docker.horse/oss-images/zerossl-caddy/caddy:2.11.1-alpine",
+		"docker.horse/oss-images/zerossl-caddy/caddy:2.11.2-alpine",
 		"Caddy image (format image:tag)",
 	)
 	flags.enableLoadBalancer = pflag.Bool(
