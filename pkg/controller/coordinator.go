@@ -6,13 +6,11 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"git.horse/vapronva/ckic/pkg/caddy"
-	"git.horse/vapronva/ckic/pkg/watcher"
 )
 
 type WatcherCoordinator struct {
 	mu                *sync.RWMutex
 	notifyMu          sync.Mutex
-	nodeWatcher       *watcher.NodeWatcher
 	configWatcher     coordinatedConfigWatcher
 	deployedInstances map[string]*caddy.Instance
 }
@@ -23,23 +21,15 @@ type coordinatedConfigWatcher interface {
 }
 
 func NewWatcherCoordinator(
-	nodeWatcher *watcher.NodeWatcher,
 	configWatcher coordinatedConfigWatcher,
 	deployedInstances map[string]*caddy.Instance,
 	mu *sync.RWMutex,
 ) *WatcherCoordinator {
 	return &WatcherCoordinator{
 		mu:                mu,
-		nodeWatcher:       nodeWatcher,
 		configWatcher:     configWatcher,
 		deployedInstances: deployedInstances,
 	}
-}
-
-func (wc *WatcherCoordinator) HasAvailableNodes() bool {
-	wc.mu.RLock()
-	defer wc.mu.RUnlock()
-	return len(wc.deployedInstances) > 0
 }
 
 func (wc *WatcherCoordinator) NotifyNodeChange() {

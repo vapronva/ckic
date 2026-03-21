@@ -16,9 +16,6 @@ import (
 	"github.com/rs/zerolog/log"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	"git.horse/vapronva/ckic/pkg/constants"
-	"git.horse/vapronva/ckic/pkg/errors"
 )
 
 type CommunicationMethod int
@@ -36,6 +33,9 @@ type AdminAPIConfig struct {
 const (
 	readinessRequestTimeout = 10 * time.Second
 	configPushTimeout       = 30 * time.Second
+	caddyAPIInitialDelay    = 5 * time.Second
+	caddyAPIMaxDelay        = 600 * time.Second
+	caddyAPIReadyTimeout    = 5 * time.Minute
 )
 
 func waitForCaddyAPIReady(
@@ -44,8 +44,8 @@ func waitForCaddyAPIReady(
 	apiConfig *AdminAPIConfig,
 	client *http.Client,
 ) error {
-	initialDelay := constants.CaddyAPIInitialDelay
-	maxDelay := constants.CaddyAPIMaxDelay
+	initialDelay := caddyAPIInitialDelay
+	maxDelay := caddyAPIMaxDelay
 	delay := initialDelay
 	multiplier := 1.5
 	readyURL := readinessURL(adminURL)
@@ -107,7 +107,7 @@ func readinessProbe(
 	if apiConfig != nil && apiConfig.OriginKey != "" {
 		req.Header.Set("Origin", adminOrigin(apiConfig.OriginKey))
 	}
-	resp, doErr := doAdminRequest(client, req)
+	resp, doErr := client.Do(req) //nolint:gosec
 	if doErr != nil {
 		return false, doErr
 	}
@@ -154,14 +154,14 @@ func (i *Instance) UpdateConfig(
 	adminURL, resolveErr := i.resolveAdminURL(ctx, method, logger)
 	if resolveErr != nil {
 		logger.Error().Err(resolveErr).Msg("Failed to resolve admin URL")
-		return &errors.ConfigurationFailedError{
+		return &ConfigurationFailedError{
 			NodeName: i.NodeName,
 			Reason:   "failed to resolve admin URL",
 			Err:      resolveErr,
 		}
 	}
-	readinessClient := buildAdminHTTPClient(apiConfig, readinessRequestTimeout)
-	readyCtx, cancel := context.WithTimeout(ctx, constants.CaddyAPIReadyTimeout)
+	readinessClient := &http.Client{Timeout: readinessRequestTimeout}
+	readyCtx, cancel := context.WithTimeout(ctx, caddyAPIReadyTimeout)
 	defer cancel()
 	if readyErr := waitForCaddyAPIReady(
 		readyCtx,
@@ -170,7 +170,7 @@ func (i *Instance) UpdateConfig(
 		readinessClient,
 	); readyErr != nil {
 		logger.Error().Err(readyErr).Msg("Caddy Admin API not ready")
-		return &errors.ConfigurationFailedError{
+		return &ConfigurationFailedError{
 			NodeName: i.NodeName,
 			Reason:   "admin API not ready",
 			Err:      readyErr,
@@ -185,7 +185,7 @@ func (i *Instance) UpdateConfig(
 	)
 	if reqErr != nil {
 		logger.Error().Err(reqErr).Msg("Failed to create HTTP request")
-		return &errors.ConfigurationFailedError{
+		return &ConfigurationFailedError{
 			NodeName: i.NodeName,
 			Reason:   "failed to create HTTP request",
 			Err:      reqErr,
@@ -194,7 +194,7 @@ func (i *Instance) UpdateConfig(
 	resp, doErr := i.sendConfigUpdateRequest(req)
 	if doErr != nil {
 		logger.Error().Err(doErr).Msg("Failed to send configuration to Caddy")
-		return &errors.ConfigurationFailedError{
+		return &ConfigurationFailedError{
 			NodeName: i.NodeName,
 			Reason:   "failed to send configuration",
 			Err:      doErr,
@@ -208,7 +208,7 @@ func (i *Instance) UpdateConfig(
 	body, readErr := io.ReadAll(resp.Body)
 	if readErr != nil {
 		logger.Error().Err(readErr).Msg("Failed to read response body")
-		return &errors.ConfigurationFailedError{
+		return &ConfigurationFailedError{
 			NodeName: i.NodeName,
 			Reason:   "failed to read response",
 			Err:      readErr,
@@ -216,7 +216,7 @@ func (i *Instance) UpdateConfig(
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		err := i.logConfigUpdateFailure(resp.StatusCode, body, logger)
-		return &errors.ConfigurationFailedError{
+		return &ConfigurationFailedError{
 			NodeName: i.NodeName,
 			Reason:   "non-2xx response",
 			Err:      err,
@@ -302,10 +302,10 @@ func preferredNodeIP(node *corev1.Node) string {
 	if node == nil {
 		return ""
 	}
-	if internalIP := nodeAddressByType(node, "InternalIP"); internalIP != "" {
+	if internalIP := nodeAddressByType(node, corev1.NodeInternalIP); internalIP != "" {
 		return internalIP
 	}
-	return nodeAddressByType(node, "ExternalIP")
+	return nodeAddressByType(node, corev1.NodeExternalIP)
 }
 
 func nodeAddressByType(node *corev1.Node, addrType corev1.NodeAddressType) string {
@@ -345,8 +345,8 @@ func (i *Instance) buildConfigUpdateRequest(
 }
 
 func (i *Instance) sendConfigUpdateRequest(req *http.Request) (*http.Response, error) {
-	client := buildAdminHTTPClient(nil, configPushTimeout)
-	return doAdminRequest(client, req)
+	client := &http.Client{Timeout: configPushTimeout}
+	return client.Do(req) //nolint:gosec
 }
 
 func (i *Instance) logConfigUpdateFailure(
@@ -367,18 +367,4 @@ func (i *Instance) logConfigUpdateFailure(
 		Int("status", statusCode).
 		Msg("Caddy configuration update failed")
 	return err
-}
-
-func doAdminRequest(client *http.Client, req *http.Request) (*http.Response, error) {
-	transport := client.Transport
-	if transport == nil {
-		transport = http.DefaultTransport
-	}
-	return transport.RoundTrip(req)
-}
-
-func buildAdminHTTPClient(apiConfig *AdminAPIConfig, timeout time.Duration) *http.Client {
-	client := &http.Client{Timeout: timeout}
-	_ = apiConfig
-	return client
 }

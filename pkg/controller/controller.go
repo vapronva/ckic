@@ -53,6 +53,7 @@ type ControllerConfig struct {
 type Controller struct {
 	clientset         kubernetes.Interface
 	config            ControllerConfig
+	deployOpts        caddy.DeployOptions
 	nodeWatcher       *watcher.NodeWatcher
 	configWatcher     *watcher.ConfigWatcher
 	externalWatcher   *watcher.ExternalConfigWatcher
@@ -62,7 +63,7 @@ type Controller struct {
 	instancesMutex    *sync.RWMutex
 	stateStore        *state.ConfigMapStateStore
 	coordinator       *WatcherCoordinator
-	aggregator        any
+	aggregator        *aggregator.NamespaceAggregator
 }
 
 const (
@@ -84,7 +85,27 @@ func NewController(
 	config ControllerConfig,
 ) (*Controller, error) {
 	deployedInstances, mutex, nodeAvailabilityCheck := newControllerState()
-	nodeHandler := newNodeHandler(clientset, config, deployedInstances, mutex)
+	deployOpts := caddy.DeployOptions{
+		Clientset:          clientset,
+		Namespace:          config.ConfigMapNamespace,
+		CaddyImage:         config.CaddyImage,
+		EnableLoadBalancer: config.EnableLoadBalancer,
+		EnvSecretName:      config.EnvSecretName,
+		EnvSecretKeys:      config.EnvSecretKeys,
+		DataVolumePVC:      config.DataVolumePVC,
+		ConfigVolumePVC:    config.ConfigVolumePVC,
+		ConfigMapName:      config.ConfigMapName,
+		UseHostNetwork:     config.UseHostNetwork,
+		HTTPHostPort:       config.HTTPHostPort,
+		HTTPSHostPort:      config.HTTPSHostPort,
+	}
+	nodeHandler := handlers.NewNodeHandler(
+		deployOpts,
+		deployedInstances,
+		mutex,
+		config.ExternalEndpoints,
+		nil,
+	)
 	nodeWatcher, err := watcher.NewNodeWatcher(
 		clientset,
 		config.NodeLabel,
@@ -93,7 +114,14 @@ func NewController(
 	if err != nil {
 		return nil, fmt.Errorf("failed to create node watcher: %w", err)
 	}
-	configHandler := newConfigHandler(clientset, config, deployedInstances, mutex)
+	configHandler := handlers.NewConfigHandler(
+		deployOpts,
+		config.CommunicationMethod,
+		config.CaddyAdminOriginKey,
+		config.ExternalEndpoints,
+		deployedInstances,
+		mutex,
+	)
 	watchers := buildWatcherBundle(
 		clientset,
 		config,
@@ -101,7 +129,6 @@ func NewController(
 		nodeAvailabilityCheck,
 	)
 	coordinator := NewWatcherCoordinator(
-		nodeWatcher,
 		watchers.configWatcher,
 		deployedInstances,
 		mutex,
@@ -115,6 +142,7 @@ func NewController(
 	ctrl := &Controller{
 		clientset:         clientset,
 		config:            config,
+		deployOpts:        deployOpts,
 		nodeWatcher:       nodeWatcher,
 		configWatcher:     watchers.configWatcher,
 		externalWatcher:   watchers.externalWatcher,
@@ -125,9 +153,7 @@ func NewController(
 		stateStore:        stateStore,
 		coordinator:       coordinator,
 	}
-	if watchers.agg != nil {
-		ctrl.aggregator = watchers.agg
-	}
+	ctrl.aggregator = watchers.agg
 	return ctrl, nil
 }
 
@@ -144,59 +170,6 @@ func newControllerState() (
 		return len(deployedInstances) > 0
 	}
 	return deployedInstances, mutex, nodeAvailabilityCheck
-}
-
-func newNodeHandler(
-	clientset kubernetes.Interface,
-	config ControllerConfig,
-	deployedInstances map[string]*caddy.Instance,
-	mutex *sync.RWMutex,
-) *handlers.NodeHandler {
-	return handlers.NewNodeHandler(
-		clientset,
-		config.ConfigMapNamespace,
-		config.CaddyImage,
-		config.EnableLoadBalancer,
-		deployedInstances,
-		mutex,
-		nil,
-		config.EnvSecretName,
-		config.EnvSecretKeys,
-		config.DataVolumePVC,
-		config.ConfigVolumePVC,
-		config.ConfigMapName,
-		config.ExternalEndpoints,
-		config.UseHostNetwork,
-		config.HTTPHostPort,
-		config.HTTPSHostPort,
-	)
-}
-
-func newConfigHandler(
-	clientset kubernetes.Interface,
-	config ControllerConfig,
-	deployedInstances map[string]*caddy.Instance,
-	mutex *sync.RWMutex,
-) *handlers.ConfigHandler {
-	return handlers.NewConfigHandler(
-		config.CommunicationMethod,
-		clientset,
-		config.ConfigMapNamespace,
-		config.CaddyImage,
-		config.EnableLoadBalancer,
-		deployedInstances,
-		mutex,
-		config.EnvSecretName,
-		config.EnvSecretKeys,
-		config.DataVolumePVC,
-		config.ConfigVolumePVC,
-		config.ConfigMapName,
-		config.ExternalEndpoints,
-		config.UseHostNetwork,
-		config.CaddyAdminOriginKey,
-		config.HTTPHostPort,
-		config.HTTPSHostPort,
-	)
 }
 
 func buildWatcherBundle(
@@ -285,8 +258,8 @@ func (c *Controller) ReconcileState(ctx context.Context) error {
 		return err
 	}
 	c.reconcileDiscoveredDeployments(ctx, discovered)
-	c.mergeSavedState(discovered, logger)
-	c.replaceAndPersistState(discovered, logger)
+	c.mergeSavedState(ctx, discovered, logger)
+	c.replaceAndPersistState(ctx, discovered, logger)
 	c.initializeConfiguration(ctx, logger)
 	logger.Info().Msg("Reconciliation process completed")
 	return nil
@@ -421,10 +394,11 @@ func (c *Controller) logAdoptedDeployment(
 }
 
 func (c *Controller) mergeSavedState(
+	ctx context.Context,
 	discovered map[string]*caddy.Instance,
 	logger zerolog.Logger,
 ) {
-	savedState, err := c.stateStore.LoadState()
+	savedState, err := c.stateStore.LoadState(ctx)
 	if err != nil {
 		logger.Warn().
 			Err(err).
@@ -450,18 +424,17 @@ func (c *Controller) mergeSavedState(
 }
 
 func (c *Controller) replaceAndPersistState(
+	ctx context.Context,
 	discovered map[string]*caddy.Instance,
 	logger zerolog.Logger,
 ) {
 	c.instancesMutex.Lock()
-	for node := range c.deployedInstances {
-		delete(c.deployedInstances, node)
-	}
+	clear(c.deployedInstances)
 	maps.Copy(c.deployedInstances, discovered)
 	instancesCopy := make(map[string]*caddy.Instance, len(c.deployedInstances))
 	maps.Copy(instancesCopy, c.deployedInstances)
 	c.instancesMutex.Unlock()
-	if saveErr := c.stateStore.SaveState(instancesCopy); saveErr != nil {
+	if saveErr := c.stateStore.SaveState(ctx, instancesCopy); saveErr != nil {
 		logger.Error().Err(saveErr).Msg("Failed to persist state")
 	}
 }
@@ -492,20 +465,14 @@ func (c *Controller) initializeExternalConfiguration(
 			Msg("External aggregation enabled but aggregator is nil, skipping initial config setup")
 		return
 	}
-	agg, ok := c.aggregator.(*aggregator.NamespaceAggregator)
-	if !ok {
-		logger.Error().
-			Msg("Failed to assert aggregator type, skipping initial config setup")
-		return
-	}
-	c.loadExternalBatch(ctx, agg, logger)
+	c.loadExternalBatch(ctx, c.aggregator, logger)
 	configData, err := c.loadConfigData(ctx)
 	if err != nil {
 		c.logConfigLoadError(err, logger, "initial config push")
 	} else {
-		agg.UpdateBase(configData)
+		c.aggregator.UpdateBase(configData)
 	}
-	agg.MarkInitialized()
+	c.aggregator.MarkInitialized()
 	if c.deployedInstanceCount() > 0 {
 		logger.Info().Msg("Initial configuration pushed to discovered instances")
 		return
@@ -544,7 +511,7 @@ func (c *Controller) loadConfigData(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	configData, exists := configMap.Data["Caddyfile"]
+	configData, exists := configMap.Data[constants.CaddyfileKey]
 	if !exists {
 		return "", errConfigMapMissingCaddyfile
 	}
@@ -574,20 +541,9 @@ func (c *Controller) reconcileDiscoveredDeployments(
 	for nodeName, adopted := range discovered {
 		reconciled, err := caddy.DeployCaddy(
 			ctx,
-			c.clientset,
+			c.deployOpts,
 			nodeName,
-			c.config.ConfigMapNamespace,
-			c.config.CaddyImage,
-			c.config.EnableLoadBalancer,
 			c.config.ExternalEndpoints[nodeName],
-			c.config.EnvSecretName,
-			c.config.EnvSecretKeys,
-			c.config.DataVolumePVC,
-			c.config.ConfigVolumePVC,
-			c.config.ConfigMapName,
-			c.config.UseHostNetwork,
-			c.config.HTTPHostPort,
-			c.config.HTTPSHostPort,
 		)
 		if err != nil {
 			logger.Error().
@@ -654,13 +610,7 @@ func (c *Controller) applyPeriodicConfigData(
 			Msg("External aggregation enabled but aggregator is nil, skipping reconciliation to prevent configuration drift")
 		return false
 	}
-	agg, ok := c.aggregator.(*aggregator.NamespaceAggregator)
-	if !ok {
-		logger.Error().
-			Msg("Failed to assert aggregator type, skipping reconciliation to prevent configuration drift")
-		return false
-	}
-	agg.UpdateBase(configData)
+	c.aggregator.UpdateBase(configData)
 	return true
 }
 
@@ -674,24 +624,12 @@ func (c *Controller) runPeriodicStatePersistence(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			c.instancesMutex.RLock()
-			instanceCount := len(c.deployedInstances)
-			if instanceCount == 0 {
-				c.instancesMutex.RUnlock()
-				logger.Debug().Msg("No deployed instances, skipping state persistence")
-				continue
-			}
-			instancesCopy := make(map[string]*caddy.Instance, instanceCount)
-			maps.Copy(instancesCopy, c.deployedInstances)
-			c.instancesMutex.RUnlock()
-			if err := c.stateStore.SaveState(instancesCopy); err != nil {
+			if err := c.snapshotAndPersistState(ctx); err != nil {
 				logger.Error().
 					Err(err).
 					Msg("Failed to persist state during periodic save")
 			} else {
-				logger.Debug().
-					Int("instances", instanceCount).
-					Msg("Periodic state persistence completed")
+				logger.Debug().Msg("Periodic state persistence completed")
 			}
 		}
 	}
@@ -700,21 +638,21 @@ func (c *Controller) runPeriodicStatePersistence(ctx context.Context) {
 func (c *Controller) persistStateOnShutdown() {
 	logger := log.With().Str("component", "state_persistence").Logger()
 	logger.Info().Msg("Persisting state before shutdown")
-	c.instancesMutex.RLock()
-	instanceCount := len(c.deployedInstances)
-	if instanceCount == 0 {
-		c.instancesMutex.RUnlock()
-		logger.Info().Msg("No deployed instances, skipping shutdown state persistence")
-		return
-	}
-	instancesCopy := make(map[string]*caddy.Instance, instanceCount)
-	maps.Copy(instancesCopy, c.deployedInstances)
-	c.instancesMutex.RUnlock()
-	if err := c.stateStore.SaveState(instancesCopy); err != nil {
+	if err := c.snapshotAndPersistState(context.Background()); err != nil {
 		logger.Error().Err(err).Msg("Failed to persist state during shutdown")
 	} else {
-		logger.Info().
-			Int("instances", instanceCount).
-			Msg("State persisted successfully before shutdown")
+		logger.Info().Msg("State persisted successfully before shutdown")
 	}
+}
+
+func (c *Controller) snapshotAndPersistState(ctx context.Context) error {
+	c.instancesMutex.RLock()
+	if len(c.deployedInstances) == 0 {
+		c.instancesMutex.RUnlock()
+		return nil
+	}
+	instancesCopy := make(map[string]*caddy.Instance, len(c.deployedInstances))
+	maps.Copy(instancesCopy, c.deployedInstances)
+	c.instancesMutex.RUnlock()
+	return c.stateStore.SaveState(ctx, instancesCopy)
 }

@@ -37,11 +37,12 @@ type NodeEvent struct {
 type NodeHandler func(NodeEvent)
 
 type NodeWatcher struct {
-	clientset     kubernetes.Interface
-	labelSelector string
-	nodeHandler   NodeHandler
-	mu            sync.RWMutex
-	currentNodes  map[string]bool
+	clientset           kubernetes.Interface
+	labelSelector       string
+	nodeHandler         NodeHandler
+	mu                  sync.RWMutex
+	currentNodes        map[string]bool
+	lastResourceVersion string
 }
 
 func normalizeLegacyNodeSelector(labelSelector string) string {
@@ -118,7 +119,8 @@ func (w *NodeWatcher) Start(ctx context.Context) {
 			continue
 		}
 		watcher, err := w.clientset.CoreV1().Nodes().Watch(ctx, metav1.ListOptions{
-			LabelSelector: w.labelSelector,
+			LabelSelector:   w.labelSelector,
+			ResourceVersion: w.lastResourceVersion,
 		})
 		if err != nil {
 			logger.Error().Err(err).Msg("Failed to create node watcher")
@@ -140,6 +142,7 @@ func (w *NodeWatcher) syncCurrentNodes(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	w.lastResourceVersion = nodes.ResourceVersion
 	newNodes := make(map[string]bool, len(nodes.Items))
 	for _, node := range nodes.Items {
 		newNodes[node.Name] = true
@@ -211,6 +214,11 @@ func (w *NodeWatcher) handleNodeWatchEvent(
 	logger zerolog.Logger,
 ) bool {
 	if event.Type == watch.Error {
+		if status, ok := event.Object.(*metav1.Status); ok && status.Code == 410 {
+			logger.Warn().Msg("Node watch resource version expired, re-listing")
+			w.lastResourceVersion = ""
+			return true
+		}
 		logger.Error().Msg("Error watching nodes")
 		return true
 	}
@@ -219,6 +227,7 @@ func (w *NodeWatcher) handleNodeWatchEvent(
 		logger.Warn().Msg("Unexpected object type in node watcher")
 		return false
 	}
+	w.lastResourceVersion = node.ResourceVersion
 	notifyAdd, notifyRemove := w.applyNodeWatchEvent(event.Type, node.Name)
 	if notifyAdd {
 		w.emitNodeEvents(NodeAdded, []string{node.Name})

@@ -22,7 +22,7 @@ const (
 	caddyAdminPort         = 2019
 	caddyHTTPPort          = 80
 	caddyHTTPSPort         = 443
-	configMapDefaultMode   = int32(420)
+	configMapDefaultMode   = int32(0o644)
 	hostPortMin            = 1
 	hostPortMax            = 65535
 	caddyContainerName     = "caddy"
@@ -33,17 +33,26 @@ const (
 	downwardAPIEnvVarCount = 3
 )
 
+type DeployOptions struct {
+	Clientset          kubernetes.Interface
+	Namespace          string
+	CaddyImage         string
+	EnableLoadBalancer bool
+	EnvSecretName      string
+	EnvSecretKeys      []string
+	DataVolumePVC      string
+	ConfigVolumePVC    string
+	ConfigMapName      string
+	UseHostNetwork     bool
+	HTTPHostPort       int
+	HTTPSHostPort      int
+}
+
 func DeployCaddy(
 	ctx context.Context,
-	clientset kubernetes.Interface,
-	nodeName, namespace, caddyImage string,
-	enableLoadBalancer bool,
+	opts DeployOptions,
+	nodeName string,
 	externalIPs []string,
-	envSecretName string,
-	envSecretKeys []string,
-	dataVolumePVC, configVolumePVC, configMapName string,
-	useHostNetwork bool,
-	httpHostPort, httpsHostPort int,
 ) (*Instance, error) {
 	deployCtx, cancel := context.WithTimeout(ctx, deploymentTimeout)
 	defer cancel()
@@ -51,25 +60,25 @@ func DeployCaddy(
 	deploymentName := fmt.Sprintf("caddy-%s", nodeName)
 	instance := &Instance{
 		NodeName:       nodeName,
-		Namespace:      namespace,
+		Namespace:      opts.Namespace,
 		DeploymentName: deploymentName,
 		ServiceName:    deploymentName,
 		ExternalIPs:    externalIPs,
-		KubeClient:     clientset,
+		KubeClient:     opts.Clientset,
 	}
 	deploymentChanged, deploymentCreated, err := deployDeployment(
 		deployCtx,
-		clientset,
+		opts.Clientset,
 		instance,
-		caddyImage,
-		envSecretName,
-		envSecretKeys,
-		dataVolumePVC,
-		configVolumePVC,
-		configMapName,
-		useHostNetwork,
-		httpHostPort,
-		httpsHostPort,
+		opts.CaddyImage,
+		opts.EnvSecretName,
+		opts.EnvSecretKeys,
+		opts.DataVolumePVC,
+		opts.ConfigVolumePVC,
+		opts.ConfigMapName,
+		opts.UseHostNetwork,
+		opts.HTTPHostPort,
+		opts.HTTPSHostPort,
 	)
 	if err != nil {
 		return nil, err
@@ -77,10 +86,10 @@ func DeployCaddy(
 	if err = deployCaddyServices(
 		deployCtx,
 		ctx,
-		clientset,
+		opts.Clientset,
 		instance,
-		useHostNetwork,
-		enableLoadBalancer,
+		opts.UseHostNetwork,
+		opts.EnableLoadBalancer,
 		deploymentCreated,
 		logger,
 	); err != nil {
@@ -89,8 +98,8 @@ func DeployCaddy(
 	if err = waitForDeploymentReadyIfChanged(
 		deployCtx,
 		ctx,
-		clientset,
-		namespace,
+		opts.Clientset,
+		opts.Namespace,
 		deploymentName,
 		deploymentChanged,
 		deploymentCreated,
@@ -101,8 +110,8 @@ func DeployCaddy(
 	if err = resolveAndAssignPodName(
 		deployCtx,
 		ctx,
-		clientset,
-		namespace,
+		opts.Clientset,
+		opts.Namespace,
 		nodeName,
 		instance,
 		deploymentCreated,
@@ -844,53 +853,10 @@ func deployService(
 	instance *Instance,
 ) (bool, error) {
 	logger := log.With().Str("service", instance.ServiceName).Logger()
-	service := desiredClusterIPService(instance)
-	existingService, err := clientset.CoreV1().
-		Services(instance.Namespace).
-		Get(ctx, instance.DeploymentName, metav1.GetOptions{})
-	switch {
-	case err == nil:
-		updatedService := existingService.DeepCopy()
-		mergeServiceForUpdate(updatedService, service)
-		if !serviceNeedsUpdate(existingService, updatedService) {
-			logger.Debug().Msg("Caddy service already up-to-date")
-			return false, nil
-		}
-		_, err = clientset.CoreV1().
-			Services(instance.Namespace).
-			Update(ctx, updatedService, metav1.UpdateOptions{})
-		if err != nil {
-			logger.Error().Err(err).Msg("Failed to update existing Caddy service")
-			return false, fmt.Errorf(
-				"failed to update service %s: %w",
-				instance.DeploymentName,
-				err,
-			)
-		}
-		logger.Info().Msg("Updated existing Caddy service")
-		return true, nil
-	case apierrors.IsNotFound(err):
-		_, err = clientset.CoreV1().
-			Services(instance.Namespace).
-			Create(ctx, service, metav1.CreateOptions{})
-		if err != nil {
-			logger.Error().Err(err).Msg("Failed to create Caddy service")
-			return false, fmt.Errorf(
-				"failed to create service %s: %w",
-				instance.DeploymentName,
-				err,
-			)
-		}
-		logger.Info().Msg("Created Caddy service")
-		return true, nil
-	default:
-		logger.Error().Err(err).Msg("Failed to fetch existing Caddy service")
-		return false, fmt.Errorf(
-			"failed to get service %s: %w",
-			instance.DeploymentName,
-			err,
-		)
-	}
+	return upsertService(
+		ctx, clientset, instance.Namespace, instance.DeploymentName,
+		desiredClusterIPService(instance), logger,
+	)
 }
 
 func deployLoadBalancerService(
@@ -898,62 +864,58 @@ func deployLoadBalancerService(
 	clientset kubernetes.Interface,
 	instance *Instance,
 ) (bool, error) {
-	logger := log.With().
-		Str("loadbalancer_service", instance.DeploymentName+"-loadbalancer").
-		Logger()
-	loadBalancerServiceName := instance.DeploymentName + "-loadbalancer"
-	loadBalancerService := desiredLoadBalancerService(instance)
+	serviceName := instance.DeploymentName + "-loadbalancer"
+	logger := log.With().Str("service", serviceName).Logger()
+	desired := desiredLoadBalancerService(instance)
 	if len(instance.ExternalIPs) > 0 {
 		logger.Info().
 			Strs("externalIPs", instance.ExternalIPs).
 			Msg("Setting external IPs for LoadBalancer service")
-		loadBalancerService.Spec.ExternalIPs = instance.ExternalIPs
+		desired.Spec.ExternalIPs = instance.ExternalIPs
 	}
-	existingNPService, err := clientset.CoreV1().
-		Services(instance.Namespace).
-		Get(ctx, loadBalancerServiceName, metav1.GetOptions{})
+	return upsertService(ctx, clientset, instance.Namespace, serviceName, desired, logger)
+}
+
+func upsertService(
+	ctx context.Context,
+	clientset kubernetes.Interface,
+	namespace, serviceName string,
+	desired *corev1.Service,
+	logger zerolog.Logger,
+) (bool, error) {
+	existing, err := clientset.CoreV1().
+		Services(namespace).
+		Get(ctx, serviceName, metav1.GetOptions{})
 	switch {
 	case err == nil:
-		updatedService := existingNPService.DeepCopy()
-		mergeServiceForUpdate(updatedService, loadBalancerService)
-		if !serviceNeedsUpdate(existingNPService, updatedService) {
-			logger.Debug().Msg("LoadBalancer service already up-to-date")
+		updated := existing.DeepCopy()
+		mergeServiceForUpdate(updated, desired)
+		if !serviceNeedsUpdate(existing, updated) {
+			logger.Debug().Msg("Service already up-to-date")
 			return false, nil
 		}
 		_, err = clientset.CoreV1().
-			Services(instance.Namespace).
-			Update(ctx, updatedService, metav1.UpdateOptions{})
+			Services(namespace).
+			Update(ctx, updated, metav1.UpdateOptions{})
 		if err != nil {
-			logger.Error().Err(err).Msg("Failed to update existing LoadBalancer service")
-			return false, fmt.Errorf(
-				"failed to update LoadBalancer service %s: %w",
-				loadBalancerServiceName,
-				err,
-			)
+			logger.Error().Err(err).Msg("Failed to update service")
+			return false, fmt.Errorf("failed to update service %s: %w", serviceName, err)
 		}
-		logger.Info().Msg("Updated existing LoadBalancer service")
+		logger.Info().Msg("Updated service")
 		return true, nil
 	case apierrors.IsNotFound(err):
 		_, err = clientset.CoreV1().
-			Services(instance.Namespace).
-			Create(ctx, loadBalancerService, metav1.CreateOptions{})
+			Services(namespace).
+			Create(ctx, desired, metav1.CreateOptions{})
 		if err != nil {
-			logger.Error().Err(err).Msg("Failed to create LoadBalancer service")
-			return false, fmt.Errorf(
-				"failed to create LoadBalancer service %s: %w",
-				loadBalancerServiceName,
-				err,
-			)
+			logger.Error().Err(err).Msg("Failed to create service")
+			return false, fmt.Errorf("failed to create service %s: %w", serviceName, err)
 		}
-		logger.Info().Msg("Created LoadBalancer service")
+		logger.Info().Msg("Created service")
 		return true, nil
 	default:
-		logger.Error().Err(err).Msg("Failed to fetch existing LoadBalancer service")
-		return false, fmt.Errorf(
-			"failed to get LoadBalancer service %s: %w",
-			loadBalancerServiceName,
-			err,
-		)
+		logger.Error().Err(err).Msg("Failed to fetch existing service")
+		return false, fmt.Errorf("failed to get service %s: %w", serviceName, err)
 	}
 }
 
@@ -1240,8 +1202,4 @@ func cleanupDeployment(
 
 func hostPathTypePtr(t corev1.HostPathType) *corev1.HostPathType {
 	return new(t)
-}
-
-func StringPtr(s string) *string {
-	return new(s)
 }

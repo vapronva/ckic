@@ -33,6 +33,13 @@ type instanceJSON struct {
 	ExternalIPs    []string `json:"externalIPs,omitempty"`
 }
 
+func (i *Instance) StateKey() string {
+	if i == nil {
+		return ""
+	}
+	return i.NodeName + "|" + i.Namespace + "|" + i.DeploymentName + "|" + i.ServiceName + "|" + i.PodName
+}
+
 func (i *Instance) MarshalJSON() ([]byte, error) {
 	return json.Marshal(instanceJSON{
 		NodeName:       i.NodeName,

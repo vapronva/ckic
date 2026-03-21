@@ -15,6 +15,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+
+	"git.horse/vapronva/ckic/pkg/constants"
 )
 
 type NamespaceAggregator struct {
@@ -26,8 +28,6 @@ type NamespaceAggregator struct {
 	lastPublishedVersion    uint64
 	base                    string
 	externals               map[string]string
-	lastPushedMerged        string
-	lastPublishedToMirror   string
 	clientset               kubernetes.Interface
 	namespace               string
 	publishAggregated       bool
@@ -67,6 +67,39 @@ func NewNamespaceAggregator(
 	}
 }
 
+type dispatchOpts struct {
+	skipInitGuard bool
+	operation     string
+}
+
+func (a *NamespaceAggregator) dispatchAfterMutation(
+	snapshot updateSnapshot,
+	logger zerolog.Logger,
+	opts dispatchOpts,
+) {
+	if !opts.skipInitGuard && snapshot.initializing {
+		logger.Debug().Msg("Updated during initialization, deferring push")
+		return
+	}
+	if snapshot.mirrorDirty {
+		a.publishSnapshot(logger, snapshot, opts.operation)
+	}
+	if !snapshot.nodeDirty {
+		logger.Debug().
+			Msgf("Merged config unchanged for %s, skipping push", opts.operation)
+		return
+	}
+	if a.nodeAvailabilityCheck != nil && !a.nodeAvailabilityCheck() {
+		logger.Info().
+			Msgf("No nodes available for %s, skipping config push", opts.operation)
+		return
+	}
+	if a.configUpdateHandler == nil {
+		return
+	}
+	a.pushSnapshotToNodes(logger, snapshot, opts.operation)
+}
+
 func (a *NamespaceAggregator) UpdateBase(base string) {
 	logger := log.With().Str("component", "aggregator").Logger()
 	snapshot := a.snapshotAfterMutation(func() {
@@ -76,34 +109,9 @@ func (a *NamespaceAggregator) UpdateBase(base string) {
 			a.stateVersion++
 		}
 	})
-	if snapshot.initializing {
-		logger.Debug().Msg("Base updated during initialization, deferring push")
-		return
-	}
-	if snapshot.mirrorDirty {
-		a.publishSnapshot(
-			logger,
-			snapshot,
-			"Skipping stale mirror publish for base update",
-			"Failed to publish aggregated ConfigMap",
-		)
-	}
-	if !snapshot.nodeDirty {
-		logger.Debug().
-			Msg("Base updated but merged config unchanged for nodes, skipping push")
-		return
-	}
-	if !a.canPushToNodes(
-		logger,
-		"Base updated but no nodes available, skipping config push",
-	) {
-		return
-	}
-	a.pushSnapshotToNodes(
-		logger,
-		snapshot,
-		"Skipping stale node push for base update",
-	)
+	a.dispatchAfterMutation(snapshot, logger, dispatchOpts{
+		operation: "base update",
+	})
 }
 
 func (a *NamespaceAggregator) SetExternal(namespace, fragment string) {
@@ -118,57 +126,32 @@ func (a *NamespaceAggregator) SetExternal(namespace, fragment string) {
 			a.stateVersion++
 		}
 	})
-	if snapshot.initializing {
-		logger.Debug().
-			Msg("External fragment updated during initialization, deferring push")
-		return
-	}
-	if snapshot.mirrorDirty {
-		logger.Info().Msg("External fragment updated, publishing to mirror")
-		a.publishSnapshot(
-			logger,
-			snapshot,
-			"Skipping stale mirror publish for external update",
-			"Failed to publish aggregated ConfigMap",
-		)
-	}
-	if !snapshot.nodeDirty {
-		logger.Debug().
-			Msg("External fragment updated but merged config unchanged for nodes, skipping push")
-		return
-	}
-	logger.Info().Msg("External fragment updated, pushing to nodes")
-	if !a.canPushToNodes(
-		logger,
-		"External updated but no nodes available, skipping config push",
-	) {
-		return
-	}
-	a.pushSnapshotToNodes(
-		logger,
-		snapshot,
-		"Skipping stale node push for external update",
-	)
+	a.dispatchAfterMutation(snapshot, logger, dispatchOpts{
+		operation: "external update",
+	})
 }
 
 func (a *NamespaceAggregator) SetExternalBatch(externals map[string]string) {
 	logger := log.With().Str("component", "aggregator").Logger()
-	a.mu.Lock()
-	changed := false
-	for namespace, fragment := range externals {
-		if a.externals[namespace] != fragment {
-			changed = true
-			break
+	snapshot := a.snapshotAfterMutation(func() {
+		changed := false
+		for namespace, fragment := range externals {
+			if a.externals[namespace] != fragment {
+				changed = true
+				break
+			}
 		}
-	}
-	maps.Copy(a.externals, externals)
-	if changed {
-		a.stateVersion++
-	}
-	a.mu.Unlock()
+		maps.Copy(a.externals, externals)
+		if changed {
+			a.stateVersion++
+		}
+	})
 	logger.Info().
 		Int("count", len(externals)).
-		Msg("Batch loaded external fragments during initialization")
+		Msg("Batch loaded external fragments")
+	a.dispatchAfterMutation(snapshot, logger, dispatchOpts{
+		operation: "batch external update",
+	})
 }
 
 func (a *NamespaceAggregator) MarkInitialized() {
@@ -181,30 +164,10 @@ func (a *NamespaceAggregator) MarkInitialized() {
 		}
 	})
 	logger.Info().Msg("Aggregator initialization complete, performing initial push")
-	if snapshot.mirrorDirty {
-		a.publishSnapshot(
-			logger,
-			snapshot,
-			"Skipping stale mirror publish on initialization",
-			"Failed to publish aggregated ConfigMap on initialization",
-		)
-	}
-	if !snapshot.nodeDirty {
-		logger.Debug().
-			Msg("Merged config unchanged for nodes after initialization, skipping push")
-		return
-	}
-	if !a.canPushToNodes(
-		logger,
-		"Initialization complete but no nodes available, skipping config push",
-	) {
-		return
-	}
-	a.pushSnapshotToNodes(
-		logger,
-		snapshot,
-		"Skipping stale node push on initialization",
-	)
+	a.dispatchAfterMutation(snapshot, logger, dispatchOpts{
+		skipInitGuard: true,
+		operation:     "initialization",
+	})
 }
 
 func (a *NamespaceAggregator) RemoveExternal(namespace string) {
@@ -218,32 +181,10 @@ func (a *NamespaceAggregator) RemoveExternal(namespace string) {
 			a.stateVersion++
 		}
 	})
-	if snapshot.mirrorDirty {
-		logger.Info().Msg("External fragment removed, publishing to mirror")
-		a.publishSnapshot(
-			logger,
-			snapshot,
-			"Skipping stale mirror publish for external removal",
-			"Failed to publish aggregated ConfigMap",
-		)
-	}
-	if !snapshot.nodeDirty {
-		logger.Debug().
-			Msg("External fragment removed but merged config unchanged for nodes, skipping push")
-		return
-	}
-	logger.Info().Msg("External fragment removed, pushing to nodes")
-	if !a.canPushToNodes(
-		logger,
-		"External removed but no nodes available, skipping config push",
-	) {
-		return
-	}
-	a.pushSnapshotToNodes(
-		logger,
-		snapshot,
-		"Skipping stale node push for external removal",
-	)
+	a.dispatchAfterMutation(snapshot, logger, dispatchOpts{
+		skipInitGuard: true,
+		operation:     "external removal",
+	})
 }
 
 func (a *NamespaceAggregator) snapshotAfterMutation(
@@ -265,7 +206,7 @@ func (a *NamespaceAggregator) snapshotAfterMutation(
 func (a *NamespaceAggregator) publishSnapshot(
 	logger zerolog.Logger,
 	snapshot updateSnapshot,
-	staleMsg, errorMsg string,
+	operation string,
 ) {
 	if !a.publishAggregated {
 		return
@@ -273,40 +214,31 @@ func (a *NamespaceAggregator) publishSnapshot(
 	a.publishMu.Lock()
 	defer a.publishMu.Unlock()
 	if a.isStaleMirrorPublish(snapshot.version) {
-		logger.Debug().Msg(staleMsg)
+		logger.Debug().Msgf("Skipping stale mirror publish for %s", operation)
 		return
 	}
 	if err := a.publishMirrorConfigMap(snapshot.merged); err != nil {
-		logger.Error().Err(err).Msg(errorMsg)
+		logger.Error().
+			Err(err).
+			Msgf("Failed to publish aggregated ConfigMap for %s", operation)
 		return
 	}
-	a.recordMirrorPublish(snapshot.version, snapshot.merged)
-}
-
-func (a *NamespaceAggregator) canPushToNodes(
-	logger zerolog.Logger,
-	noNodesMsg string,
-) bool {
-	if a.nodeAvailabilityCheck != nil && !a.nodeAvailabilityCheck() {
-		logger.Info().Msg(noNodesMsg)
-		return false
-	}
-	return a.configUpdateHandler != nil
+	a.recordMirrorPublish(snapshot.version)
 }
 
 func (a *NamespaceAggregator) pushSnapshotToNodes(
 	logger zerolog.Logger,
 	snapshot updateSnapshot,
-	staleMsg string,
+	operation string,
 ) {
 	a.nodePushMu.Lock()
 	defer a.nodePushMu.Unlock()
 	if a.isStaleNodePush(snapshot.version) {
-		logger.Debug().Msg(staleMsg)
+		logger.Debug().Msgf("Skipping stale node push for %s", operation)
 		return
 	}
 	a.configUpdateHandler(snapshot.merged)
-	a.recordNodePush(snapshot.version, snapshot.merged)
+	a.recordNodePush(snapshot.version)
 }
 
 func (a *NamespaceAggregator) isStaleMirrorPublish(version uint64) bool {
@@ -321,23 +253,21 @@ func (a *NamespaceAggregator) isStaleNodePush(version uint64) bool {
 	return version < a.stateVersion || version <= a.lastPushedVersion
 }
 
-func (a *NamespaceAggregator) recordMirrorPublish(version uint64, merged string) {
+func (a *NamespaceAggregator) recordMirrorPublish(version uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if version <= a.lastPublishedVersion {
 		return
 	}
-	a.lastPublishedToMirror = merged
 	a.lastPublishedVersion = version
 }
 
-func (a *NamespaceAggregator) recordNodePush(version uint64, merged string) {
+func (a *NamespaceAggregator) recordNodePush(version uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if version <= a.lastPushedVersion {
 		return
 	}
-	a.lastPushedMerged = merged
 	a.lastPushedVersion = version
 }
 
@@ -390,7 +320,6 @@ func (a *NamespaceAggregator) EnsureNodeSync() {
 	}
 	handler(merged)
 	a.mu.Lock()
-	a.lastPushedMerged = merged
 	if version > a.lastPushedVersion {
 		a.lastPushedVersion = version
 	}
@@ -422,7 +351,7 @@ func (a *NamespaceAggregator) publishMirrorConfigMap(mergedConfig string) error 
 				},
 			},
 			Data: map[string]string{
-				"Caddyfile": mergedConfig,
+				constants.CaddyfileKey: mergedConfig,
 			},
 		}
 		_, err = a.clientset.CoreV1().
@@ -437,7 +366,7 @@ func (a *NamespaceAggregator) publishMirrorConfigMap(mergedConfig string) error 
 	if cm.Data == nil {
 		cm.Data = make(map[string]string)
 	}
-	cm.Data["Caddyfile"] = mergedConfig
+	cm.Data[constants.CaddyfileKey] = mergedConfig
 	_, err = a.clientset.CoreV1().
 		ConfigMaps(a.namespace).
 		Update(ctx, cm, metav1.UpdateOptions{})

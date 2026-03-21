@@ -14,15 +14,10 @@ import (
 	"git.horse/vapronva/ckic/pkg/constants"
 )
 
-type StateStore interface {
-	SaveState(state map[string]*caddy.Instance) error
-	LoadState() (map[string]*caddy.Instance, error)
-}
-
 type ConfigMapStateStore struct {
-	Client    kubernetes.Interface
-	Namespace string
-	Name      string
+	client    kubernetes.Interface
+	namespace string
+	name      string
 }
 
 func NewConfigMapStateStore(
@@ -30,27 +25,30 @@ func NewConfigMapStateStore(
 	namespace, name string,
 ) *ConfigMapStateStore {
 	return &ConfigMapStateStore{
-		Client:    client,
-		Namespace: namespace,
-		Name:      name,
+		client:    client,
+		namespace: namespace,
+		name:      name,
 	}
 }
 
-func (s *ConfigMapStateStore) SaveState(state map[string]*caddy.Instance) error {
+func (s *ConfigMapStateStore) SaveState(
+	ctx context.Context,
+	state map[string]*caddy.Instance,
+) error {
 	data, err := json.Marshal(state)
 	if err != nil {
 		return fmt.Errorf("failed to marshal state: %w", err)
 	}
-	return s.upsertStateConfigMap(context.Background(), string(data))
+	return s.upsertStateConfigMap(ctx, string(data))
 }
 
 func (s *ConfigMapStateStore) upsertStateConfigMap(
 	ctx context.Context,
 	data string,
 ) error {
-	cm, err := s.Client.CoreV1().
-		ConfigMaps(s.Namespace).
-		Get(ctx, s.Name, metav1.GetOptions{})
+	cm, err := s.client.CoreV1().
+		ConfigMaps(s.namespace).
+		Get(ctx, s.name, metav1.GetOptions{})
 	if err == nil {
 		return s.updateStateConfigMap(ctx, cm, data)
 	}
@@ -59,22 +57,22 @@ func (s *ConfigMapStateStore) upsertStateConfigMap(
 	}
 	cm = &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      s.Name,
-			Namespace: s.Namespace,
+			Name:      s.name,
+			Namespace: s.namespace,
 		},
 		Data: map[string]string{
 			constants.StateKey: data,
 		},
 	}
-	if _, err = s.Client.CoreV1().
-		ConfigMaps(s.Namespace).
+	if _, err = s.client.CoreV1().
+		ConfigMaps(s.namespace).
 		Create(ctx, cm, metav1.CreateOptions{}); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
 			return fmt.Errorf("failed to create state ConfigMap: %w", err)
 		}
-		existingCM, getErr := s.Client.CoreV1().
-			ConfigMaps(s.Namespace).
-			Get(ctx, s.Name, metav1.GetOptions{})
+		existingCM, getErr := s.client.CoreV1().
+			ConfigMaps(s.namespace).
+			Get(ctx, s.name, metav1.GetOptions{})
 		if getErr != nil {
 			return fmt.Errorf(
 				"failed to get state ConfigMap after create conflict: %w",
@@ -95,18 +93,20 @@ func (s *ConfigMapStateStore) updateStateConfigMap(
 		cm.Data = make(map[string]string)
 	}
 	cm.Data[constants.StateKey] = data
-	if _, err := s.Client.CoreV1().
-		ConfigMaps(s.Namespace).
+	if _, err := s.client.CoreV1().
+		ConfigMaps(s.namespace).
 		Update(ctx, cm, metav1.UpdateOptions{}); err != nil {
 		return fmt.Errorf("failed to update state ConfigMap: %w", err)
 	}
 	return nil
 }
 
-func (s *ConfigMapStateStore) LoadState() (map[string]*caddy.Instance, error) {
+func (s *ConfigMapStateStore) LoadState(
+	ctx context.Context,
+) (map[string]*caddy.Instance, error) {
 	stateMap := make(map[string]*caddy.Instance)
-	cm, err := s.Client.CoreV1().ConfigMaps(s.Namespace).Get(
-		context.Background(), s.Name, metav1.GetOptions{})
+	cm, err := s.client.CoreV1().ConfigMaps(s.namespace).Get(
+		ctx, s.name, metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get state ConfigMap: %w", err)
 	}
@@ -120,7 +120,7 @@ func (s *ConfigMapStateStore) LoadState() (map[string]*caddy.Instance, error) {
 	}
 	for _, instance := range stateMap {
 		if instance != nil {
-			instance.KubeClient = s.Client
+			instance.KubeClient = s.client
 		}
 	}
 	return stateMap, nil

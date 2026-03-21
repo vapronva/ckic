@@ -74,34 +74,13 @@ func (w *ConfigWatcher) Pause() {
 	}
 }
 
-func (w *ConfigWatcher) Resume() {
+func (w *ConfigWatcher) recordSuccessAndDispatch(configData string) {
 	w.mu.Lock()
-	wasPaused := w.isPaused
-	if wasPaused {
-		w.isPaused = false
-		log.Info().Msg("ConfigMap watcher resumed")
-	}
-	shouldProcess := w.hasCachedConfig && w.nodeAvailableCheck != nil &&
-		w.nodeAvailableCheck()
-	var configToProcess string
-	shouldSkip := false
-	if shouldProcess {
-		if w.cachedConfig != w.lastProcessedConfig {
-			configToProcess = w.cachedConfig
-		} else {
-			shouldSkip = true
-		}
-		w.hasCachedConfig = false
-	}
+	w.lastProcessedConfig = configData
+	w.lastSuccess = time.Now()
+	w.failureCount = 0
 	w.mu.Unlock()
-	if shouldSkip {
-		log.Debug().Msg("Cached config unchanged, skipping handler on resume")
-	} else if configToProcess != "" {
-		w.configHandler(configToProcess)
-		w.mu.Lock()
-		w.lastProcessedConfig = configToProcess
-		w.mu.Unlock()
-	}
+	w.configHandler(configData)
 }
 
 func (w *ConfigWatcher) SetForceSyncHandler(handler func()) {
@@ -129,12 +108,12 @@ func (w *ConfigWatcher) EnsureSync() {
 	nodeAvailableCheck := w.nodeAvailableCheck
 	w.mu.Unlock()
 	if shouldProcessCached && cachedConfig != "" && configHandler != nil {
-		configHandler(cachedConfig)
 		w.mu.Lock()
 		w.lastProcessedConfig = cachedConfig
 		w.lastSuccess = time.Now()
 		w.failureCount = 0
 		w.mu.Unlock()
+		configHandler(cachedConfig)
 		if forceSyncHandler == nil {
 			return
 		}
@@ -160,13 +139,6 @@ func (w *ConfigWatcher) EnsureSync() {
 	w.mu.Unlock()
 }
 
-func minDuration(a, b time.Duration) time.Duration {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 func (w *ConfigWatcher) refreshResourceVersion(
 	ctx context.Context,
 	logger zerolog.Logger,
@@ -181,7 +153,7 @@ func (w *ConfigWatcher) refreshResourceVersion(
 	logger.Info().
 		Str("resourceVersion", w.lastResourceVersion).
 		Msg("Resource version refreshed")
-	if configData, exists := cm.Data["Caddyfile"]; exists {
+	if configData, exists := cm.Data[constants.CaddyfileKey]; exists {
 		w.mu.RLock()
 		lastProcessed := w.lastProcessedConfig
 		w.mu.RUnlock()
@@ -191,11 +163,7 @@ func (w *ConfigWatcher) refreshResourceVersion(
 		}
 		if w.nodeAvailableCheck() {
 			logger.Info().Msg("Refreshed ConfigMap loaded, updating configuration")
-			w.configHandler(configData)
-			w.mu.Lock()
-			w.lastProcessedConfig = configData
-			w.lastSuccess = time.Now()
-			w.mu.Unlock()
+			w.recordSuccessAndDispatch(configData)
 		} else {
 			logger.Info().
 				Msg("Refreshed ConfigMap loaded but no eligible nodes, caching config")
@@ -295,7 +263,7 @@ func (w *ConfigWatcher) runConfigWatchCycle(
 	}
 	logger.Info().Msg("ConfigMap watch channel closed, restarting")
 	time.Sleep(delay)
-	return minDuration(time.Duration(float64(delay)*multiplier), maxDelay), true
+	return min(time.Duration(float64(delay)*multiplier), maxDelay), true
 }
 
 func (w *ConfigWatcher) handleWatchCreateFailure(
@@ -313,13 +281,14 @@ func (w *ConfigWatcher) handleWatchCreateFailure(
 	failureCount := w.failureCount
 	w.mu.Unlock()
 	if failureCount >= w.maxFailures {
-		sleepTime := w.resetTimeout
+		sleepTime := w.resetTimeout - time.Since(w.lastSuccess)
 		if sleepTime > 0 {
 			logger.Warn().Msgf("Circuit breaker open, sleeping for %v", sleepTime)
 			time.Sleep(sleepTime)
 		}
 		w.mu.Lock()
 		w.failureCount = 0
+		w.lastSuccess = time.Now()
 		w.mu.Unlock()
 		if errRV := w.refreshResourceVersion(ctx, logger); errRV != nil {
 			logger.Error().Err(errRV).Msg("Failed to refresh resource version")
@@ -327,7 +296,7 @@ func (w *ConfigWatcher) handleWatchCreateFailure(
 		return delay
 	}
 	time.Sleep(delay)
-	return minDuration(time.Duration(float64(delay)*multiplier), maxDelay)
+	return min(time.Duration(float64(delay)*multiplier), maxDelay)
 }
 
 func (w *ConfigWatcher) consumeConfigEvents(
@@ -392,7 +361,7 @@ func (w *ConfigWatcher) handleConfigMapUpdate(
 	eventType watch.EventType,
 	logger zerolog.Logger,
 ) {
-	configData, exists := cm.Data["Caddyfile"]
+	configData, exists := cm.Data[constants.CaddyfileKey]
 	if !exists {
 		logger.Warn().Msg("Updated ConfigMap missing Caddyfile key")
 		return
@@ -410,12 +379,7 @@ func (w *ConfigWatcher) handleConfigMapUpdate(
 		logger.Info().
 			Str("event", string(eventType)).
 			Msg("ConfigMap updated, notifying handlers")
-		w.configHandler(configData)
-		w.mu.Lock()
-		w.lastProcessedConfig = configData
-		w.lastSuccess = time.Now()
-		w.failureCount = 0
-		w.mu.Unlock()
+		w.recordSuccessAndDispatch(configData)
 		return
 	}
 	logger.Info().Msg("ConfigMap updated but no eligible nodes available, caching config")
@@ -460,7 +424,7 @@ func (w *ConfigWatcher) createDefaultInitialConfigMap(
 			Namespace: w.namespace,
 		},
 		Data: map[string]string{
-			"Caddyfile": ":80 {\n    respond \"Hello, world!\"\n}\n",
+			constants.CaddyfileKey: ":80 {\n    respond \"Hello, world!\"\n}\n",
 		},
 	}
 	_, err := w.clientset.CoreV1().
@@ -477,17 +441,17 @@ func (w *ConfigWatcher) applyInitialConfig(
 	configMap *corev1.ConfigMap,
 	logger zerolog.Logger,
 ) {
-	configData, exists := configMap.Data["Caddyfile"]
+	configData, exists := configMap.Data[constants.CaddyfileKey]
 	if !exists {
 		logger.Warn().Msg("ConfigMap missing Caddyfile key")
 		return
 	}
 	logger.Info().Msg("Initial ConfigMap loaded")
 	if w.nodeAvailableCheck() {
-		w.configHandler(configData)
 		w.mu.Lock()
 		w.lastProcessedConfig = configData
 		w.mu.Unlock()
+		w.configHandler(configData)
 		return
 	}
 	logger.Info().Msg("No eligible nodes available, caching initial config")

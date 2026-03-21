@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"fmt"
 	"os"
 
 	"k8s.io/client-go/kubernetes"
@@ -11,11 +12,11 @@ import (
 func GetKubernetesClient(kubeconfig string) (*kubernetes.Clientset, error) {
 	config, err := getKubernetesConfig(kubeconfig)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to build kubernetes config: %w", err)
 	}
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create kubernetes client: %w", err)
 	}
 	return clientset, nil
 }
@@ -30,10 +31,6 @@ func getKubernetesConfig(kubeconfig string) (*rest.Config, error) {
 			return config, nil
 		}
 	}
-	return loadDefaultKubernetesConfig()
-}
-
-func loadDefaultKubernetesConfig() (*rest.Config, error) {
 	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
 		clientcmd.NewDefaultClientConfigLoadingRules(),
 		&clientcmd.ConfigOverrides{},

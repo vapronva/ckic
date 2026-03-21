@@ -10,32 +10,19 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
-	"k8s.io/client-go/kubernetes"
 
 	"git.horse/vapronva/ckic/pkg/caddy"
-	"git.horse/vapronva/ckic/pkg/constants"
 	"git.horse/vapronva/ckic/pkg/utils"
 )
 
 type ConfigHandler struct {
-	CommunicationMethod caddy.CommunicationMethod
-	Clientset           kubernetes.Interface
-	Namespace           string
-	CaddyImage          string
-	EnableLoadBalancer  bool
-	DeployedInstances   map[string]*caddy.Instance
-	Mu                  *sync.RWMutex
+	deployOpts          caddy.DeployOptions
+	communicationMethod caddy.CommunicationMethod
+	caddyAdminOriginKey string
+	externalEndpoints   utils.ExternalEndpointsMap
+	deployedInstances   map[string]*caddy.Instance
+	mu                  *sync.RWMutex
 	handleMu            sync.Mutex
-	EnvSecretName       string
-	EnvSecretKeys       []string
-	DataVolumePVC       string
-	ConfigVolumePVC     string
-	ConfigMapName       string
-	ExternalEndpoints   utils.ExternalEndpointsMap
-	UseHostNetwork      bool
-	CaddyAdminOriginKey string
-	HTTPHostPort        int
-	HTTPSHostPort       int
 	lastConfigDigest    string
 	instanceDigests     map[string]string
 	instanceSignatures  map[string]string
@@ -52,45 +39,29 @@ type configUpdateResult struct {
 }
 
 const (
-	configUpdateConcurrency = 5
-	configUpdateRetryCount  = 3
-	configUpdateRetryFactor = 2
-	maxInstanceFailureCount = 5
+	configUpdateDelay         = 1 * time.Second
+	configUpdateConcurrency   = 5
+	configUpdateRetryCount    = 3
+	configUpdateRetryFactor   = 2
+	maxInstanceFailureCount   = 5
+	redeployConfigPushTimeout = 2 * time.Minute
 )
 
 func NewConfigHandler(
+	deployOpts caddy.DeployOptions,
 	method caddy.CommunicationMethod,
-	clientset kubernetes.Interface,
-	namespace, caddyImage string,
-	enableLoadBalancer bool,
+	caddyAdminOriginKey string,
+	externalEndpoints utils.ExternalEndpointsMap,
 	instances map[string]*caddy.Instance,
 	mu *sync.RWMutex,
-	envSecretName string,
-	envSecretKeys []string,
-	dataVolumePVC, configVolumePVC, configMapName string,
-	externalEndpoints utils.ExternalEndpointsMap,
-	useHostNetwork bool,
-	caddyAdminOriginKey string,
-	httpHostPort, httpsHostPort int,
 ) *ConfigHandler {
 	return &ConfigHandler{
-		CommunicationMethod: method,
-		Clientset:           clientset,
-		Namespace:           namespace,
-		CaddyImage:          caddyImage,
-		EnableLoadBalancer:  enableLoadBalancer,
-		DeployedInstances:   instances,
-		Mu:                  mu,
-		EnvSecretName:       envSecretName,
-		EnvSecretKeys:       envSecretKeys,
-		DataVolumePVC:       dataVolumePVC,
-		ConfigVolumePVC:     configVolumePVC,
-		ConfigMapName:       configMapName,
-		ExternalEndpoints:   externalEndpoints,
-		UseHostNetwork:      useHostNetwork,
-		CaddyAdminOriginKey: caddyAdminOriginKey,
-		HTTPHostPort:        httpHostPort,
-		HTTPSHostPort:       httpsHostPort,
+		deployOpts:          deployOpts,
+		communicationMethod: method,
+		caddyAdminOriginKey: caddyAdminOriginKey,
+		externalEndpoints:   externalEndpoints,
+		deployedInstances:   instances,
+		mu:                  mu,
 		instanceDigests:     make(map[string]string),
 		instanceSignatures:  make(map[string]string),
 	}
@@ -99,7 +70,6 @@ func NewConfigHandler(
 func (h *ConfigHandler) Handle(configData string) {
 	h.handleMu.Lock()
 	defer h.handleMu.Unlock()
-	h.ensureTrackingMaps()
 	logger := log.With().Str("component", "config_handler").Logger()
 	configDigest := calculateConfigDigest(configData)
 	logger.Info().Msg("Detected configuration change, updating Caddy instances")
@@ -112,41 +82,44 @@ func (h *ConfigHandler) Handle(configData string) {
 			Msg("No deployed instances, skipping config push")
 		return
 	}
-	if configDigest == h.lastConfigDigest &&
-		h.allInstancesAtDigest(instancesCopy, configDigest) {
+	instancesToUpdate := make(map[string]*caddy.Instance)
+	for nodeName, instance := range instancesCopy {
+		if h.instanceDigests[nodeName] != configDigest ||
+			h.instanceSignatures[nodeName] != instanceStateSignature(instance) {
+			instancesToUpdate[nodeName] = instance
+		}
+	}
+	if len(instancesToUpdate) == 0 {
 		logger.Info().
 			Str("configDigest", configDigest).
-			Msg("Configuration digest unchanged across all instances, skipping update")
+			Msg("All instances already at desired digest, skipping update")
+		h.lastConfigDigest = configDigest
 		return
 	}
-	time.Sleep(constants.ConfigUpdateDelay)
+	time.Sleep(configUpdateDelay)
 	updateResult := h.updateAllInstances(
-		instancesCopy,
+		instancesToUpdate,
 		configData,
 		h.adminAPIConfig(),
 		logger,
 	)
 	h.applySuccessfulUpdates(updateResult.successfulNodes, instancesCopy, configDigest)
-	h.redeployFailedInstances(updateResult.failedInstances, configDigest, logger)
+	h.redeployFailedInstances(
+		updateResult.failedInstances,
+		configData,
+		configDigest,
+		logger,
+	)
 	if h.allCurrentInstancesConverged(configDigest) {
 		h.lastConfigDigest = configDigest
 	}
 }
 
-func (h *ConfigHandler) ensureTrackingMaps() {
-	if h.instanceDigests == nil {
-		h.instanceDigests = make(map[string]string)
-	}
-	if h.instanceSignatures == nil {
-		h.instanceSignatures = make(map[string]string)
-	}
-}
-
 func (h *ConfigHandler) snapshotInstances() map[string]*caddy.Instance {
-	h.Mu.RLock()
-	defer h.Mu.RUnlock()
-	instancesCopy := make(map[string]*caddy.Instance, len(h.DeployedInstances))
-	maps.Copy(instancesCopy, h.DeployedInstances)
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	instancesCopy := make(map[string]*caddy.Instance, len(h.deployedInstances))
+	maps.Copy(instancesCopy, h.deployedInstances)
 	return instancesCopy
 }
 
@@ -164,10 +137,10 @@ func (h *ConfigHandler) pruneTrackingMaps(instancesCopy map[string]*caddy.Instan
 }
 
 func (h *ConfigHandler) adminAPIConfig() *caddy.AdminAPIConfig {
-	if h.CaddyAdminOriginKey == "" {
+	if h.caddyAdminOriginKey == "" {
 		return nil
 	}
-	return &caddy.AdminAPIConfig{OriginKey: h.CaddyAdminOriginKey}
+	return &caddy.AdminAPIConfig{OriginKey: h.caddyAdminOriginKey}
 }
 
 func (h *ConfigHandler) updateAllInstances(
@@ -248,7 +221,7 @@ func (h *ConfigHandler) updateInstanceWithRetry(
 		err = instance.UpdateConfig(
 			context.Background(),
 			effectiveConfig,
-			h.CommunicationMethod,
+			h.communicationMethod,
 			apiConfig,
 		)
 		if err == nil {
@@ -267,13 +240,13 @@ func (h *ConfigHandler) handleInstanceUpdateFailure(
 	instanceLogger.Error().
 		Err(updateErr).
 		Msg("Failed to update Caddy configuration")
-	h.Mu.RLock()
-	current := h.DeployedInstances[nodeName] == instance
+	h.mu.RLock()
+	current := h.deployedInstances[nodeName] == instance
 	var newCount int32
 	if current {
 		newCount = instance.FailureCount.Add(1)
 	}
-	h.Mu.RUnlock()
+	h.mu.RUnlock()
 	if !current {
 		instanceLogger.Debug().
 			Msg("Instance replaced during update, skipping failure tracking")
@@ -296,12 +269,12 @@ func (h *ConfigHandler) handleInstanceUpdateSuccess(
 	instanceLogger zerolog.Logger,
 ) (failedInstance, string, bool) {
 	instanceLogger.Info().Msg("Successfully updated Caddy configuration")
-	h.Mu.RLock()
-	current := h.DeployedInstances[nodeName] == instance
+	h.mu.RLock()
+	current := h.deployedInstances[nodeName] == instance
 	if current {
 		instance.FailureCount.Store(0)
 	}
-	h.Mu.RUnlock()
+	h.mu.RUnlock()
 	if !current {
 		instanceLogger.Debug().
 			Msg("Instance replaced during update, skipping failure reset")
@@ -325,6 +298,7 @@ func (h *ConfigHandler) applySuccessfulUpdates(
 
 func (h *ConfigHandler) redeployFailedInstances(
 	failedInstances []failedInstance,
+	configData string,
 	configDigest string,
 	logger zerolog.Logger,
 ) {
@@ -333,12 +307,13 @@ func (h *ConfigHandler) redeployFailedInstances(
 	}
 	logger.Info().Msgf("Redeploying %d failed instances", len(failedInstances))
 	for _, failed := range failedInstances {
-		h.redeployFailedInstance(failed, configDigest, logger)
+		h.redeployFailedInstance(failed, configData, configDigest, logger)
 	}
 }
 
 func (h *ConfigHandler) redeployFailedInstance(
 	failed failedInstance,
+	configData string,
 	configDigest string,
 	logger zerolog.Logger,
 ) {
@@ -351,7 +326,7 @@ func (h *ConfigHandler) redeployFailedInstance(
 			Err(deleteErr).
 			Str("node", failed.nodeName).
 			Msg("Failed to delete failed Caddy instance")
-		h.restoreFailedInstanceIfMissing(failed.nodeName, current)
+		restoreInstanceIfMissing(h.mu, h.deployedInstances, failed.nodeName, current)
 		h.clearInstanceTracking(failed.nodeName)
 		return
 	}
@@ -361,7 +336,7 @@ func (h *ConfigHandler) redeployFailedInstance(
 			Err(redeployErr).
 			Str("node", failed.nodeName).
 			Msg("Failed to redeploy Caddy instance")
-		h.restoreFailedInstanceIfMissing(failed.nodeName, current)
+		restoreInstanceIfMissing(h.mu, h.deployedInstances, failed.nodeName, current)
 		h.clearInstanceTracking(failed.nodeName)
 		return
 	}
@@ -378,6 +353,23 @@ func (h *ConfigHandler) redeployFailedInstance(
 		h.clearInstanceTracking(failed.nodeName)
 		return
 	}
+	pushCtx, pushCancel := context.WithTimeout(
+		context.Background(), redeployConfigPushTimeout,
+	)
+	defer pushCancel()
+	if pushErr := newInstance.UpdateConfig(
+		pushCtx,
+		configData,
+		h.communicationMethod,
+		h.adminAPIConfig(),
+	); pushErr != nil {
+		logger.Error().
+			Err(pushErr).
+			Str("node", failed.nodeName).
+			Msg("Failed to push config to redeployed instance")
+		h.clearInstanceTracking(failed.nodeName)
+		return
+	}
 	h.instanceDigests[failed.nodeName] = configDigest
 	h.instanceSignatures[failed.nodeName] = instanceStateSignature(newInstance)
 	logger.Info().
@@ -389,9 +381,9 @@ func (h *ConfigHandler) prepareFailedInstanceRedeploy(
 	failed failedInstance,
 	logger zerolog.Logger,
 ) (*caddy.Instance, bool) {
-	h.Mu.Lock()
-	defer h.Mu.Unlock()
-	current := h.DeployedInstances[failed.nodeName]
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	current := h.deployedInstances[failed.nodeName]
 	if current == nil {
 		logger.Debug().
 			Str("node", failed.nodeName).
@@ -404,25 +396,11 @@ func (h *ConfigHandler) prepareFailedInstanceRedeploy(
 			Msg("Failed instance was replaced, skipping redeployment")
 		return nil, false
 	}
-	delete(h.DeployedInstances, failed.nodeName)
+	delete(h.deployedInstances, failed.nodeName)
 	logger.Info().
 		Str("node", failed.nodeName).
 		Msg("Redeploying failed Caddy instance")
 	return current, true
-}
-
-func (h *ConfigHandler) restoreFailedInstanceIfMissing(
-	nodeName string,
-	instance *caddy.Instance,
-) {
-	if instance == nil {
-		return
-	}
-	h.Mu.Lock()
-	if _, exists := h.DeployedInstances[nodeName]; !exists {
-		h.DeployedInstances[nodeName] = instance
-	}
-	h.Mu.Unlock()
 }
 
 func (h *ConfigHandler) clearInstanceTracking(nodeName string) {
@@ -433,23 +411,11 @@ func (h *ConfigHandler) clearInstanceTracking(nodeName string) {
 func (h *ConfigHandler) deployReplacementInstance(
 	nodeName string,
 ) (*caddy.Instance, error) {
-	externalIPs := h.ExternalEndpoints[nodeName]
 	return caddy.DeployCaddy(
 		context.Background(),
-		h.Clientset,
+		h.deployOpts,
 		nodeName,
-		h.Namespace,
-		h.CaddyImage,
-		h.EnableLoadBalancer,
-		externalIPs,
-		h.EnvSecretName,
-		h.EnvSecretKeys,
-		h.DataVolumePVC,
-		h.ConfigVolumePVC,
-		h.ConfigMapName,
-		h.UseHostNetwork,
-		h.HTTPHostPort,
-		h.HTTPSHostPort,
+		h.externalEndpoints[nodeName],
 	)
 }
 
@@ -457,34 +423,19 @@ func (h *ConfigHandler) registerReplacementInstance(
 	nodeName string,
 	newInstance *caddy.Instance,
 ) bool {
-	h.Mu.Lock()
-	defer h.Mu.Unlock()
-	if _, exists := h.DeployedInstances[nodeName]; exists {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, exists := h.deployedInstances[nodeName]; exists {
 		return false
 	}
-	h.DeployedInstances[nodeName] = newInstance
-	return true
-}
-
-func (h *ConfigHandler) allInstancesAtDigest(
-	instances map[string]*caddy.Instance,
-	configDigest string,
-) bool {
-	for nodeName, instance := range instances {
-		if h.instanceDigests[nodeName] != configDigest {
-			return false
-		}
-		if h.instanceSignatures[nodeName] != instanceStateSignature(instance) {
-			return false
-		}
-	}
+	h.deployedInstances[nodeName] = newInstance
 	return true
 }
 
 func (h *ConfigHandler) allCurrentInstancesConverged(configDigest string) bool {
-	h.Mu.RLock()
-	defer h.Mu.RUnlock()
-	for nodeName, instance := range h.DeployedInstances {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for nodeName, instance := range h.deployedInstances {
 		if h.instanceDigests[nodeName] != configDigest {
 			return false
 		}
@@ -496,10 +447,7 @@ func (h *ConfigHandler) allCurrentInstancesConverged(configDigest string) bool {
 }
 
 func instanceStateSignature(instance *caddy.Instance) string {
-	if instance == nil {
-		return ""
-	}
-	return instance.DeploymentName + "|" + instance.ServiceName + "|" + instance.PodName
+	return instance.StateKey()
 }
 
 func calculateConfigDigest(configData string) string {

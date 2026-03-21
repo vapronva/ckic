@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 	"time"
 
@@ -166,7 +167,7 @@ func (w *ExternalConfigWatcher) runWatchCycle(
 	}
 	logger.Info().Msg("External ConfigMap watch channel closed, restarting")
 	time.Sleep(delay)
-	return minExternalDuration(time.Duration(float64(delay)*multiplier), maxDelay), true
+	return min(time.Duration(float64(delay)*multiplier), maxDelay), true
 }
 
 func (w *ExternalConfigWatcher) consumeExternalEvents(
@@ -227,8 +228,8 @@ func (w *ExternalConfigWatcher) handleWatchUpsert(
 	eventType watch.EventType,
 	logger zerolog.Logger,
 ) {
-	sourceKey := fmt.Sprintf("%s/%s", cm.Namespace, cm.Name)
-	fragment, exists := cm.Data["Caddyfile"]
+	sourceKey := configMapSourceKey(cm.Namespace, cm.Name)
+	fragment, exists := cm.Data[constants.CaddyfileKey]
 	if !exists {
 		logger.Warn().
 			Str("namespace", cm.Namespace).
@@ -269,7 +270,7 @@ func (w *ExternalConfigWatcher) handleWatchDelete(
 	cm *corev1.ConfigMap,
 	logger zerolog.Logger,
 ) {
-	sourceKey := fmt.Sprintf("%s/%s", cm.Namespace, cm.Name)
+	sourceKey := configMapSourceKey(cm.Namespace, cm.Name)
 	logger.Info().
 		Str("namespace", cm.Namespace).
 		Str("name", cm.Name).
@@ -314,7 +315,7 @@ func (w *ExternalConfigWatcher) handleWatchCreateError(
 	w.failureCount++
 	if w.failureCount < w.maxFailures {
 		time.Sleep(delay)
-		return minExternalDuration(time.Duration(float64(delay)*multiplier), maxDelay)
+		return min(time.Duration(float64(delay)*multiplier), maxDelay)
 	}
 	sleepTime := w.resetTimeout - time.Since(w.lastSuccess)
 	if sleepTime > 0 {
@@ -354,35 +355,44 @@ func (w *ExternalConfigWatcher) handleWatchErrorEvent(
 	}
 }
 
-func (w *ExternalConfigWatcher) initialList(ctx context.Context, logger zerolog.Logger) {
-	listOptions := metav1.ListOptions{
+func (w *ExternalConfigWatcher) listFilteredFragments(
+	ctx context.Context,
+) (*corev1.ConfigMapList, map[string]string, error) {
+	configMaps, err := w.clientset.CoreV1().ConfigMaps("").List(ctx, metav1.ListOptions{
 		LabelSelector: w.labelSelector,
+	})
+	if err != nil {
+		return nil, nil, err
 	}
-	configMaps, err := w.clientset.CoreV1().ConfigMaps("").List(ctx, listOptions)
+	fragments := make(map[string]string)
+	for _, cm := range configMaps.Items {
+		if !w.isNamespaceAllowed(cm.Namespace) {
+			continue
+		}
+		if fragment, exists := cm.Data[constants.CaddyfileKey]; exists {
+			fragments[configMapSourceKey(cm.Namespace, cm.Name)] = fragment
+		}
+	}
+	return configMaps, fragments, nil
+}
+
+func (w *ExternalConfigWatcher) initialList(ctx context.Context, logger zerolog.Logger) {
+	configMaps, fragments, err := w.listFilteredFragments(ctx)
 	if err != nil {
 		logger.Error().Err(err).Msg("Failed to list initial external ConfigMaps")
 		return
 	}
 	w.lastResourceVersion = configMaps.ResourceVersion
 	logger.Info().
-		Int("count", len(configMaps.Items)).
+		Int("count", len(fragments)).
 		Str("resourceVersion", w.lastResourceVersion).
 		Msg("Discovered initial external ConfigMaps")
-	for _, cm := range configMaps.Items {
-		if !w.isNamespaceAllowed(cm.Namespace) {
-			continue
+	for sourceKey, fragment := range fragments {
+		logger.Info().Str("source", sourceKey).Msg("Loading initial external ConfigMap")
+		if w.onUpdate != nil {
+			w.onUpdate(sourceKey, fragment)
 		}
-		if fragment, exists := cm.Data["Caddyfile"]; exists {
-			sourceKey := fmt.Sprintf("%s/%s", cm.Namespace, cm.Name)
-			logger.Info().
-				Str("namespace", cm.Namespace).
-				Str("name", cm.Name).
-				Msg("Loading initial external ConfigMap")
-			if w.onUpdate != nil {
-				w.onUpdate(sourceKey, fragment)
-			}
-			w.lastProcessedConfigs[sourceKey] = fragment
-		}
+		w.lastProcessedConfigs[sourceKey] = fragment
 	}
 	w.lastSuccess = time.Now()
 }
@@ -437,8 +447,8 @@ func (w *ExternalConfigWatcher) reconcileSnapshotConfigMap(
 	if !w.isNamespaceAllowed(cm.Namespace) {
 		return 0, 0
 	}
-	sourceKey := fmt.Sprintf("%s/%s", cm.Namespace, cm.Name)
-	fragment, exists := cm.Data["Caddyfile"]
+	sourceKey := configMapSourceKey(cm.Namespace, cm.Name)
+	fragment, exists := cm.Data[constants.CaddyfileKey]
 	if !exists {
 		logger.Warn().
 			Str("namespace", cm.Namespace).
@@ -491,10 +501,7 @@ func (w *ExternalConfigWatcher) InitialListBatch(
 	ctx context.Context,
 ) (map[string]string, error) {
 	logger := log.With().Str("component", "external_config_watcher").Logger()
-	listOptions := metav1.ListOptions{
-		LabelSelector: w.labelSelector,
-	}
-	configMaps, err := w.clientset.CoreV1().ConfigMaps("").List(ctx, listOptions)
+	configMaps, fragments, err := w.listFilteredFragments(ctx)
 	if err != nil {
 		logger.Error().
 			Err(err).
@@ -502,24 +509,18 @@ func (w *ExternalConfigWatcher) InitialListBatch(
 		return nil, fmt.Errorf("failed to list external ConfigMaps: %w", err)
 	}
 	w.lastResourceVersion = configMaps.ResourceVersion
-	externals := make(map[string]string)
-	for _, cm := range configMaps.Items {
-		if !w.isNamespaceAllowed(cm.Namespace) {
-			continue
-		}
-		if fragment, exists := cm.Data["Caddyfile"]; exists {
-			sourceKey := fmt.Sprintf("%s/%s", cm.Namespace, cm.Name)
-			externals[sourceKey] = fragment
-			w.lastProcessedConfigs[sourceKey] = fragment
-		}
-	}
+	maps.Copy(w.lastProcessedConfigs, fragments)
 	w.batchInitialized = true
 	w.lastSuccess = time.Now()
 	logger.Info().
-		Int("count", len(externals)).
+		Int("count", len(fragments)).
 		Str("resourceVersion", w.lastResourceVersion).
 		Msg("Batch loaded external ConfigMaps")
-	return externals, nil
+	return fragments, nil
+}
+
+func configMapSourceKey(namespace, name string) string {
+	return namespace + "/" + name
 }
 
 func isExternalResourceVersionExpired(err error) bool {
@@ -542,11 +543,4 @@ func isExternalWatchExpiredStatus(status *metav1.Status) bool {
 		return false
 	}
 	return status.Code == 410 || status.Reason == metav1.StatusReasonExpired
-}
-
-func minExternalDuration(a, b time.Duration) time.Duration {
-	if a < b {
-		return a
-	}
-	return b
 }

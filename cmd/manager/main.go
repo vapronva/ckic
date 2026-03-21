@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -82,7 +83,7 @@ type leaderElectionRunFunc func(context.Context, leaderelection.LeaderElectionCo
 func main() {
 	options := parseCLIOptions()
 	level := parseLogLevel(options.logLevel)
-	utils.SetupLogger(level)
+	setupLogger(level)
 	commMethod, err := resolveCommunicationMethod(
 		options.communicationMethod,
 		options.useHostNetwork,
@@ -165,279 +166,212 @@ func main() {
 }
 
 func parseCLIOptions() cliOptions {
-	flags := registerCLIOptionsFlags()
+	var opts cliOptions
+	registerCoreCLIFlags(&opts)
+	registerExternalCLIFlags(&opts)
+	registerLeaderElectionCLIFlags(&opts)
 	pflag.Parse()
-	return flags.toCLIOptions()
+	return opts
 }
 
-type cliOptionFlags struct {
-	kubeconfigPath               *string
-	nodeLabel                    *string
-	configMapName                *string
-	configMapNamespace           *string
-	bootstrapDefaultConfig       *bool
-	healthBindAddress            *string
-	communicationMethod          *string
-	logLevel                     *string
-	caddyImage                   *string
-	enableLoadBalancer           *bool
-	preferSavedState             *bool
-	secretName                   *string
-	secretEnvKeys                *[]string
-	dataVolumePVC                *string
-	configVolumePVC              *string
-	externalEndpoints            *[]string
-	externalEndpointsFile        *string
-	useHostNetwork               *bool
-	caddyAdminOriginKey          *string
-	httpHostPort                 *int
-	httpsHostPort                *int
-	externalEnable               *bool
-	externalLabel                *string
-	externalNsMode               *string
-	externalAllowNamespaces      *string
-	externalDenyNamespaces       *string
-	externalPublishAggregated    *bool
-	externalAggregatedConfigName *string
-	leaderElectionEnabled        *bool
-	readinessRequireLeader       *bool
-	leaderElectionLeaseName      *string
-	leaderElectionLeaseNamespace *string
-	leaderElectionLeaseDuration  *time.Duration
-	leaderElectionRenewDeadline  *time.Duration
-	leaderElectionRetryPeriod    *time.Duration
-}
-
-func registerCLIOptionsFlags() cliOptionFlags {
-	flags := cliOptionFlags{}
-	registerCoreCLIFlags(&flags)
-	registerExternalCLIFlags(&flags)
-	registerLeaderElectionCLIFlags(&flags)
-	return flags
-}
-
-func registerCoreCLIFlags(flags *cliOptionFlags) {
-	flags.kubeconfigPath = pflag.String("kubeconfig", "", "Path to kubeconfig file")
-	flags.nodeLabel = pflag.String(
+func registerCoreCLIFlags(opts *cliOptions) {
+	pflag.StringVar(&opts.kubeconfigPath, "kubeconfig", "", "Path to kubeconfig file")
+	pflag.StringVar(&opts.nodeLabel,
 		"node-label",
 		"ckic.cmld.ru/enabled=true",
 		"Kubernetes label selector used to choose managed nodes",
 	)
-	flags.configMapName = pflag.String(
+	pflag.StringVar(&opts.configMapName,
 		"config-map",
 		"caddy-config",
 		"ConfigMap containing Caddy configuration",
 	)
-	flags.configMapNamespace = pflag.String(
+	pflag.StringVar(&opts.configMapNamespace,
 		"config-namespace",
 		"caddy-system",
 		"Namespace of the ConfigMap and deployments",
 	)
-	flags.bootstrapDefaultConfig = pflag.Bool(
+	pflag.BoolVar(&opts.bootstrapDefaultConfig,
 		"bootstrap-default-config",
 		false,
 		"Create a default ConfigMap on startup only when it is missing",
 	)
-	flags.healthBindAddress = pflag.String(
+	pflag.StringVar(&opts.healthBindAddress,
 		"health-bind-address",
 		":8081",
 		"Address where health and readiness probes are served (set empty to disable)",
 	)
-	flags.communicationMethod = pflag.String(
+	pflag.StringVar(&opts.communicationMethod,
 		"comm-method",
 		"clusterip",
 		"Communication method (clusterip, direct, hostnetwork)",
 	)
-	flags.logLevel = pflag.String(
+	pflag.StringVar(&opts.logLevel,
 		"log-level",
 		"info",
 		"Log level (debug, info, warn, error)",
 	)
-	flags.caddyImage = pflag.String(
+	pflag.StringVar(&opts.caddyImage,
 		"caddy-image",
 		"docker.horse/oss-images/zerossl-caddy/caddy:2.11.2-alpine",
 		"Caddy image (format image:tag)",
 	)
-	flags.enableLoadBalancer = pflag.Bool(
+	pflag.BoolVar(&opts.enableLoadBalancer,
 		"enable-loadbalancer",
 		false,
 		"Enable LoadBalancer service exposure",
 	)
-	flags.preferSavedState = pflag.Bool(
+	pflag.BoolVar(&opts.preferSavedState,
 		"prefer-saved-state",
 		false,
 		"Prefer saved (aka persistent) state during reconciliation",
 	)
-	flags.secretName = pflag.String(
+	pflag.StringVar(&opts.secretName,
 		"env-secret",
 		"",
 		"Name of the Kubernetes Secret to use for environment variables",
 	)
-	flags.secretEnvKeys = pflag.StringSlice(
+	pflag.StringSliceVar(&opts.secretEnvKeys,
 		"env-keys",
 		[]string{},
 		"Keys from the Secret to use as environment variables",
 	)
-	flags.dataVolumePVC = pflag.String(
+	pflag.StringVar(&opts.dataVolumePVC,
 		"data-pvc",
 		"",
 		"Name of PVC to use for the /data volume (defaults to HostPath if empty)",
 	)
-	flags.configVolumePVC = pflag.String(
+	pflag.StringVar(&opts.configVolumePVC,
 		"config-pvc",
 		"",
 		"Name of PVC to use for the /config volume (defaults to HostPath if empty)",
 	)
-	registerCoreNetworkingCLIFlags(flags)
+	registerCoreNetworkingCLIFlags(opts)
 }
 
-func registerCoreNetworkingCLIFlags(flags *cliOptionFlags) {
-	flags.externalEndpoints = pflag.StringArray(
+func registerCoreNetworkingCLIFlags(opts *cliOptions) {
+	pflag.StringArrayVar(&opts.externalEndpoints,
 		"external-endpoints",
 		[]string{},
 		"External endpoints for nodes (format: nodeName=ip1,ip2,...)",
 	)
-	flags.externalEndpointsFile = pflag.String(
+	pflag.StringVar(&opts.externalEndpointsFile,
 		"external-endpoints-file",
 		"",
 		"Path to JSON file containing external endpoints mapping",
 	)
-	flags.useHostNetwork = pflag.Bool(
+	pflag.BoolVar(&opts.useHostNetwork,
 		"use-host-network",
 		false,
 		"Use hostNetwork for Caddy pods",
 	)
-	flags.caddyAdminOriginKey = pflag.String(
+	pflag.StringVar(&opts.caddyAdminOriginKey,
 		"caddy-admin-origin-key",
 		"",
 		"Origin key for Caddy admin API security",
 	)
-	flags.httpHostPort = pflag.Int(
+	pflag.IntVar(&opts.httpHostPort,
 		"http-host-port",
 		defaultHTTPHostPort,
 		"Host port for HTTP when using hostNetwork",
 	)
-	flags.httpsHostPort = pflag.Int(
+	pflag.IntVar(&opts.httpsHostPort,
 		"https-host-port",
 		defaultHTTPSHostPort,
 		"Host port for HTTPS when using hostNetwork",
 	)
 }
 
-func registerExternalCLIFlags(flags *cliOptionFlags) {
-	flags.externalEnable = pflag.Bool(
+func registerExternalCLIFlags(opts *cliOptions) {
+	pflag.BoolVar(&opts.externalEnable,
 		"external-enable",
 		false,
 		"Enable external namespace ConfigMap aggregation",
 	)
-	flags.externalLabel = pflag.String(
+	pflag.StringVar(&opts.externalLabel,
 		"external-label",
 		"ckic.cmld.ru/aggregate=true",
 		"Label selector for external ConfigMaps",
 	)
-	flags.externalNsMode = pflag.String(
+	pflag.StringVar(&opts.externalNsMode,
 		"external-ns-mode",
 		"all",
 		"Namespace mode: all, allow, or deny",
 	)
-	flags.externalAllowNamespaces = pflag.String(
+	pflag.StringVar(&opts.externalAllowNamespaces,
 		"external-allow-namespaces",
 		"",
 		"Comma-separated list of allowed namespaces (for allow mode)",
 	)
-	flags.externalDenyNamespaces = pflag.String(
+	pflag.StringVar(&opts.externalDenyNamespaces,
 		"external-deny-namespaces",
 		"",
 		"Comma-separated list of denied namespaces (for deny mode)",
 	)
-	flags.externalPublishAggregated = pflag.Bool(
+	pflag.BoolVar(&opts.externalPublishAggregated,
 		"external-publish-aggregated",
 		true,
 		"Publish aggregated Caddyfile to a mirror ConfigMap",
 	)
-	flags.externalAggregatedConfigName = pflag.String(
+	pflag.StringVar(&opts.externalAggregatedConfigName,
 		"external-aggregated-config-name",
 		"ckic-caddy-config-working",
 		"Name of the mirror ConfigMap for aggregated config",
 	)
 }
 
-func registerLeaderElectionCLIFlags(flags *cliOptionFlags) {
-	flags.leaderElectionEnabled = pflag.Bool(
+func registerLeaderElectionCLIFlags(opts *cliOptions) {
+	pflag.BoolVar(&opts.leaderElectionEnabled,
 		"leader-elect",
 		true,
 		"Enable leader election so only one manager instance reconciles resources",
 	)
-	flags.readinessRequireLeader = pflag.Bool(
+	pflag.BoolVar(&opts.readinessRequireLeader,
 		"readiness-require-leader",
 		false,
 		"Report readiness only while leading (set true to keep legacy behavior)",
 	)
-	flags.leaderElectionLeaseName = pflag.String(
+	pflag.StringVar(&opts.leaderElectionLeaseName,
 		"leader-election-lease-name",
 		"ckic-manager-leader",
 		"Name of the Lease resource used for leader election",
 	)
-	flags.leaderElectionLeaseNamespace = pflag.String(
+	pflag.StringVar(
+		&opts.leaderElectionLeaseNamespace,
 		"leader-election-lease-namespace",
 		"",
 		"Namespace of the Lease resource used for leader election (defaults to --config-namespace)",
 	)
-	flags.leaderElectionLeaseDuration = pflag.Duration(
+	pflag.DurationVar(&opts.leaderElectionLeaseDuration,
 		"leader-election-lease-duration",
 		15*time.Second,
 		"Duration non-leaders wait before forcing a leader election",
 	)
-	flags.leaderElectionRenewDeadline = pflag.Duration(
+	pflag.DurationVar(&opts.leaderElectionRenewDeadline,
 		"leader-election-renew-deadline",
 		10*time.Second,
 		"Duration the acting leader retries refreshing leadership before giving up",
 	)
-	flags.leaderElectionRetryPeriod = pflag.Duration(
+	pflag.DurationVar(&opts.leaderElectionRetryPeriod,
 		"leader-election-retry-period",
 		2*time.Second,
 		"Time between attempts by clients to acquire or renew leadership",
 	)
 }
 
-func (flags cliOptionFlags) toCLIOptions() cliOptions {
-	return cliOptions{
-		kubeconfigPath:               *flags.kubeconfigPath,
-		nodeLabel:                    *flags.nodeLabel,
-		configMapName:                *flags.configMapName,
-		configMapNamespace:           *flags.configMapNamespace,
-		bootstrapDefaultConfig:       *flags.bootstrapDefaultConfig,
-		healthBindAddress:            *flags.healthBindAddress,
-		communicationMethod:          *flags.communicationMethod,
-		logLevel:                     *flags.logLevel,
-		caddyImage:                   *flags.caddyImage,
-		enableLoadBalancer:           *flags.enableLoadBalancer,
-		preferSavedState:             *flags.preferSavedState,
-		secretName:                   *flags.secretName,
-		secretEnvKeys:                *flags.secretEnvKeys,
-		dataVolumePVC:                *flags.dataVolumePVC,
-		configVolumePVC:              *flags.configVolumePVC,
-		externalEndpoints:            *flags.externalEndpoints,
-		externalEndpointsFile:        *flags.externalEndpointsFile,
-		useHostNetwork:               *flags.useHostNetwork,
-		caddyAdminOriginKey:          *flags.caddyAdminOriginKey,
-		httpHostPort:                 *flags.httpHostPort,
-		httpsHostPort:                *flags.httpsHostPort,
-		externalEnable:               *flags.externalEnable,
-		externalLabel:                *flags.externalLabel,
-		externalNsMode:               *flags.externalNsMode,
-		externalAllowNamespaces:      *flags.externalAllowNamespaces,
-		externalDenyNamespaces:       *flags.externalDenyNamespaces,
-		externalPublishAggregated:    *flags.externalPublishAggregated,
-		externalAggregatedConfigName: *flags.externalAggregatedConfigName,
-		leaderElectionEnabled:        *flags.leaderElectionEnabled,
-		readinessRequireLeader:       *flags.readinessRequireLeader,
-		leaderElectionLeaseName:      *flags.leaderElectionLeaseName,
-		leaderElectionLeaseNamespace: *flags.leaderElectionLeaseNamespace,
-		leaderElectionLeaseDuration:  *flags.leaderElectionLeaseDuration,
-		leaderElectionRenewDeadline:  *flags.leaderElectionRenewDeadline,
-		leaderElectionRetryPeriod:    *flags.leaderElectionRetryPeriod,
+func setupLogger(level zerolog.Level) {
+	zerolog.SetGlobalLevel(level)
+	var output io.Writer = os.Stdout
+	if os.Getenv("LOG_FORMAT") != "json" {
+		output = zerolog.SyncWriter(zerolog.ConsoleWriter{
+			Out:        os.Stdout,
+			TimeFormat: time.RFC3339,
+		})
 	}
+	log.Logger = log.Output(output). //nolint:reassign
+						With().
+						Str("service", "ckic-manager").
+						Logger()
 }
 
 func parseLogLevel(level string) zerolog.Level {
@@ -932,6 +866,7 @@ func startHealthProbeServer(
 		Handler:           mux,
 		ReadHeaderTimeout: probeReadHeaderTimeout,
 	}
+	//nolint:gosec
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(

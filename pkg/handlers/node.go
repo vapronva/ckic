@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
-	"k8s.io/client-go/kubernetes"
 
 	"git.horse/vapronva/ckic/pkg/caddy"
 	"git.horse/vapronva/ckic/pkg/utils"
@@ -26,37 +25,20 @@ type deploymentResult struct {
 }
 
 type NodeHandler struct {
-	Clientset          kubernetes.Interface
-	Namespace          string
-	CaddyImage         string
-	EnableLoadBalancer bool
-	DeployedInstances  map[string]*caddy.Instance
-	Mu                 *sync.RWMutex
+	deployOpts         caddy.DeployOptions
+	deployedInstances  map[string]*caddy.Instance
+	mu                 *sync.RWMutex
+	externalEndpoints  utils.ExternalEndpointsMap
 	jobCh              chan deploymentJob
 	nodeChangeNotifier func()
-	EnvSecretName      string
-	EnvSecretKeys      []string
-	DataVolumePVC      string
-	ConfigVolumePVC    string
-	ConfigMapName      string
-	ExternalEndpoints  utils.ExternalEndpointsMap
-	UseHostNetwork     bool
-	HTTPHostPort       int
-	HTTPSHostPort      int
 	inProgressNodes    map[string]struct{}
 	inProgressNodesMu  sync.Mutex
 	removedNodes       map[string]struct{}
 	deployFn           func(
 		ctx context.Context,
-		clientset kubernetes.Interface,
-		nodeName, namespace, caddyImage string,
-		enableLoadBalancer bool,
+		opts caddy.DeployOptions,
+		nodeName string,
 		externalIPs []string,
-		envSecretName string,
-		envSecretKeys []string,
-		dataVolumePVC, configVolumePVC, configMapName string,
-		useHostNetwork bool,
-		httpHostPort, httpsHostPort int,
 	) (*caddy.Instance, error)
 }
 
@@ -66,36 +48,18 @@ const (
 )
 
 func NewNodeHandler(
-	clientset kubernetes.Interface,
-	namespace, caddyImage string,
-	enableLoadBalancer bool,
+	deployOpts caddy.DeployOptions,
 	instances map[string]*caddy.Instance,
 	mu *sync.RWMutex,
-	notifier func(),
-	envSecretName string,
-	envSecretKeys []string,
-	dataVolumePVC, configVolumePVC, configMapName string,
 	externalEndpoints utils.ExternalEndpointsMap,
-	useHostNetwork bool,
-	httpHostPort, httpsHostPort int,
+	notifier func(),
 ) *NodeHandler {
 	return &NodeHandler{
-		Clientset:          clientset,
-		Namespace:          namespace,
-		CaddyImage:         caddyImage,
-		EnableLoadBalancer: enableLoadBalancer,
-		DeployedInstances:  instances,
-		Mu:                 mu,
+		deployOpts:         deployOpts,
+		deployedInstances:  instances,
+		mu:                 mu,
+		externalEndpoints:  externalEndpoints,
 		nodeChangeNotifier: notifier,
-		EnvSecretName:      envSecretName,
-		EnvSecretKeys:      envSecretKeys,
-		DataVolumePVC:      dataVolumePVC,
-		ConfigVolumePVC:    configVolumePVC,
-		ConfigMapName:      configMapName,
-		ExternalEndpoints:  externalEndpoints,
-		UseHostNetwork:     useHostNetwork,
-		HTTPHostPort:       httpHostPort,
-		HTTPSHostPort:      httpsHostPort,
 		inProgressNodes:    make(map[string]struct{}),
 		removedNodes:       make(map[string]struct{}),
 		deployFn:           caddy.DeployCaddy,
@@ -125,20 +89,9 @@ func (h *NodeHandler) StartWorkerPool(ctx context.Context, workerCount int) {
 					deployCtx, cancel := context.WithTimeout(ctx, deployJobTimeout)
 					instance, err := deployFn(
 						deployCtx,
-						h.Clientset,
+						h.deployOpts,
 						job.nodeName,
-						h.Namespace,
-						h.CaddyImage,
-						h.EnableLoadBalancer,
 						job.externalIPs,
-						h.EnvSecretName,
-						h.EnvSecretKeys,
-						h.DataVolumePVC,
-						h.ConfigVolumePVC,
-						h.ConfigMapName,
-						h.UseHostNetwork,
-						h.HTTPHostPort,
-						h.HTTPSHostPort,
 					)
 					cancel()
 					job.resultCh <- &deploymentResult{
@@ -163,9 +116,9 @@ func (h *NodeHandler) Handle(event watcher.NodeEvent) {
 
 func (h *NodeHandler) handleNodeAdded(nodeName string) {
 	logger := log.With().Str("node", nodeName).Logger()
-	h.Mu.RLock()
-	_, alreadyDeployed := h.DeployedInstances[nodeName]
-	h.Mu.RUnlock()
+	h.mu.RLock()
+	_, alreadyDeployed := h.deployedInstances[nodeName]
+	h.mu.RUnlock()
 	h.inProgressNodesMu.Lock()
 	if _, inProgress := h.inProgressNodes[nodeName]; inProgress {
 		delete(h.removedNodes, nodeName)
@@ -183,7 +136,7 @@ func (h *NodeHandler) handleNodeAdded(nodeName string) {
 		logger.Info().Msg("Detected new node, deploying Caddy")
 	}
 	resultCh := make(chan *deploymentResult, 1)
-	externalIPs, exists := h.ExternalEndpoints[nodeName]
+	externalIPs, exists := h.externalEndpoints[nodeName]
 	if exists {
 		logger.Info().
 			Strs("externalIPs", externalIPs).
@@ -215,24 +168,20 @@ func (h *NodeHandler) handleNodeRemoved(nodeName string) {
 		return
 	}
 	h.inProgressNodesMu.Unlock()
-	h.Mu.Lock()
-	instance, exists = h.DeployedInstances[nodeName]
+	h.mu.Lock()
+	instance, exists = h.deployedInstances[nodeName]
 	if exists {
-		delete(h.DeployedInstances, nodeName)
+		delete(h.deployedInstances, nodeName)
 		shouldNotify = h.nodeChangeNotifier != nil
 	}
-	h.Mu.Unlock()
+	h.mu.Unlock()
 	if !exists {
 		return
 	}
 	logger.Info().Msg("Node removed, cleaning up Caddy instance")
 	if err := instance.Delete(); err != nil {
 		logger.Error().Err(err).Msg("Failed to delete Caddy instance")
-		h.Mu.Lock()
-		if _, alreadyPresent := h.DeployedInstances[nodeName]; !alreadyPresent {
-			h.DeployedInstances[nodeName] = instance
-		}
-		h.Mu.Unlock()
+		restoreInstanceIfMissing(h.mu, h.deployedInstances, nodeName, instance)
 		return
 	}
 	logger.Info().Msg("Successfully removed Caddy instance")
@@ -247,29 +196,33 @@ func (h *NodeHandler) handleNodeAddedResult(
 	result *deploymentResult,
 ) {
 	logger := log.With().Str("node", nodeName).Logger()
+	defer func() {
+		h.inProgressNodesMu.Lock()
+		delete(h.inProgressNodes, nodeName)
+		h.inProgressNodesMu.Unlock()
+	}()
 	h.inProgressNodesMu.Lock()
-	h.Mu.Lock()
-	delete(h.inProgressNodes, nodeName)
-	previousInstance := h.DeployedInstances[nodeName]
+	h.mu.Lock()
+	previousInstance := h.deployedInstances[nodeName]
 	_, wasRemoved := h.removedNodes[nodeName]
 	if wasRemoved {
 		delete(h.removedNodes, nodeName)
-		delete(h.DeployedInstances, nodeName)
+		delete(h.deployedInstances, nodeName)
 	}
 	h.inProgressNodesMu.Unlock()
 	if result.err != nil {
-		h.Mu.Unlock()
+		h.mu.Unlock()
 		h.handleNodeAddDeployError(nodeName, previousInstance, wasRemoved, result.err)
 		return
 	}
 	if wasRemoved {
-		h.Mu.Unlock()
+		h.mu.Unlock()
 		h.handleRemovedNodeAfterDeployResult(nodeName, previousInstance, result.instance)
 		return
 	}
-	h.DeployedInstances[nodeName] = result.instance
+	h.deployedInstances[nodeName] = result.instance
 	instanceChanged := !instancesEquivalent(previousInstance, result.instance)
-	h.Mu.Unlock()
+	h.mu.Unlock()
 	switch {
 	case !alreadyDeployed:
 		logger.Info().Msg("Successfully deployed Caddy instance")
@@ -300,7 +253,7 @@ func (h *NodeHandler) handleNodeAddDeployError(
 		logger.Error().
 			Err(err).
 			Msg("Failed to delete previous Caddy instance after removal")
-		h.restoreInstanceIfMissing(nodeName, previousInstance)
+		restoreInstanceIfMissing(h.mu, h.deployedInstances, nodeName, previousInstance)
 		return
 	}
 	h.notifyNodeChange()
@@ -321,7 +274,7 @@ func (h *NodeHandler) handleRemovedNodeAfterDeployResult(
 	}
 	if err := cleanupInstance.Delete(); err != nil {
 		logger.Error().Err(err).Msg("Failed to delete Caddy instance after removal")
-		h.restoreInstanceIfMissing(nodeName, previousInstance)
+		restoreInstanceIfMissing(h.mu, h.deployedInstances, nodeName, previousInstance)
 		return
 	}
 	if previousInstance != nil {
@@ -329,18 +282,20 @@ func (h *NodeHandler) handleRemovedNodeAfterDeployResult(
 	}
 }
 
-func (h *NodeHandler) restoreInstanceIfMissing(
+func restoreInstanceIfMissing(
+	mu *sync.RWMutex,
+	instances map[string]*caddy.Instance,
 	nodeName string,
 	instance *caddy.Instance,
 ) {
 	if instance == nil {
 		return
 	}
-	h.Mu.Lock()
-	if _, alreadyPresent := h.DeployedInstances[nodeName]; !alreadyPresent {
-		h.DeployedInstances[nodeName] = instance
+	mu.Lock()
+	if _, exists := instances[nodeName]; !exists {
+		instances[nodeName] = instance
 	}
-	h.Mu.Unlock()
+	mu.Unlock()
 }
 
 func (h *NodeHandler) notifyNodeChange() {
@@ -350,12 +305,5 @@ func (h *NodeHandler) notifyNodeChange() {
 }
 
 func instancesEquivalent(a, b *caddy.Instance) bool {
-	if a == nil || b == nil {
-		return a == b
-	}
-	return a.NodeName == b.NodeName &&
-		a.Namespace == b.Namespace &&
-		a.DeploymentName == b.DeploymentName &&
-		a.ServiceName == b.ServiceName &&
-		a.PodName == b.PodName
+	return a.StateKey() == b.StateKey()
 }
