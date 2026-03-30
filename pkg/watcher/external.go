@@ -280,10 +280,10 @@ func (w *ExternalConfigWatcher) handleWatchDelete(
 }
 
 func (w *ExternalConfigWatcher) removeExternalSource(sourceKey string) {
+	delete(w.lastProcessedConfigs, sourceKey)
 	if w.onRemove != nil {
 		w.onRemove(sourceKey)
 	}
-	delete(w.lastProcessedConfigs, sourceKey)
 }
 
 func (w *ExternalConfigWatcher) markWatchSuccess() {

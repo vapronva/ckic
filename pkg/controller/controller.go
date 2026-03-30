@@ -404,23 +404,25 @@ func (c *Controller) mergeSavedState(
 			Err(err).
 			Msg("Could not load saved state, proceeding with discovered state")
 	}
+	for node := range discovered {
+		savedInst, exists := savedState[node]
+		if !exists {
+			continue
+		}
+		if savedInst.FailureCount.Load() > 0 {
+			discovered[node].FailureCount.Store(savedInst.FailureCount.Load())
+			logger.Debug().
+				Str("node", node).
+				Int32("failureCount", savedInst.FailureCount.Load()).
+				Msg("Restored FailureCount from saved state")
+		}
+	}
 	if !c.config.PreferSavedState || len(savedState) == 0 {
 		logger.Info().Msg("Using discovered state")
 		return
 	}
 	logger.Info().
 		Msg("PreferSavedState is enabled. Merging saved state with discovered state, preferring saved state")
-	for node := range discovered {
-		savedInst, exists := savedState[node]
-		if !exists {
-			continue
-		}
-		discovered[node].FailureCount.Store(savedInst.FailureCount.Load())
-		logger.Debug().
-			Str("node", node).
-			Int32("failureCount", savedInst.FailureCount.Load()).
-			Msg("Restored FailureCount from saved state")
-	}
 }
 
 func (c *Controller) replaceAndPersistState(

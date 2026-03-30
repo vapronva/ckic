@@ -3,6 +3,7 @@ package caddy
 import (
 	"context"
 	"fmt"
+	"maps"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -1028,7 +1029,10 @@ func desiredLoadBalancerService(instance *Instance) *corev1.Service {
 
 func mergeServiceForUpdate(existing, desired *corev1.Service) {
 	existing.Labels = desired.Labels
-	existing.Annotations = desired.Annotations
+	if existing.Annotations == nil {
+		existing.Annotations = make(map[string]string)
+	}
+	maps.Copy(existing.Annotations, desired.Annotations)
 	existing.Spec.Selector = desired.Spec.Selector
 	existing.Spec.Type = desired.Spec.Type
 	existing.Spec.ExternalIPs = desired.Spec.ExternalIPs
@@ -1044,8 +1048,10 @@ func serviceNeedsUpdate(existing, desired *corev1.Service) bool {
 	if !equality.Semantic.DeepEqual(existing.Labels, desired.Labels) {
 		return true
 	}
-	if !equality.Semantic.DeepEqual(existing.Annotations, desired.Annotations) {
-		return true
+	for k, v := range desired.Annotations {
+		if existing.Annotations[k] != v {
+			return true
+		}
 	}
 	if !equality.Semantic.DeepEqual(existing.Spec.Selector, desired.Spec.Selector) {
 		return true

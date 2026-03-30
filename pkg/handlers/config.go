@@ -44,7 +44,7 @@ const (
 	configUpdateRetryCount    = 3
 	configUpdateRetryFactor   = 2
 	maxInstanceFailureCount   = 5
-	redeployConfigPushTimeout = 2 * time.Minute
+	redeployConfigPushTimeout = 6 * time.Minute
 )
 
 func NewConfigHandler(

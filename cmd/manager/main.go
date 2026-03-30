@@ -557,6 +557,7 @@ func startLeaderElectionLoop(
 				OnStartedLeading: func(leadCtx context.Context) {
 					onStartedLeading(
 						leadCtx,
+						ctx,
 						identity,
 						ctrl,
 						readiness,
@@ -591,6 +592,7 @@ func logLeaderElectionEnabled(options cliOptions, leaseNamespace string) {
 
 func onStartedLeading(
 	leadCtx context.Context,
+	ctx context.Context,
 	identity string,
 	ctrl controllerRunner,
 	readiness *atomic.Bool,
@@ -608,6 +610,9 @@ func onStartedLeading(
 	runErr := ctrl.Run(leadCtx)
 	if errors.Is(runErr, context.Canceled) {
 		runErr = nil
+	}
+	if runErr == nil && ctx.Err() == nil && leadCtx.Err() != nil {
+		runErr = errLeaderElectionLost
 	}
 	reportRunResult(controllerDoneCh, runErr)
 	reportRunResult(runErrCh, runErr)

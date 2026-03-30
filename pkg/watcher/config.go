@@ -281,7 +281,10 @@ func (w *ConfigWatcher) handleWatchCreateFailure(
 	failureCount := w.failureCount
 	w.mu.Unlock()
 	if failureCount >= w.maxFailures {
-		sleepTime := w.resetTimeout - time.Since(w.lastSuccess)
+		w.mu.RLock()
+		lastSuccess := w.lastSuccess
+		w.mu.RUnlock()
+		sleepTime := w.resetTimeout - time.Since(lastSuccess)
 		if sleepTime > 0 {
 			logger.Warn().Msgf("Circuit breaker open, sleeping for %v", sleepTime)
 			time.Sleep(sleepTime)

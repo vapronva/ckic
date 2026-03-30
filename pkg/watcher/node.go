@@ -228,7 +228,12 @@ func (w *NodeWatcher) handleNodeWatchEvent(
 		return false
 	}
 	w.lastResourceVersion = node.ResourceVersion
-	notifyAdd, notifyRemove := w.applyNodeWatchEvent(event.Type, node.Name)
+	matchesSelector := w.nodeMatchesSelector(node)
+	notifyAdd, notifyRemove := w.applyNodeWatchEvent(
+		event.Type,
+		node.Name,
+		matchesSelector,
+	)
 	if notifyAdd {
 		w.emitNodeEvents(NodeAdded, []string{node.Name})
 	}
@@ -241,6 +246,7 @@ func (w *NodeWatcher) handleNodeWatchEvent(
 func (w *NodeWatcher) applyNodeWatchEvent(
 	eventType watch.EventType,
 	nodeName string,
+	matchesSelector bool,
 ) (bool, bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -248,16 +254,24 @@ func (w *NodeWatcher) applyNodeWatchEvent(
 		w.currentNodes = make(map[string]bool)
 	}
 	wasTracked := w.currentNodes[nodeName]
-	if eventType == watch.Deleted {
+	if eventType == watch.Deleted || (wasTracked && !matchesSelector) {
 		if !wasTracked {
 			return false, false
 		}
 		delete(w.currentNodes, nodeName)
 		return false, true
 	}
-	if (eventType == watch.Added || eventType == watch.Modified) && !wasTracked {
+	if matchesSelector && !wasTracked {
 		w.currentNodes[nodeName] = true
 		return true, false
 	}
 	return false, false
+}
+
+func (w *NodeWatcher) nodeMatchesSelector(node *v1.Node) bool {
+	selector, err := labels.Parse(w.labelSelector)
+	if err != nil {
+		return false
+	}
+	return selector.Matches(labels.Set(node.Labels))
 }
