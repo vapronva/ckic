@@ -406,7 +406,7 @@ func (c *Controller) mergeSavedState(
 	}
 	for node := range discovered {
 		savedInst, exists := savedState[node]
-		if !exists {
+		if !exists || savedInst == nil {
 			continue
 		}
 		if savedInst.FailureCount.Load() > 0 {
