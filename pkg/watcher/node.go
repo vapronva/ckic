@@ -39,9 +39,10 @@ type NodeHandler func(NodeEvent)
 type NodeWatcher struct {
 	clientset           kubernetes.Interface
 	labelSelector       string
+	parsedSelector      labels.Selector
 	nodeHandler         NodeHandler
 	mu                  sync.RWMutex
-	currentNodes        map[string]bool
+	currentNodes        map[string]struct{}
 	lastResourceVersion string
 }
 
@@ -92,11 +93,20 @@ func NewNodeWatcher(
 	if err != nil {
 		return nil, err
 	}
+	parsed, parseErr := labels.Parse(normalizedSelector)
+	if parseErr != nil {
+		return nil, fmt.Errorf(
+			"failed to parse normalized selector %q: %w",
+			normalizedSelector,
+			parseErr,
+		)
+	}
 	return &NodeWatcher{
-		clientset:     clientset,
-		labelSelector: normalizedSelector,
-		nodeHandler:   handler,
-		currentNodes:  make(map[string]bool),
+		clientset:      clientset,
+		labelSelector:  normalizedSelector,
+		parsedSelector: parsed,
+		nodeHandler:    handler,
+		currentNodes:   make(map[string]struct{}),
 	}, nil
 }
 
@@ -143,9 +153,9 @@ func (w *NodeWatcher) syncCurrentNodes(ctx context.Context) error {
 		return err
 	}
 	w.lastResourceVersion = nodes.ResourceVersion
-	newNodes := make(map[string]bool, len(nodes.Items))
+	newNodes := make(map[string]struct{}, len(nodes.Items))
 	for _, node := range nodes.Items {
-		newNodes[node.Name] = true
+		newNodes[node.Name] = struct{}{}
 	}
 	addedNodes, removedNodes := w.replaceCurrentNodes(newNodes)
 	w.emitNodeEvents(NodeAdded, addedNodes)
@@ -154,22 +164,22 @@ func (w *NodeWatcher) syncCurrentNodes(ctx context.Context) error {
 }
 
 func (w *NodeWatcher) replaceCurrentNodes(
-	newNodes map[string]bool,
+	newNodes map[string]struct{},
 ) ([]string, []string) {
 	var addedNodes []string
 	var removedNodes []string
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.currentNodes == nil {
-		w.currentNodes = make(map[string]bool)
+		w.currentNodes = make(map[string]struct{})
 	}
 	for nodeName := range newNodes {
-		if !w.currentNodes[nodeName] {
+		if _, tracked := w.currentNodes[nodeName]; !tracked {
 			addedNodes = append(addedNodes, nodeName)
 		}
 	}
 	for nodeName := range w.currentNodes {
-		if !newNodes[nodeName] {
+		if _, exists := newNodes[nodeName]; !exists {
 			removedNodes = append(removedNodes, nodeName)
 		}
 	}
@@ -251,9 +261,9 @@ func (w *NodeWatcher) applyNodeWatchEvent(
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.currentNodes == nil {
-		w.currentNodes = make(map[string]bool)
+		w.currentNodes = make(map[string]struct{})
 	}
-	wasTracked := w.currentNodes[nodeName]
+	_, wasTracked := w.currentNodes[nodeName]
 	if eventType == watch.Deleted || (wasTracked && !matchesSelector) {
 		if !wasTracked {
 			return false, false
@@ -262,16 +272,12 @@ func (w *NodeWatcher) applyNodeWatchEvent(
 		return false, true
 	}
 	if matchesSelector && !wasTracked {
-		w.currentNodes[nodeName] = true
+		w.currentNodes[nodeName] = struct{}{}
 		return true, false
 	}
 	return false, false
 }
 
 func (w *NodeWatcher) nodeMatchesSelector(node *v1.Node) bool {
-	selector, err := labels.Parse(w.labelSelector)
-	if err != nil {
-		return false
-	}
-	return selector.Matches(labels.Set(node.Labels))
+	return w.parsedSelector.Matches(labels.Set(node.Labels))
 }

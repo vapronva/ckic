@@ -67,8 +67,11 @@ func (i *Instance) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func (i *Instance) Delete() error {
-	ctx := context.Background()
+func (i *Instance) LoadBalancerServiceName() string {
+	return i.DeploymentName + "-loadbalancer"
+}
+
+func (i *Instance) Delete(ctx context.Context) error {
 	logger := log.With().
 		Str("node", i.NodeName).
 		Str("deployment", i.DeploymentName).
@@ -79,9 +82,8 @@ func (i *Instance) Delete() error {
 	} else {
 		logger.Info().Msg("Deleted ClusterIP Caddy service")
 	}
-	loadBalancerServiceName := i.DeploymentName + "-loadbalancer"
 	if err := i.KubeClient.CoreV1().Services(i.Namespace).Delete(
-		ctx, loadBalancerServiceName, metav1.DeleteOptions{}); err != nil {
+		ctx, i.LoadBalancerServiceName(), metav1.DeleteOptions{}); err != nil {
 		logger.Warn().
 			Err(err).
 			Msg("Failed to delete LoadBalancer Caddy service (if exists)")

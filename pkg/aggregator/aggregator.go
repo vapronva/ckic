@@ -272,27 +272,26 @@ func (a *NamespaceAggregator) recordNodePush(version uint64) {
 }
 
 func (a *NamespaceAggregator) currentMergedLocked() string {
-	merged := a.base
-	if !strings.HasSuffix(merged, "\n") {
-		merged += "\n"
-	}
 	namespaces := make([]string, 0, len(a.externals))
 	for ns := range a.externals {
 		namespaces = append(namespaces, ns)
 	}
 	sort.Strings(namespaces)
-	var mergedSb strings.Builder
+	var sb strings.Builder
+	sb.WriteString(a.base)
+	if !strings.HasSuffix(a.base, "\n") {
+		sb.WriteByte('\n')
+	}
 	for _, ns := range namespaces {
 		fragment := a.externals[ns]
 		if strings.TrimSpace(fragment) == "" {
 			continue
 		}
-		fmt.Fprintf(&mergedSb, "\n\n# ---- Begin external from %s ----\n", ns)
-		mergedSb.WriteString(strings.TrimSpace(fragment))
-		fmt.Fprintf(&mergedSb, "\n# ---- End external from %s ----\n", ns)
+		fmt.Fprintf(&sb, "\n\n# ---- Begin external from %s ----\n", ns)
+		sb.WriteString(strings.TrimSpace(fragment))
+		fmt.Fprintf(&sb, "\n# ---- End external from %s ----\n", ns)
 	}
-	merged += mergedSb.String()
-	return merged
+	return sb.String()
 }
 
 func (a *NamespaceAggregator) CurrentMerged() string {

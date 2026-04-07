@@ -368,10 +368,10 @@ func setupLogger(level zerolog.Level) {
 			TimeFormat: time.RFC3339,
 		})
 	}
-	log.Logger = log.Output(output). //nolint:reassign
-						With().
-						Str("service", "ckic-manager").
-						Logger()
+	log.Logger = log.Output(output).
+		With().
+		Str("service", "ckic-manager").
+		Logger()
 }
 
 func parseLogLevel(level string) zerolog.Level {
@@ -871,11 +871,10 @@ func startHealthProbeServer(
 		Handler:           mux,
 		ReadHeaderTimeout: probeReadHeaderTimeout,
 	}
-	//nolint:gosec
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(
-			context.Background(),
+			context.WithoutCancel(ctx),
 			probeShutdownTimeout,
 		)
 		defer cancel()

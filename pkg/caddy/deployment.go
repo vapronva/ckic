@@ -15,12 +15,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
+
+	"git.horse/vapronva/ckic/pkg/constants"
 )
 
 const (
 	deploymentTimeout      = 3 * time.Minute
 	deploymentPollDelay    = 5 * time.Second
-	caddyAdminPort         = 2019
 	caddyHTTPPort          = 80
 	caddyHTTPSPort         = 443
 	configMapDefaultMode   = int32(0o644)
@@ -33,6 +34,50 @@ const (
 	caddyCapabilityDrop    = corev1.Capability("ALL")
 	downwardAPIEnvVarCount = 3
 )
+
+func managedLabels(nodeName string) map[string]string {
+	return map[string]string{
+		constants.LabelApp:          constants.LabelAppValue,
+		constants.LabelInstance:     nodeName,
+		constants.LabelCaddyManaged: constants.LabelManagedValue,
+	}
+}
+
+func selectorLabels(nodeName string) map[string]string {
+	return map[string]string{
+		constants.LabelApp:      constants.LabelAppValue,
+		constants.LabelInstance: nodeName,
+	}
+}
+
+func trafficServicePorts() []corev1.ServicePort {
+	return []corev1.ServicePort{
+		{
+			Name:       "http-tcp",
+			Port:       caddyHTTPPort,
+			TargetPort: intstr.FromInt(caddyHTTPPort),
+			Protocol:   corev1.ProtocolTCP,
+		},
+		{
+			Name:       "http-udp",
+			Port:       caddyHTTPPort,
+			TargetPort: intstr.FromInt(caddyHTTPPort),
+			Protocol:   corev1.ProtocolUDP,
+		},
+		{
+			Name:       "https-tcp",
+			Port:       caddyHTTPSPort,
+			TargetPort: intstr.FromInt(caddyHTTPSPort),
+			Protocol:   corev1.ProtocolTCP,
+		},
+		{
+			Name:       "https-udp",
+			Port:       caddyHTTPSPort,
+			TargetPort: intstr.FromInt(caddyHTTPSPort),
+			Protocol:   corev1.ProtocolUDP,
+		},
+	}
+}
 
 type DeployOptions struct {
 	Clientset          kubernetes.Interface
@@ -69,17 +114,8 @@ func DeployCaddy(
 	}
 	deploymentChanged, deploymentCreated, err := deployDeployment(
 		deployCtx,
-		opts.Clientset,
+		opts,
 		instance,
-		opts.CaddyImage,
-		opts.EnvSecretName,
-		opts.EnvSecretKeys,
-		opts.DataVolumePVC,
-		opts.ConfigVolumePVC,
-		opts.ConfigMapName,
-		opts.UseHostNetwork,
-		opts.HTTPHostPort,
-		opts.HTTPSHostPort,
 	)
 	if err != nil {
 		return nil, err
@@ -284,56 +320,24 @@ func SelectNewestActivePodName(pods []corev1.Pod) (string, bool) {
 
 func deployDeployment(
 	ctx context.Context,
-	clientset kubernetes.Interface,
+	opts DeployOptions,
 	instance *Instance,
-	caddyImage, envSecretName string,
-	envSecretKeys []string,
-	dataVolumePVC, configVolumePVC, configMapName string,
-	useHostNetwork bool,
-	httpHostPort, httpsHostPort int,
 ) (bool, bool, error) {
 	logger := log.With().Str("deployment", instance.DeploymentName).Logger()
-	options := deploymentBuildOptions{
-		caddyImage:      caddyImage,
-		envSecretName:   envSecretName,
-		envSecretKeys:   envSecretKeys,
-		dataVolumePVC:   dataVolumePVC,
-		configVolumePVC: configVolumePVC,
-		configMapName:   configMapName,
-		useHostNetwork:  useHostNetwork,
-		httpHostPort:    httpHostPort,
-		httpsHostPort:   httpsHostPort,
-	}
-	deployment, err := buildDesiredDeployment(instance, options, logger)
+	deployment, err := buildDesiredDeployment(instance, opts, logger)
 	if err != nil {
 		return false, false, err
 	}
-	return upsertDeployment(ctx, clientset, instance, deployment, logger)
-}
-
-type deploymentBuildOptions struct {
-	caddyImage      string
-	envSecretName   string
-	envSecretKeys   []string
-	dataVolumePVC   string
-	configVolumePVC string
-	configMapName   string
-	useHostNetwork  bool
-	httpHostPort    int
-	httpsHostPort   int
+	return upsertDeployment(ctx, opts.Clientset, instance, deployment, logger)
 }
 
 func buildDesiredDeployment(
 	instance *Instance,
-	options deploymentBuildOptions,
+	options DeployOptions,
 	logger zerolog.Logger,
 ) (*appsv1.Deployment, error) {
 	replicas := int32(1)
-	labels := map[string]string{
-		"app":                        "caddy",
-		"instance":                   instance.NodeName,
-		"ckic.cmld.ru/caddy-managed": "true",
-	}
+	labels := managedLabels(instance.NodeName)
 	caddyContainer, err := buildCaddyContainer(options, logger)
 	if err != nil {
 		return nil, err
@@ -346,7 +350,7 @@ func buildDesiredDeployment(
 		Containers: []corev1.Container{caddyContainer},
 		Volumes:    volumes,
 	}
-	if options.useHostNetwork {
+	if options.UseHostNetwork {
 		podSpec.HostNetwork = true
 		podSpec.DNSPolicy = corev1.DNSClusterFirstWithHostNet
 		logger.Info().Msg("Enabled hostNetwork mode")
@@ -361,12 +365,9 @@ func buildDesiredDeployment(
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: &replicas,
-			Strategy: deploymentStrategy(options.useHostNetwork),
+			Strategy: deploymentStrategy(options.UseHostNetwork),
 			Selector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					"app":      "caddy",
-					"instance": instance.NodeName,
-				},
+				MatchLabels: selectorLabels(instance.NodeName),
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: labels},
@@ -377,13 +378,13 @@ func buildDesiredDeployment(
 }
 
 func buildCaddyContainer(
-	options deploymentBuildOptions,
+	options DeployOptions,
 	logger zerolog.Logger,
 ) (corev1.Container, error) {
 	trafficPorts, err := buildTrafficPorts(
-		options.useHostNetwork,
-		options.httpHostPort,
-		options.httpsHostPort,
+		options.UseHostNetwork,
+		options.HTTPHostPort,
+		options.HTTPSHostPort,
 		logger,
 	)
 	if err != nil {
@@ -391,12 +392,12 @@ func buildCaddyContainer(
 	}
 	container := corev1.Container{
 		Name:  caddyContainerName,
-		Image: options.caddyImage,
+		Image: options.CaddyImage,
 		Ports: append(
 			[]corev1.ContainerPort{
 				{
 					Name:          "admin",
-					ContainerPort: caddyAdminPort,
+					ContainerPort: constants.CaddyAdminPort,
 					Protocol:      corev1.ProtocolTCP,
 				},
 			},
@@ -412,8 +413,8 @@ func buildCaddyContainer(
 			{Name: "opt-config", MountPath: "/config"},
 		},
 		Env: buildCaddyEnvVars(
-			options.envSecretName,
-			options.envSecretKeys,
+			options.EnvSecretName,
+			options.EnvSecretKeys,
 			logger,
 		),
 		ImagePullPolicy: caddyImagePullPolicy,
@@ -550,7 +551,7 @@ func buildCaddyEnvVars(
 }
 
 func buildCaddyVolumes(
-	options deploymentBuildOptions,
+	options DeployOptions,
 	logger zerolog.Logger,
 ) []corev1.Volume {
 	volumes := []corev1.Volume{
@@ -559,7 +560,7 @@ func buildCaddyVolumes(
 			VolumeSource: corev1.VolumeSource{
 				ConfigMap: &corev1.ConfigMapVolumeSource{
 					LocalObjectReference: corev1.LocalObjectReference{
-						Name: options.configMapName,
+						Name: options.ConfigMapName,
 					},
 					Items: []corev1.KeyToPath{
 						{Key: "Caddyfile", Path: "Caddyfile"},
@@ -568,53 +569,45 @@ func buildCaddyVolumes(
 			},
 		},
 	}
-	volumes = append(volumes, dataVolume(options.dataVolumePVC, logger))
-	volumes = append(volumes, configVolume(options.configVolumePVC, logger))
+	volumes = append(
+		volumes,
+		buildStorageVolume(
+			"opt-data",
+			options.DataVolumePVC,
+			"/opt/cmld/caddy/data",
+			logger,
+		),
+		buildStorageVolume(
+			"opt-config",
+			options.ConfigVolumePVC,
+			"/opt/cmld/caddy/config",
+			logger,
+		),
+	)
 	return volumes
 }
 
-func dataVolume(dataVolumePVC string, logger zerolog.Logger) corev1.Volume {
-	if dataVolumePVC != "" {
-		logger.Info().Str("pvc", dataVolumePVC).Msg("Using PVC for data volume")
+func buildStorageVolume(
+	name, pvcName, hostPath string,
+	logger zerolog.Logger,
+) corev1.Volume {
+	if pvcName != "" {
+		logger.Info().Str("pvc", pvcName).Msgf("Using PVC for %s volume", name)
 		return corev1.Volume{
-			Name: "opt-data",
+			Name: name,
 			VolumeSource: corev1.VolumeSource{
 				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-					ClaimName: dataVolumePVC,
+					ClaimName: pvcName,
 				},
 			},
 		}
 	}
-	logger.Info().Msg("Using HostPath for data volume")
+	logger.Info().Msgf("Using HostPath for %s volume", name)
 	return corev1.Volume{
-		Name: "opt-data",
+		Name: name,
 		VolumeSource: corev1.VolumeSource{
 			HostPath: &corev1.HostPathVolumeSource{
-				Path: "/opt/cmld/caddy/data",
-				Type: hostPathTypePtr(corev1.HostPathDirectoryOrCreate),
-			},
-		},
-	}
-}
-
-func configVolume(configVolumePVC string, logger zerolog.Logger) corev1.Volume {
-	if configVolumePVC != "" {
-		logger.Info().Str("pvc", configVolumePVC).Msg("Using PVC for config volume")
-		return corev1.Volume{
-			Name: "opt-config",
-			VolumeSource: corev1.VolumeSource{
-				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-					ClaimName: configVolumePVC,
-				},
-			},
-		}
-	}
-	logger.Info().Msg("Using HostPath for config volume")
-	return corev1.Volume{
-		Name: "opt-config",
-		VolumeSource: corev1.VolumeSource{
-			HostPath: &corev1.HostPathVolumeSource{
-				Path: "/opt/cmld/caddy/config",
+				Path: hostPath,
 				Type: hostPathTypePtr(corev1.HostPathDirectoryOrCreate),
 			},
 		},
@@ -865,7 +858,7 @@ func deployLoadBalancerService(
 	clientset kubernetes.Interface,
 	instance *Instance,
 ) (bool, error) {
-	serviceName := instance.DeploymentName + "-loadbalancer"
+	serviceName := instance.LoadBalancerServiceName()
 	logger := log.With().Str("service", serviceName).Logger()
 	desired := desiredLoadBalancerService(instance)
 	if len(instance.ExternalIPs) > 0 {
@@ -923,54 +916,22 @@ func upsertService(
 func desiredClusterIPService(
 	instance *Instance,
 ) *corev1.Service {
+	adminPort := corev1.ServicePort{
+		Name:       "admin",
+		Port:       constants.CaddyAdminPort,
+		TargetPort: intstr.FromInt(constants.CaddyAdminPort),
+		Protocol:   corev1.ProtocolTCP,
+	}
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      instance.DeploymentName,
 			Namespace: instance.Namespace,
-			Labels: map[string]string{
-				"app":                        "caddy",
-				"instance":                   instance.NodeName,
-				"ckic.cmld.ru/caddy-managed": "true",
-			},
+			Labels:    managedLabels(instance.NodeName),
 		},
 		Spec: corev1.ServiceSpec{
-			Selector: map[string]string{
-				"app":      "caddy",
-				"instance": instance.NodeName,
-			},
-			Ports: []corev1.ServicePort{
-				{
-					Name:       "admin",
-					Port:       caddyAdminPort,
-					TargetPort: intstr.FromInt(caddyAdminPort),
-					Protocol:   corev1.ProtocolTCP,
-				},
-				{
-					Name:       "http-tcp",
-					Port:       caddyHTTPPort,
-					TargetPort: intstr.FromInt(caddyHTTPPort),
-					Protocol:   corev1.ProtocolTCP,
-				},
-				{
-					Name:       "http-udp",
-					Port:       caddyHTTPPort,
-					TargetPort: intstr.FromInt(caddyHTTPPort),
-					Protocol:   corev1.ProtocolUDP,
-				},
-				{
-					Name:       "https-tcp",
-					Port:       caddyHTTPSPort,
-					TargetPort: intstr.FromInt(caddyHTTPSPort),
-					Protocol:   corev1.ProtocolTCP,
-				},
-				{
-					Name:       "https-udp",
-					Port:       caddyHTTPSPort,
-					TargetPort: intstr.FromInt(caddyHTTPSPort),
-					Protocol:   corev1.ProtocolUDP,
-				},
-			},
-			Type: corev1.ServiceTypeClusterIP,
+			Selector: selectorLabels(instance.NodeName),
+			Ports:    append([]corev1.ServicePort{adminPort}, trafficServicePorts()...),
+			Type:     corev1.ServiceTypeClusterIP,
 		},
 	}
 }
@@ -978,48 +939,16 @@ func desiredClusterIPService(
 func desiredLoadBalancerService(instance *Instance) *corev1.Service {
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      instance.DeploymentName + "-loadbalancer",
+			Name:      instance.LoadBalancerServiceName(),
 			Namespace: instance.Namespace,
-			Labels: map[string]string{
-				"app":                        "caddy",
-				"instance":                   instance.NodeName,
-				"ckic.cmld.ru/caddy-managed": "true",
-			},
+			Labels:    managedLabels(instance.NodeName),
 			Annotations: map[string]string{
 				"io.cilium.nodeipam/match-node-labels": "kubernetes.io/hostname=" + instance.NodeName,
 			},
 		},
 		Spec: corev1.ServiceSpec{
-			Selector: map[string]string{
-				"app":      "caddy",
-				"instance": instance.NodeName,
-			},
-			Ports: []corev1.ServicePort{
-				{
-					Name:       "http-tcp",
-					Port:       caddyHTTPPort,
-					TargetPort: intstr.FromInt(caddyHTTPPort),
-					Protocol:   corev1.ProtocolTCP,
-				},
-				{
-					Name:       "https-tcp",
-					Port:       caddyHTTPSPort,
-					TargetPort: intstr.FromInt(caddyHTTPSPort),
-					Protocol:   corev1.ProtocolTCP,
-				},
-				{
-					Name:       "http-udp",
-					Port:       caddyHTTPPort,
-					TargetPort: intstr.FromInt(caddyHTTPPort),
-					Protocol:   corev1.ProtocolUDP,
-				},
-				{
-					Name:       "https-udp",
-					Port:       caddyHTTPSPort,
-					TargetPort: intstr.FromInt(caddyHTTPSPort),
-					Protocol:   corev1.ProtocolUDP,
-				},
-			},
+			Selector:              selectorLabels(instance.NodeName),
+			Ports:                 trafficServicePorts(),
 			Type:                  corev1.ServiceTypeLoadBalancer,
 			LoadBalancerClass:     new("io.cilium/node"),
 			ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyTypeLocal,
@@ -1173,36 +1102,17 @@ func deploymentRolloutComplete(deployment *appsv1.Deployment) bool {
 
 func cleanupDeployment(
 	ctx context.Context,
-	clientset kubernetes.Interface,
+	_ kubernetes.Interface,
 	instance *Instance,
 ) {
 	log.Warn().
 		Str("deployment", instance.DeploymentName).
 		Msg("Cleaning up failed deployment")
-	if err := clientset.CoreV1().
-		Services(instance.Namespace).
-		Delete(ctx, instance.ServiceName, metav1.DeleteOptions{}); err != nil {
-		log.Debug().
-			Err(err).
-			Str("service", instance.ServiceName).
-			Msg("Failed to delete service during cleanup")
-	}
-	loadBalancerServiceName := instance.DeploymentName + "-loadbalancer"
-	if err := clientset.CoreV1().
-		Services(instance.Namespace).
-		Delete(ctx, loadBalancerServiceName, metav1.DeleteOptions{}); err != nil {
-		log.Debug().
-			Err(err).
-			Str("service", loadBalancerServiceName).
-			Msg("Failed to delete LoadBalancer service during cleanup")
-	}
-	if err := clientset.AppsV1().
-		Deployments(instance.Namespace).
-		Delete(ctx, instance.DeploymentName, metav1.DeleteOptions{}); err != nil {
+	if err := instance.Delete(ctx); err != nil {
 		log.Debug().
 			Err(err).
 			Str("deployment", instance.DeploymentName).
-			Msg("Failed to delete deployment during cleanup")
+			Msg("Failed to clean up deployment resources")
 	}
 }
 

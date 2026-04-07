@@ -16,6 +16,8 @@ import (
 	"github.com/rs/zerolog/log"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"git.horse/vapronva/ckic/pkg/constants"
 )
 
 type CommunicationMethod int
@@ -25,6 +27,19 @@ const (
 	CommunicationMethodDirect
 	CommunicationMethodHostNetwork
 )
+
+func (m CommunicationMethod) String() string {
+	switch m {
+	case CommunicationMethodClusterIP:
+		return "clusterip"
+	case CommunicationMethodDirect:
+		return "direct"
+	case CommunicationMethodHostNetwork:
+		return "hostnetwork"
+	default:
+		return fmt.Sprintf("unknown(%d)", int(m))
+	}
+}
 
 type AdminAPIConfig struct {
 	OriginKey string
@@ -37,6 +52,14 @@ const (
 	caddyAPIMaxDelay        = 600 * time.Second
 	caddyAPIReadyTimeout    = 5 * time.Minute
 )
+
+func newReadinessHTTPClient() *http.Client {
+	return &http.Client{Timeout: readinessRequestTimeout}
+}
+
+func newConfigPushHTTPClient() *http.Client {
+	return &http.Client{Timeout: configPushTimeout}
+}
 
 func waitForCaddyAPIReady(
 	ctx context.Context,
@@ -90,7 +113,7 @@ func readinessClient(client *http.Client) *http.Client {
 	if client != nil {
 		return client
 	}
-	return &http.Client{Timeout: readinessRequestTimeout}
+	return newReadinessHTTPClient()
 }
 
 func readinessProbe(
@@ -107,7 +130,7 @@ func readinessProbe(
 	if apiConfig != nil && apiConfig.OriginKey != "" {
 		req.Header.Set("Origin", adminOrigin(apiConfig.OriginKey))
 	}
-	resp, doErr := client.Do(req) //nolint:gosec
+	resp, doErr := client.Do(req)
 	if doErr != nil {
 		return false, doErr
 	}
@@ -148,7 +171,7 @@ func (i *Instance) UpdateConfig(
 	logger := log.With().
 		Str("node", i.NodeName).
 		Str("pod", i.PodName).
-		Str("method", fmt.Sprintf("%d", method)).
+		Str("method", method.String()).
 		Logger()
 	logger.Debug().Msg("Updating Caddy configuration")
 	adminURL, resolveErr := i.resolveAdminURL(ctx, method, logger)
@@ -160,14 +183,13 @@ func (i *Instance) UpdateConfig(
 			Err:      resolveErr,
 		}
 	}
-	readinessClient := &http.Client{Timeout: readinessRequestTimeout}
 	readyCtx, cancel := context.WithTimeout(ctx, caddyAPIReadyTimeout)
 	defer cancel()
 	if readyErr := waitForCaddyAPIReady(
 		readyCtx,
 		adminURL,
 		apiConfig,
-		readinessClient,
+		newReadinessHTTPClient(),
 	); readyErr != nil {
 		logger.Error().Err(readyErr).Msg("Caddy Admin API not ready")
 		return &ConfigurationFailedError{
@@ -191,7 +213,7 @@ func (i *Instance) UpdateConfig(
 			Err:      reqErr,
 		}
 	}
-	resp, doErr := i.sendConfigUpdateRequest(req)
+	resp, doErr := newConfigPushHTTPClient().Do(req)
 	if doErr != nil {
 		logger.Error().Err(doErr).Msg("Failed to send configuration to Caddy")
 		return &ConfigurationFailedError{
@@ -244,13 +266,16 @@ func (i *Instance) resolveAdminURL(
 }
 
 func clusterIPAdminURL(serviceName, namespace string) string {
+	return adminLoadURL(
+		fmt.Sprintf("%s.%s.svc.cluster.local", serviceName, namespace),
+	)
+}
+
+func adminLoadURL(host string) string {
 	return (&url.URL{
 		Scheme: "http",
-		Host: net.JoinHostPort(
-			fmt.Sprintf("%s.%s.svc.cluster.local", serviceName, namespace),
-			"2019",
-		),
-		Path: "/load",
+		Host:   net.JoinHostPort(host, constants.CaddyAdminPortStr),
+		Path:   "/load",
 	}).String()
 }
 
@@ -269,11 +294,7 @@ func (i *Instance) directAdminURL(
 	if podIP == "" {
 		return "", stdErrors.New("pod IP is empty")
 	}
-	return (&url.URL{
-		Scheme: "http",
-		Host:   net.JoinHostPort(podIP, "2019"),
-		Path:   "/load",
-	}).String(), nil
+	return adminLoadURL(podIP), nil
 }
 
 func (i *Instance) hostNetworkAdminURL(
@@ -291,11 +312,7 @@ func (i *Instance) hostNetworkAdminURL(
 	if nodeIP == "" {
 		return "", stdErrors.New("no IP address found for node")
 	}
-	return (&url.URL{
-		Scheme: "http",
-		Host:   net.JoinHostPort(nodeIP, "2019"),
-		Path:   "/load",
-	}).String(), nil
+	return adminLoadURL(nodeIP), nil
 }
 
 func preferredNodeIP(node *corev1.Node) string {
@@ -342,11 +359,6 @@ func (i *Instance) buildConfigUpdateRequest(
 		Str("origin", req.Header.Get("Origin")).
 		Msg("Added Origin header for admin API security")
 	return req, nil
-}
-
-func (i *Instance) sendConfigUpdateRequest(req *http.Request) (*http.Response, error) {
-	client := &http.Client{Timeout: configPushTimeout}
-	return client.Do(req) //nolint:gosec
 }
 
 func (i *Instance) logConfigUpdateFailure(

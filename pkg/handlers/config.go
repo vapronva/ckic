@@ -321,7 +321,7 @@ func (h *ConfigHandler) redeployFailedInstance(
 	if !shouldRedeploy {
 		return
 	}
-	if deleteErr := failed.instance.Delete(); deleteErr != nil {
+	if deleteErr := failed.instance.Delete(context.Background()); deleteErr != nil {
 		logger.Error().
 			Err(deleteErr).
 			Str("node", failed.nodeName).
@@ -344,7 +344,7 @@ func (h *ConfigHandler) redeployFailedInstance(
 		logger.Debug().
 			Str("node", failed.nodeName).
 			Msg("Failed instance was replaced during redeployment; cleaning up stale redeploy")
-		if cleanupErr := newInstance.Delete(); cleanupErr != nil {
+		if cleanupErr := newInstance.Delete(context.Background()); cleanupErr != nil {
 			logger.Warn().
 				Err(cleanupErr).
 				Str("node", failed.nodeName).

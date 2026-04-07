@@ -179,7 +179,7 @@ func (h *NodeHandler) handleNodeRemoved(nodeName string) {
 		return
 	}
 	logger.Info().Msg("Node removed, cleaning up Caddy instance")
-	if err := instance.Delete(); err != nil {
+	if err := instance.Delete(context.Background()); err != nil {
 		logger.Error().Err(err).Msg("Failed to delete Caddy instance")
 		restoreInstanceIfMissing(h.mu, h.deployedInstances, nodeName, instance)
 		return
@@ -249,7 +249,7 @@ func (h *NodeHandler) handleNodeAddDeployError(
 	}
 	logger.Info().
 		Msg("Node was removed while deployment failed, cleaning up previous instance")
-	if err := previousInstance.Delete(); err != nil {
+	if err := previousInstance.Delete(context.Background()); err != nil {
 		logger.Error().
 			Err(err).
 			Msg("Failed to delete previous Caddy instance after removal")
@@ -272,7 +272,7 @@ func (h *NodeHandler) handleRemovedNodeAfterDeployResult(
 	if cleanupInstance == nil {
 		return
 	}
-	if err := cleanupInstance.Delete(); err != nil {
+	if err := cleanupInstance.Delete(context.Background()); err != nil {
 		logger.Error().Err(err).Msg("Failed to delete Caddy instance after removal")
 		restoreInstanceIfMissing(h.mu, h.deployedInstances, nodeName, previousInstance)
 		return

@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -51,19 +53,20 @@ type ControllerConfig struct {
 }
 
 type Controller struct {
-	clientset         kubernetes.Interface
-	config            ControllerConfig
-	deployOpts        caddy.DeployOptions
-	nodeWatcher       *watcher.NodeWatcher
-	configWatcher     *watcher.ConfigWatcher
-	externalWatcher   *watcher.ExternalConfigWatcher
-	nodeHandler       *handlers.NodeHandler
-	configHandler     *handlers.ConfigHandler
-	deployedInstances map[string]*caddy.Instance
-	instancesMutex    *sync.RWMutex
-	stateStore        *state.ConfigMapStateStore
-	coordinator       *WatcherCoordinator
-	aggregator        *aggregator.NamespaceAggregator
+	clientset              kubernetes.Interface
+	config                 ControllerConfig
+	deployOpts             caddy.DeployOptions
+	nodeWatcher            *watcher.NodeWatcher
+	configWatcher          *watcher.ConfigWatcher
+	externalWatcher        *watcher.ExternalConfigWatcher
+	nodeHandler            *handlers.NodeHandler
+	configHandler          *handlers.ConfigHandler
+	deployedInstances      map[string]*caddy.Instance
+	instancesMutex         *sync.RWMutex
+	stateStore             *state.ConfigMapStateStore
+	coordinator            *WatcherCoordinator
+	aggregator             *aggregator.NamespaceAggregator
+	lastPersistedStateHash [sha256.Size]byte
 }
 
 const (
@@ -302,7 +305,7 @@ func (c *Controller) discoverManagedDeployments(
 	deployments, err := c.clientset.AppsV1().
 		Deployments(c.config.ConfigMapNamespace).
 		List(ctx, metav1.ListOptions{
-			LabelSelector: "ckic.cmld.ru/caddy-managed=true",
+			LabelSelector: constants.ManagedLabelSelector,
 		})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list deployments for reconciliation: %w", err)
@@ -340,7 +343,7 @@ func (c *Controller) deleteOutOfScopeDeployment(
 		Str("node", nodeName).
 		Str("selector", nodeSelector).
 		Msg("Deleting managed deployment outside NodeLabel selector scope")
-	if err := instance.Delete(); err != nil {
+	if err := instance.Delete(context.Background()); err != nil {
 		logger.Error().
 			Err(err).
 			Msgf("Failed to delete orphaned deployment on node %s", nodeName)
@@ -586,11 +589,7 @@ func (c *Controller) runPeriodicConfigReconciliationTick(
 	logger.Info().Msg("Performing periodic configuration reconciliation")
 	configData, err := c.loadConfigData(ctx)
 	if err != nil {
-		if errors.Is(err, errConfigMapMissingCaddyfile) {
-			logger.Warn().Msg("ConfigMap missing Caddyfile key during reconciliation")
-			return
-		}
-		logger.Error().Err(err).Msg("Failed to get ConfigMap during reconciliation")
+		c.logConfigLoadError(err, logger, "reconciliation")
 		return
 	}
 	if !c.applyPeriodicConfigData(configData, logger) {
@@ -656,5 +655,17 @@ func (c *Controller) snapshotAndPersistState(ctx context.Context) error {
 	instancesCopy := make(map[string]*caddy.Instance, len(c.deployedInstances))
 	maps.Copy(instancesCopy, c.deployedInstances)
 	c.instancesMutex.RUnlock()
-	return c.stateStore.SaveState(ctx, instancesCopy)
+	data, err := json.Marshal(instancesCopy)
+	if err != nil {
+		return fmt.Errorf("failed to marshal state for hash: %w", err)
+	}
+	hash := sha256.Sum256(data)
+	if hash == c.lastPersistedStateHash {
+		return nil
+	}
+	if saveErr := c.stateStore.SaveState(ctx, instancesCopy); saveErr != nil {
+		return saveErr
+	}
+	c.lastPersistedStateHash = hash
+	return nil
 }
