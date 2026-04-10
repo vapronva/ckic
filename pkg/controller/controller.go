@@ -33,7 +33,6 @@ type ControllerConfig struct {
 	CommunicationMethod          caddy.CommunicationMethod
 	CaddyImage                   string
 	EnableLoadBalancer           bool
-	PreferSavedState             bool
 	EnvSecretName                string
 	EnvSecretKeys                []string
 	DataVolumePVC                string
@@ -53,20 +52,21 @@ type ControllerConfig struct {
 }
 
 type Controller struct {
-	clientset              kubernetes.Interface
-	config                 ControllerConfig
-	deployOpts             caddy.DeployOptions
-	nodeWatcher            *watcher.NodeWatcher
-	configWatcher          *watcher.ConfigWatcher
-	externalWatcher        *watcher.ExternalConfigWatcher
-	nodeHandler            *handlers.NodeHandler
-	configHandler          *handlers.ConfigHandler
-	deployedInstances      map[string]*caddy.Instance
-	instancesMutex         *sync.RWMutex
-	stateStore             *state.ConfigMapStateStore
-	coordinator            *WatcherCoordinator
-	aggregator             *aggregator.NamespaceAggregator
-	lastPersistedStateHash [sha256.Size]byte
+	clientset                kubernetes.Interface
+	config                   ControllerConfig
+	deployOpts               caddy.DeployOptions
+	nodeWatcher              *watcher.NodeWatcher
+	configWatcher            *watcher.ConfigWatcher
+	externalWatcher          *watcher.ExternalConfigWatcher
+	nodeHandler              *handlers.NodeHandler
+	configHandler            *handlers.ConfigHandler
+	deployedInstances        map[string]*caddy.Instance
+	instancesMutex           *sync.RWMutex
+	stateStore               *state.ConfigMapStateStore
+	coordinator              *WatcherCoordinator
+	aggregator               *aggregator.NamespaceAggregator
+	lastPersistedStateHashMu sync.Mutex
+	lastPersistedStateHash   [sha256.Size]byte
 }
 
 const (
@@ -124,6 +124,7 @@ func NewController(
 		config.ExternalEndpoints,
 		deployedInstances,
 		mutex,
+		nodeHandler,
 	)
 	watchers := buildWatcherBundle(
 		clientset,
@@ -311,7 +312,7 @@ func (c *Controller) discoverManagedDeployments(
 		return nil, fmt.Errorf("failed to list deployments for reconciliation: %w", err)
 	}
 	for _, dep := range deployments.Items {
-		nodeName, ok := dep.Labels["instance"]
+		nodeName, ok := dep.Labels[constants.LabelInstance]
 		if !ok || nodeName == "" {
 			logger.Warn().Msg("Deployment missing instance label, skipping")
 			continue
@@ -324,7 +325,7 @@ func (c *Controller) discoverManagedDeployments(
 			KubeClient:     c.clientset,
 		}
 		if _, matchesSelector := eligibleNodes[nodeName]; !matchesSelector {
-			c.deleteOutOfScopeDeployment(instance, nodeName, nodeSelector, logger)
+			c.deleteOutOfScopeDeployment(ctx, instance, nodeName, nodeSelector, logger)
 			continue
 		}
 		c.attachPodNameForAdoptedDeployment(ctx, nodeName, instance, logger)
@@ -335,6 +336,7 @@ func (c *Controller) discoverManagedDeployments(
 }
 
 func (c *Controller) deleteOutOfScopeDeployment(
+	ctx context.Context,
 	instance *caddy.Instance,
 	nodeName, nodeSelector string,
 	logger zerolog.Logger,
@@ -343,7 +345,7 @@ func (c *Controller) deleteOutOfScopeDeployment(
 		Str("node", nodeName).
 		Str("selector", nodeSelector).
 		Msg("Deleting managed deployment outside NodeLabel selector scope")
-	if err := instance.Delete(context.Background()); err != nil {
+	if err := instance.Delete(ctx); err != nil {
 		logger.Error().
 			Err(err).
 			Msgf("Failed to delete orphaned deployment on node %s", nodeName)
@@ -361,7 +363,7 @@ func (c *Controller) attachPodNameForAdoptedDeployment(
 	podList, err := c.clientset.CoreV1().
 		Pods(c.config.ConfigMapNamespace).
 		List(ctx, metav1.ListOptions{
-			LabelSelector: "app=caddy,instance=" + nodeName,
+			LabelSelector: constants.InstanceLabelSelector(nodeName),
 		})
 	if err != nil {
 		logger.Warn().
@@ -407,6 +409,7 @@ func (c *Controller) mergeSavedState(
 			Err(err).
 			Msg("Could not load saved state, proceeding with discovered state")
 	}
+	var restored int
 	for node := range discovered {
 		savedInst, exists := savedState[node]
 		if !exists || savedInst == nil {
@@ -414,18 +417,16 @@ func (c *Controller) mergeSavedState(
 		}
 		if savedInst.FailureCount.Load() > 0 {
 			discovered[node].FailureCount.Store(savedInst.FailureCount.Load())
+			restored++
 			logger.Debug().
 				Str("node", node).
 				Int32("failureCount", savedInst.FailureCount.Load()).
 				Msg("Restored FailureCount from saved state")
 		}
 	}
-	if !c.config.PreferSavedState || len(savedState) == 0 {
-		logger.Info().Msg("Using discovered state")
-		return
-	}
 	logger.Info().
-		Msg("PreferSavedState is enabled. Merging saved state with discovered state, preferring saved state")
+		Int("restored", restored).
+		Msg("Merged saved state failure counts into discovered state")
 }
 
 func (c *Controller) replaceAndPersistState(
@@ -439,9 +440,14 @@ func (c *Controller) replaceAndPersistState(
 	instancesCopy := make(map[string]*caddy.Instance, len(c.deployedInstances))
 	maps.Copy(instancesCopy, c.deployedInstances)
 	c.instancesMutex.Unlock()
-	if saveErr := c.stateStore.SaveState(ctx, instancesCopy); saveErr != nil {
+	c.lastPersistedStateHashMu.Lock()
+	defer c.lastPersistedStateHashMu.Unlock()
+	data, saveErr := c.stateStore.SaveState(ctx, instancesCopy)
+	if saveErr != nil {
 		logger.Error().Err(saveErr).Msg("Failed to persist state")
+		return
 	}
+	c.lastPersistedStateHash = sha256.Sum256(data)
 }
 
 func (c *Controller) initializeConfiguration(ctx context.Context, logger zerolog.Logger) {
@@ -660,10 +666,12 @@ func (c *Controller) snapshotAndPersistState(ctx context.Context) error {
 		return fmt.Errorf("failed to marshal state for hash: %w", err)
 	}
 	hash := sha256.Sum256(data)
+	c.lastPersistedStateHashMu.Lock()
+	defer c.lastPersistedStateHashMu.Unlock()
 	if hash == c.lastPersistedStateHash {
 		return nil
 	}
-	if saveErr := c.stateStore.SaveState(ctx, instancesCopy); saveErr != nil {
+	if _, saveErr := c.stateStore.SaveState(ctx, instancesCopy); saveErr != nil {
 		return saveErr
 	}
 	c.lastPersistedStateHash = hash

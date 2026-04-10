@@ -10,7 +10,7 @@ updateStrategy:
 image:
   repository: docker.horse
   image: vapronva/ckic/manager
-  tag: 0.27.0
+  tag: 0.28.0
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -73,7 +73,6 @@ config:
   httpHostPort: 80
   httpsHostPort: 443
   caddyAdminOriginKey: ""
-  preferSavedState: false
   secretName: caddy-env
   secretEnvKeys: []
   dataVolumePVC: caddy-data-lv

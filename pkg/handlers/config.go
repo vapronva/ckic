@@ -15,6 +15,12 @@ import (
 	"git.horse/vapronva/ckic/pkg/utils"
 )
 
+type InProgressCoordinator interface {
+	MarkInProgress(nodeName string) bool
+	UnmarkInProgress(nodeName string) (wasRemoved bool, cleanupInstance *caddy.Instance)
+	CleanupRemovedNode(nodeName string, instance *caddy.Instance)
+}
+
 type ConfigHandler struct {
 	deployOpts          caddy.DeployOptions
 	communicationMethod caddy.CommunicationMethod
@@ -26,6 +32,14 @@ type ConfigHandler struct {
 	lastConfigDigest    string
 	instanceDigests     map[string]string
 	instanceSignatures  map[string]string
+	coordinator         InProgressCoordinator
+	redeployPushTimeout time.Duration
+	deployFn            func(
+		ctx context.Context,
+		opts caddy.DeployOptions,
+		nodeName string,
+		externalIPs []string,
+	) (*caddy.Instance, error)
 }
 
 type failedInstance struct {
@@ -39,12 +53,12 @@ type configUpdateResult struct {
 }
 
 const (
-	configUpdateDelay         = 1 * time.Second
-	configUpdateConcurrency   = 5
-	configUpdateRetryCount    = 3
-	configUpdateRetryFactor   = 2
-	maxInstanceFailureCount   = 5
-	redeployConfigPushTimeout = 6 * time.Minute
+	configUpdateDelay                = 1 * time.Second
+	configUpdateConcurrency          = 5
+	configUpdateRetryCount           = 3
+	configUpdateRetryFactor          = 2
+	maxInstanceFailureCount          = 5
+	defaultRedeployConfigPushTimeout = 6 * time.Minute
 )
 
 func NewConfigHandler(
@@ -54,6 +68,7 @@ func NewConfigHandler(
 	externalEndpoints utils.ExternalEndpointsMap,
 	instances map[string]*caddy.Instance,
 	mu *sync.RWMutex,
+	coordinator InProgressCoordinator,
 ) *ConfigHandler {
 	return &ConfigHandler{
 		deployOpts:          deployOpts,
@@ -64,6 +79,9 @@ func NewConfigHandler(
 		mu:                  mu,
 		instanceDigests:     make(map[string]string),
 		instanceSignatures:  make(map[string]string),
+		coordinator:         coordinator,
+		redeployPushTimeout: defaultRedeployConfigPushTimeout,
+		deployFn:            caddy.DeployCaddy,
 	}
 }
 
@@ -317,6 +335,13 @@ func (h *ConfigHandler) redeployFailedInstance(
 	configDigest string,
 	logger zerolog.Logger,
 ) {
+	if h.coordinator != nil && !h.coordinator.MarkInProgress(failed.nodeName) {
+		logger.Debug().
+			Str("node", failed.nodeName).
+			Msg("Node deployment already in progress elsewhere, skipping redeploy")
+		return
+	}
+	defer h.finalizeRedeploy(failed.nodeName, logger)
 	current, shouldRedeploy := h.prepareFailedInstanceRedeploy(failed, logger)
 	if !shouldRedeploy {
 		return
@@ -353,8 +378,12 @@ func (h *ConfigHandler) redeployFailedInstance(
 		h.clearInstanceTracking(failed.nodeName)
 		return
 	}
+	pushTimeout := h.redeployPushTimeout
+	if pushTimeout <= 0 {
+		pushTimeout = defaultRedeployConfigPushTimeout
+	}
 	pushCtx, pushCancel := context.WithTimeout(
-		context.Background(), redeployConfigPushTimeout,
+		context.Background(), pushTimeout,
 	)
 	defer pushCancel()
 	if pushErr := newInstance.UpdateConfig(
@@ -375,6 +404,21 @@ func (h *ConfigHandler) redeployFailedInstance(
 	logger.Info().
 		Str("node", failed.nodeName).
 		Msg("Successfully redeployed Caddy instance")
+}
+
+func (h *ConfigHandler) finalizeRedeploy(nodeName string, logger zerolog.Logger) {
+	if h.coordinator == nil {
+		return
+	}
+	wasRemoved, cleanupInstance := h.coordinator.UnmarkInProgress(nodeName)
+	if !wasRemoved {
+		return
+	}
+	logger.Info().
+		Str("node", nodeName).
+		Msg("Node was removed during redeploy, cleaning up orphaned resources")
+	h.clearInstanceTracking(nodeName)
+	h.coordinator.CleanupRemovedNode(nodeName, cleanupInstance)
 }
 
 func (h *ConfigHandler) prepareFailedInstanceRedeploy(
@@ -411,7 +455,11 @@ func (h *ConfigHandler) clearInstanceTracking(nodeName string) {
 func (h *ConfigHandler) deployReplacementInstance(
 	nodeName string,
 ) (*caddy.Instance, error) {
-	return caddy.DeployCaddy(
+	deployFn := h.deployFn
+	if deployFn == nil {
+		deployFn = caddy.DeployCaddy
+	}
+	return deployFn(
 		context.Background(),
 		h.deployOpts,
 		nodeName,

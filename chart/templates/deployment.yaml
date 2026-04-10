@@ -64,7 +64,6 @@ spec:
             - "--log-level={{ .Values.config.logLevel }}"
             - "--caddy-image={{ .Values.config.caddyImage }}"
             - "--enable-loadbalancer={{ .Values.config.enableLoadBalancer }}"
-            - "--prefer-saved-state={{ .Values.config.preferSavedState }}"
             - "--env-secret={{ .Values.config.secretName }}"
             {{- range .Values.config.secretEnvKeys }}
             - "--env-keys={{ . }}"

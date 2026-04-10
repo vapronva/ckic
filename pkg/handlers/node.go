@@ -167,7 +167,6 @@ func (h *NodeHandler) handleNodeRemoved(nodeName string) {
 			Msg("Node removed while deployment in progress, marking for cleanup")
 		return
 	}
-	h.inProgressNodesMu.Unlock()
 	h.mu.Lock()
 	instance, exists = h.deployedInstances[nodeName]
 	if exists {
@@ -175,6 +174,7 @@ func (h *NodeHandler) handleNodeRemoved(nodeName string) {
 		shouldNotify = h.nodeChangeNotifier != nil
 	}
 	h.mu.Unlock()
+	h.inProgressNodesMu.Unlock()
 	if !exists {
 		return
 	}
@@ -188,6 +188,54 @@ func (h *NodeHandler) handleNodeRemoved(nodeName string) {
 	if shouldNotify {
 		h.nodeChangeNotifier()
 	}
+}
+
+func (h *NodeHandler) MarkInProgress(nodeName string) bool {
+	h.inProgressNodesMu.Lock()
+	defer h.inProgressNodesMu.Unlock()
+	if _, exists := h.inProgressNodes[nodeName]; exists {
+		return false
+	}
+	h.inProgressNodes[nodeName] = struct{}{}
+	return true
+}
+
+func (h *NodeHandler) UnmarkInProgress(
+	nodeName string,
+) (bool, *caddy.Instance) {
+	h.inProgressNodesMu.Lock()
+	defer h.inProgressNodesMu.Unlock()
+	delete(h.inProgressNodes, nodeName)
+	if _, wasRemoved := h.removedNodes[nodeName]; !wasRemoved {
+		return false, nil
+	}
+	delete(h.removedNodes, nodeName)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	instance := h.deployedInstances[nodeName]
+	delete(h.deployedInstances, nodeName)
+	return true, instance
+}
+
+func (h *NodeHandler) CleanupRemovedNode(
+	nodeName string,
+	instance *caddy.Instance,
+) {
+	logger := log.With().Str("node", nodeName).Logger()
+	if instance == nil {
+		logger.Debug().
+			Msg("No instance to clean up after redeploy/removal race")
+		return
+	}
+	if err := instance.Delete(context.Background()); err != nil {
+		logger.Error().
+			Err(err).
+			Msg("Failed to delete orphaned Caddy instance after redeploy/removal race")
+		return
+	}
+	logger.Info().
+		Msg("Successfully cleaned up orphaned Caddy instance after redeploy/removal race")
+	h.notifyNodeChange()
 }
 
 func (h *NodeHandler) handleNodeAddedResult(

@@ -18,7 +18,6 @@ flowchart LR
     CLIFlags --> |"<code>comm-method</code>"| ConfigHandler
     CLIFlags --> |"<code>caddy-admin-origin-key</code>"| CaddyAdminClient
     CLIFlags --> |"<code>use-host-network</code> & <code>enable-loadbalancer</code>"| CaddyDeployer
-    CLIFlags --> |"<code>prefer-saved-state</code>"| StateReconciliation
 
     Controller["<code>pkg/controller/controller</code>"] --> |"Run"| StateReconciliation
     Controller --> |"Start workers"| NodeHandler

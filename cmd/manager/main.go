@@ -47,7 +47,6 @@ type cliOptions struct {
 	logLevel                     string
 	caddyImage                   string
 	enableLoadBalancer           bool
-	preferSavedState             bool
 	secretName                   string
 	secretEnvKeys                []string
 	dataVolumePVC                string
@@ -112,7 +111,6 @@ func main() {
 		CommunicationMethod:          commMethod,
 		CaddyImage:                   options.caddyImage,
 		EnableLoadBalancer:           options.enableLoadBalancer,
-		PreferSavedState:             options.preferSavedState,
 		EnvSecretName:                options.secretName,
 		EnvSecretKeys:                options.secretEnvKeys,
 		DataVolumePVC:                options.dataVolumePVC,
@@ -220,11 +218,6 @@ func registerCoreCLIFlags(opts *cliOptions) {
 		"enable-loadbalancer",
 		false,
 		"Enable LoadBalancer service exposure",
-	)
-	pflag.BoolVar(&opts.preferSavedState,
-		"prefer-saved-state",
-		false,
-		"Prefer saved (aka persistent) state during reconciliation",
 	)
 	pflag.StringVar(&opts.secretName,
 		"env-secret",

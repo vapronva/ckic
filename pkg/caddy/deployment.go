@@ -250,7 +250,7 @@ func resolvePodName(
 		initialBackoff = 250 * time.Millisecond
 		maxBackoff     = 2 * time.Second
 	)
-	labelSelector := fmt.Sprintf("app=caddy,instance=%s", nodeName)
+	labelSelector := constants.InstanceLabelSelector(nodeName)
 	backoff := initialBackoff
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {

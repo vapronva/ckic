@@ -34,12 +34,15 @@ func NewConfigMapStateStore(
 func (s *ConfigMapStateStore) SaveState(
 	ctx context.Context,
 	state map[string]*caddy.Instance,
-) error {
+) ([]byte, error) {
 	data, err := json.Marshal(state)
 	if err != nil {
-		return fmt.Errorf("failed to marshal state: %w", err)
+		return nil, fmt.Errorf("failed to marshal state: %w", err)
 	}
-	return s.upsertStateConfigMap(ctx, string(data))
+	if upsertErr := s.upsertStateConfigMap(ctx, string(data)); upsertErr != nil {
+		return nil, upsertErr
+	}
+	return data, nil
 }
 
 func (s *ConfigMapStateStore) upsertStateConfigMap(

@@ -19,3 +19,7 @@ const (
 	LabelManagedValue            = "true"
 	ManagedLabelSelector         = LabelCaddyManaged + "=" + LabelManagedValue
 )
+
+func InstanceLabelSelector(nodeName string) string {
+	return LabelApp + "=" + LabelAppValue + "," + LabelInstance + "=" + nodeName
+}
