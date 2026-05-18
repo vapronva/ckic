@@ -33,6 +33,8 @@ const (
 	caddyCapabilityNetAdm  = corev1.Capability("NET_ADMIN")
 	caddyCapabilityBind    = corev1.Capability("NET_BIND_SERVICE")
 	caddyCapabilityDrop    = corev1.Capability("ALL")
+	caddyRunAsUser         = int64(1000)
+	caddyRunAsGroup        = int64(1000)
 	downwardAPIEnvVarCount = 3
 	portNameHTTPTCP        = "http-tcp"
 	portNameHTTPUDP        = "http-udp"
@@ -362,7 +364,7 @@ func buildDesiredDeployment(
 		},
 		AutomountServiceAccountToken: new(false),
 		SecurityContext: &corev1.PodSecurityContext{
-			RunAsNonRoot: new(true),
+			RunAsNonRoot: new(false),
 			SeccompProfile: &corev1.SeccompProfile{
 				Type: corev1.SeccompProfileTypeRuntimeDefault,
 			},
@@ -440,7 +442,7 @@ func buildCaddyContainer(
 		ImagePullPolicy: options.imagePullPolicy(),
 		SecurityContext: &corev1.SecurityContext{
 			AllowPrivilegeEscalation: new(false),
-			RunAsNonRoot:             new(true),
+			RunAsNonRoot:             new(false),
 			Capabilities: &corev1.Capabilities{
 				Add: []corev1.Capability{
 					caddyCapabilityNetAdm,

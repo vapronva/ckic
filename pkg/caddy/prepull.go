@@ -76,6 +76,8 @@ func prePullPodSpec(
 			AutomountServiceAccountToken: new(false),
 			SecurityContext: &corev1.PodSecurityContext{
 				RunAsNonRoot: new(true),
+				RunAsUser:    new(caddyRunAsUser),
+				RunAsGroup:   new(caddyRunAsGroup),
 				SeccompProfile: &corev1.SeccompProfile{
 					Type: corev1.SeccompProfileTypeRuntimeDefault,
 				},
@@ -89,6 +91,8 @@ func prePullPodSpec(
 					SecurityContext: &corev1.SecurityContext{
 						AllowPrivilegeEscalation: new(false),
 						RunAsNonRoot:             new(true),
+						RunAsUser:                new(caddyRunAsUser),
+						RunAsGroup:               new(caddyRunAsGroup),
 						Capabilities: &corev1.Capabilities{
 							Drop: []corev1.Capability{caddyCapabilityDrop},
 						},
