@@ -33,6 +33,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "ckic-manager.serviceAccountName" . }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | default 60 }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
@@ -47,7 +48,6 @@ spec:
             - "--config-namespace={{ .Values.config.configMapNamespace }}"
             - "--bootstrap-default-config={{ .Values.config.bootstrapDefaultConfig }}"
             - "--leader-elect={{ .Values.leaderElection.enabled }}"
-            - "--readiness-require-leader={{ .Values.leaderElection.readinessRequireLeader }}"
             - "--leader-election-lease-name={{ .Values.leaderElection.leaseName }}"
             {{- if .Values.leaderElection.leaseNamespace }}
             - "--leader-election-lease-namespace={{ .Values.leaderElection.leaseNamespace }}"
@@ -63,6 +63,8 @@ spec:
             - "--comm-method={{ .Values.config.communicationMethod }}"
             - "--log-level={{ .Values.config.logLevel }}"
             - "--caddy-image={{ .Values.config.caddyImage }}"
+            - "--image-pull-policy={{ .Values.config.imagePullPolicy }}"
+            - "--prepull-image={{ .Values.config.prePullImage }}"
             - "--enable-loadbalancer={{ .Values.config.enableLoadBalancer }}"
             - "--env-secret={{ .Values.config.secretName }}"
             {{- range .Values.config.secretEnvKeys }}

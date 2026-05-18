@@ -2,9 +2,11 @@ package handlers
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"maps"
+	"math/big"
 	"sync"
 	"time"
 
@@ -25,15 +27,16 @@ type ConfigHandler struct {
 	deployOpts          caddy.DeployOptions
 	communicationMethod caddy.CommunicationMethod
 	caddyAdminOriginKey string
+	adminClients        *caddy.AdminClients
 	externalEndpoints   utils.ExternalEndpointsMap
 	deployedInstances   map[string]*caddy.Instance
 	mu                  *sync.RWMutex
 	handleMu            sync.Mutex
-	lastConfigDigest    string
 	instanceDigests     map[string]string
 	instanceSignatures  map[string]string
 	coordinator         InProgressCoordinator
 	redeployPushTimeout time.Duration
+	lifetimeCtx         context.Context
 	deployFn            func(
 		ctx context.Context,
 		opts caddy.DeployOptions,
@@ -53,10 +56,10 @@ type configUpdateResult struct {
 }
 
 const (
-	configUpdateDelay                = 1 * time.Second
 	configUpdateConcurrency          = 5
 	configUpdateRetryCount           = 3
-	configUpdateRetryFactor          = 2
+	configUpdateRetryBase            = 2 * time.Second
+	configUpdateRetryJitter          = 500 * time.Millisecond
 	maxInstanceFailureCount          = 5
 	defaultRedeployConfigPushTimeout = 6 * time.Minute
 )
@@ -74,6 +77,7 @@ func NewConfigHandler(
 		deployOpts:          deployOpts,
 		communicationMethod: method,
 		caddyAdminOriginKey: caddyAdminOriginKey,
+		adminClients:        caddy.NewAdminClients(),
 		externalEndpoints:   externalEndpoints,
 		deployedInstances:   instances,
 		mu:                  mu,
@@ -81,8 +85,20 @@ func NewConfigHandler(
 		instanceSignatures:  make(map[string]string),
 		coordinator:         coordinator,
 		redeployPushTimeout: defaultRedeployConfigPushTimeout,
+		lifetimeCtx:         context.Background(),
 		deployFn:            caddy.DeployCaddy,
 	}
+}
+
+func (h *ConfigHandler) Attach(ctx context.Context) {
+	h.lifetimeCtx = ctx
+}
+
+func (h *ConfigHandler) ctx() context.Context {
+	if h.lifetimeCtx == nil {
+		return context.Background()
+	}
+	return h.lifetimeCtx
 }
 
 func (h *ConfigHandler) Handle(configData string) {
@@ -94,7 +110,6 @@ func (h *ConfigHandler) Handle(configData string) {
 	instancesCopy := h.snapshotInstances()
 	h.pruneTrackingMaps(instancesCopy)
 	if len(instancesCopy) == 0 {
-		h.lastConfigDigest = configDigest
 		logger.Debug().
 			Str("configDigest", configDigest).
 			Msg("No deployed instances, skipping config push")
@@ -103,7 +118,7 @@ func (h *ConfigHandler) Handle(configData string) {
 	instancesToUpdate := make(map[string]*caddy.Instance)
 	for nodeName, instance := range instancesCopy {
 		if h.instanceDigests[nodeName] != configDigest ||
-			h.instanceSignatures[nodeName] != instanceStateSignature(instance) {
+			h.instanceSignatures[nodeName] != instance.StateKey() {
 			instancesToUpdate[nodeName] = instance
 		}
 	}
@@ -111,10 +126,8 @@ func (h *ConfigHandler) Handle(configData string) {
 		logger.Info().
 			Str("configDigest", configDigest).
 			Msg("All instances already at desired digest, skipping update")
-		h.lastConfigDigest = configDigest
 		return
 	}
-	time.Sleep(configUpdateDelay)
 	updateResult := h.updateAllInstances(
 		instancesToUpdate,
 		configData,
@@ -128,9 +141,6 @@ func (h *ConfigHandler) Handle(configData string) {
 		configDigest,
 		logger,
 	)
-	if h.allCurrentInstancesConverged(configDigest) {
-		h.lastConfigDigest = configDigest
-	}
 }
 
 func (h *ConfigHandler) snapshotInstances() map[string]*caddy.Instance {
@@ -155,10 +165,12 @@ func (h *ConfigHandler) pruneTrackingMaps(instancesCopy map[string]*caddy.Instan
 }
 
 func (h *ConfigHandler) adminAPIConfig() *caddy.AdminAPIConfig {
-	if h.caddyAdminOriginKey == "" {
-		return nil
+	cfg := &caddy.AdminAPIConfig{OriginKey: h.caddyAdminOriginKey}
+	if h.adminClients != nil {
+		cfg.ReadinessClient = h.adminClients.Readiness
+		cfg.ConfigPushClient = h.adminClients.ConfigPush
 	}
-	return &caddy.AdminAPIConfig{OriginKey: h.caddyAdminOriginKey}
+	return cfg
 }
 
 func (h *ConfigHandler) updateAllInstances(
@@ -211,6 +223,7 @@ func (h *ConfigHandler) updateSingleInstance(
 	instanceLogger := logger.With().Str("node", nodeName).Logger()
 	instanceLogger.Debug().Msg("Updating Caddy configuration")
 	err := h.updateInstanceWithRetry(
+		h.ctx(),
 		instance,
 		effectiveConfig,
 		apiConfig,
@@ -223,6 +236,7 @@ func (h *ConfigHandler) updateSingleInstance(
 }
 
 func (h *ConfigHandler) updateInstanceWithRetry(
+	ctx context.Context,
 	instance *caddy.Instance,
 	effectiveConfig string,
 	apiConfig *caddy.AdminAPIConfig,
@@ -231,13 +245,19 @@ func (h *ConfigHandler) updateInstanceWithRetry(
 	var err error
 	for retry := range configUpdateRetryCount {
 		if retry > 0 {
+			backoff := time.Duration(retry)*configUpdateRetryBase + retryJitter()
 			instanceLogger.Info().
 				Int("retry", retry).
+				Dur("backoff", backoff).
 				Msg("Retrying configuration update")
-			time.Sleep(time.Duration(retry*configUpdateRetryFactor) * time.Second)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
 		}
 		err = instance.UpdateConfig(
-			context.Background(),
+			ctx,
 			effectiveConfig,
 			h.communicationMethod,
 			apiConfig,
@@ -258,19 +278,12 @@ func (h *ConfigHandler) handleInstanceUpdateFailure(
 	instanceLogger.Error().
 		Err(updateErr).
 		Msg("Failed to update Caddy configuration")
-	h.mu.RLock()
-	current := h.deployedInstances[nodeName] == instance
-	var newCount int32
-	if current {
-		newCount = instance.FailureCount.Add(1)
-	}
-	h.mu.RUnlock()
-	if !current {
+	if !h.isCurrentInstance(nodeName, instance) {
 		instanceLogger.Debug().
 			Msg("Instance replaced during update, skipping failure tracking")
 		return failedInstance{}, "", false
 	}
-	if newCount < maxInstanceFailureCount {
+	if instance.FailureCount.Add(1) < maxInstanceFailureCount {
 		return failedInstance{}, "", false
 	}
 	instanceLogger.Warn().
@@ -287,18 +300,22 @@ func (h *ConfigHandler) handleInstanceUpdateSuccess(
 	instanceLogger zerolog.Logger,
 ) (failedInstance, string, bool) {
 	instanceLogger.Info().Msg("Successfully updated Caddy configuration")
-	h.mu.RLock()
-	current := h.deployedInstances[nodeName] == instance
-	if current {
-		instance.FailureCount.Store(0)
-	}
-	h.mu.RUnlock()
-	if !current {
+	if !h.isCurrentInstance(nodeName, instance) {
 		instanceLogger.Debug().
 			Msg("Instance replaced during update, skipping failure reset")
 		return failedInstance{}, "", false
 	}
+	instance.FailureCount.Store(0)
 	return failedInstance{}, nodeName, false
+}
+
+func (h *ConfigHandler) isCurrentInstance(
+	nodeName string,
+	instance *caddy.Instance,
+) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.deployedInstances[nodeName] == instance
 }
 
 func (h *ConfigHandler) applySuccessfulUpdates(
@@ -309,7 +326,7 @@ func (h *ConfigHandler) applySuccessfulUpdates(
 	for _, nodeName := range successfulNodes {
 		h.instanceDigests[nodeName] = configDigest
 		if instance, exists := instancesCopy[nodeName]; exists {
-			h.instanceSignatures[nodeName] = instanceStateSignature(instance)
+			h.instanceSignatures[nodeName] = instance.StateKey()
 		}
 	}
 }
@@ -346,7 +363,7 @@ func (h *ConfigHandler) redeployFailedInstance(
 	if !shouldRedeploy {
 		return
 	}
-	if deleteErr := failed.instance.Delete(context.Background()); deleteErr != nil {
+	if deleteErr := failed.instance.Delete(h.ctx()); deleteErr != nil {
 		logger.Error().
 			Err(deleteErr).
 			Str("node", failed.nodeName).
@@ -369,7 +386,7 @@ func (h *ConfigHandler) redeployFailedInstance(
 		logger.Debug().
 			Str("node", failed.nodeName).
 			Msg("Failed instance was replaced during redeployment; cleaning up stale redeploy")
-		if cleanupErr := newInstance.Delete(context.Background()); cleanupErr != nil {
+		if cleanupErr := newInstance.Delete(h.ctx()); cleanupErr != nil {
 			logger.Warn().
 				Err(cleanupErr).
 				Str("node", failed.nodeName).
@@ -383,7 +400,7 @@ func (h *ConfigHandler) redeployFailedInstance(
 		pushTimeout = defaultRedeployConfigPushTimeout
 	}
 	pushCtx, pushCancel := context.WithTimeout(
-		context.Background(), pushTimeout,
+		h.ctx(), pushTimeout,
 	)
 	defer pushCancel()
 	if pushErr := newInstance.UpdateConfig(
@@ -400,7 +417,7 @@ func (h *ConfigHandler) redeployFailedInstance(
 		return
 	}
 	h.instanceDigests[failed.nodeName] = configDigest
-	h.instanceSignatures[failed.nodeName] = instanceStateSignature(newInstance)
+	h.instanceSignatures[failed.nodeName] = newInstance.StateKey()
 	logger.Info().
 		Str("node", failed.nodeName).
 		Msg("Successfully redeployed Caddy instance")
@@ -460,7 +477,7 @@ func (h *ConfigHandler) deployReplacementInstance(
 		deployFn = caddy.DeployCaddy
 	}
 	return deployFn(
-		context.Background(),
+		h.ctx(),
 		h.deployOpts,
 		nodeName,
 		h.externalEndpoints[nodeName],
@@ -480,25 +497,16 @@ func (h *ConfigHandler) registerReplacementInstance(
 	return true
 }
 
-func (h *ConfigHandler) allCurrentInstancesConverged(configDigest string) bool {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	for nodeName, instance := range h.deployedInstances {
-		if h.instanceDigests[nodeName] != configDigest {
-			return false
-		}
-		if h.instanceSignatures[nodeName] != instanceStateSignature(instance) {
-			return false
-		}
-	}
-	return true
-}
-
-func instanceStateSignature(instance *caddy.Instance) string {
-	return instance.StateKey()
-}
-
 func calculateConfigDigest(configData string) string {
 	sum := sha256.Sum256([]byte(configData))
 	return hex.EncodeToString(sum[:])
+}
+
+func retryJitter() time.Duration {
+	bound := big.NewInt(int64(configUpdateRetryJitter))
+	n, err := cryptorand.Int(cryptorand.Reader, bound)
+	if err != nil {
+		return 0
+	}
+	return time.Duration(n.Int64())
 }

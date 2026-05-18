@@ -34,6 +34,7 @@ type NodeHandler struct {
 	inProgressNodes    map[string]struct{}
 	inProgressNodesMu  sync.Mutex
 	removedNodes       map[string]struct{}
+	lifetimeCtx        context.Context
 	deployFn           func(
 		ctx context.Context,
 		opts caddy.DeployOptions,
@@ -71,6 +72,7 @@ func (h *NodeHandler) SetNodeChangeNotifier(notifier func()) {
 }
 
 func (h *NodeHandler) StartWorkerPool(ctx context.Context, workerCount int) {
+	h.lifetimeCtx = ctx
 	h.jobCh = make(chan deploymentJob, deploymentQueueSize)
 	for range workerCount {
 		go func() {
@@ -179,7 +181,7 @@ func (h *NodeHandler) handleNodeRemoved(nodeName string) {
 		return
 	}
 	logger.Info().Msg("Node removed, cleaning up Caddy instance")
-	if err := instance.Delete(context.Background()); err != nil {
+	if err := instance.Delete(h.ctx()); err != nil {
 		logger.Error().Err(err).Msg("Failed to delete Caddy instance")
 		restoreInstanceIfMissing(h.mu, h.deployedInstances, nodeName, instance)
 		return
@@ -227,7 +229,7 @@ func (h *NodeHandler) CleanupRemovedNode(
 			Msg("No instance to clean up after redeploy/removal race")
 		return
 	}
-	if err := instance.Delete(context.Background()); err != nil {
+	if err := instance.Delete(h.ctx()); err != nil {
 		logger.Error().
 			Err(err).
 			Msg("Failed to delete orphaned Caddy instance after redeploy/removal race")
@@ -297,7 +299,7 @@ func (h *NodeHandler) handleNodeAddDeployError(
 	}
 	logger.Info().
 		Msg("Node was removed while deployment failed, cleaning up previous instance")
-	if err := previousInstance.Delete(context.Background()); err != nil {
+	if err := previousInstance.Delete(h.ctx()); err != nil {
 		logger.Error().
 			Err(err).
 			Msg("Failed to delete previous Caddy instance after removal")
@@ -320,7 +322,7 @@ func (h *NodeHandler) handleRemovedNodeAfterDeployResult(
 	if cleanupInstance == nil {
 		return
 	}
-	if err := cleanupInstance.Delete(context.Background()); err != nil {
+	if err := cleanupInstance.Delete(h.ctx()); err != nil {
 		logger.Error().Err(err).Msg("Failed to delete Caddy instance after removal")
 		restoreInstanceIfMissing(h.mu, h.deployedInstances, nodeName, previousInstance)
 		return
@@ -352,6 +354,19 @@ func (h *NodeHandler) notifyNodeChange() {
 	}
 }
 
+func (h *NodeHandler) ctx() context.Context {
+	if h.lifetimeCtx == nil {
+		return context.Background()
+	}
+	return h.lifetimeCtx
+}
+
 func instancesEquivalent(a, b *caddy.Instance) bool {
+	if a == b {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
 	return a.StateKey() == b.StateKey()
 }

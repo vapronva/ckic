@@ -12,6 +12,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
@@ -25,13 +26,14 @@ import (
 )
 
 type ControllerConfig struct {
-	Kubeconfig                   string
 	NodeLabel                    string
 	ConfigMapName                string
 	ConfigMapNamespace           string
 	BootstrapDefaultConfig       bool
 	CommunicationMethod          caddy.CommunicationMethod
 	CaddyImage                   string
+	ImagePullPolicy              string
+	PrePullImage                 bool
 	EnableLoadBalancer           bool
 	EnvSecretName                string
 	EnvSecretKeys                []string
@@ -67,12 +69,21 @@ type Controller struct {
 	aggregator               *aggregator.NamespaceAggregator
 	lastPersistedStateHashMu sync.Mutex
 	lastPersistedStateHash   [sha256.Size]byte
+	deployFn                 deployFunc
 }
+
+type deployFunc func(
+	ctx context.Context,
+	opts caddy.DeployOptions,
+	nodeName string,
+	externalIPs []string,
+) (*caddy.Instance, error)
 
 const (
 	nodeHandlerWorkerCount           = 4
 	configReconciliationInterval     = 5 * time.Minute
 	periodicStatePersistenceInterval = 2 * time.Minute
+	shutdownStatePersistTimeout      = 15 * time.Second
 )
 
 var errConfigMapMissingCaddyfile = errors.New("configmap missing Caddyfile key")
@@ -92,6 +103,8 @@ func NewController(
 		Clientset:          clientset,
 		Namespace:          config.ConfigMapNamespace,
 		CaddyImage:         config.CaddyImage,
+		ImagePullPolicy:    corev1.PullPolicy(config.ImagePullPolicy),
+		PrePullImage:       config.PrePullImage,
 		EnableLoadBalancer: config.EnableLoadBalancer,
 		EnvSecretName:      config.EnvSecretName,
 		EnvSecretKeys:      config.EnvSecretKeys,
@@ -156,8 +169,9 @@ func NewController(
 		instancesMutex:    mutex,
 		stateStore:        stateStore,
 		coordinator:       coordinator,
+		aggregator:        watchers.agg,
+		deployFn:          caddy.DeployCaddy,
 	}
-	ctrl.aggregator = watchers.agg
 	return ctrl, nil
 }
 
@@ -226,6 +240,10 @@ func buildWatcherBundle(
 }
 
 func (c *Controller) Run(ctx context.Context) error {
+	c.configHandler.Attach(ctx)
+	if c.aggregator != nil {
+		c.aggregator.Attach(ctx)
+	}
 	if err := c.ReconcileState(ctx); err != nil {
 		log.Error().Err(err).Msg("Reconciliation failed")
 		return err
@@ -549,8 +567,12 @@ func (c *Controller) reconcileDiscoveredDeployments(
 	discovered map[string]*caddy.Instance,
 ) {
 	logger := log.With().Str("component", "reconcile").Logger()
+	deployFn := c.deployFn
+	if deployFn == nil {
+		deployFn = caddy.DeployCaddy
+	}
 	for nodeName, adopted := range discovered {
-		reconciled, err := caddy.DeployCaddy(
+		reconciled, err := deployFn(
 			ctx,
 			c.deployOpts,
 			nodeName,
@@ -645,7 +667,12 @@ func (c *Controller) runPeriodicStatePersistence(ctx context.Context) {
 func (c *Controller) persistStateOnShutdown() {
 	logger := log.With().Str("component", "state_persistence").Logger()
 	logger.Info().Msg("Persisting state before shutdown")
-	if err := c.snapshotAndPersistState(context.Background()); err != nil {
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		shutdownStatePersistTimeout,
+	)
+	defer cancel()
+	if err := c.snapshotAndPersistState(ctx); err != nil {
 		logger.Error().Err(err).Msg("Failed to persist state during shutdown")
 	} else {
 		logger.Info().Msg("State persisted successfully before shutdown")
@@ -671,9 +698,10 @@ func (c *Controller) snapshotAndPersistState(ctx context.Context) error {
 	if hash == c.lastPersistedStateHash {
 		return nil
 	}
-	if _, saveErr := c.stateStore.SaveState(ctx, instancesCopy); saveErr != nil {
+	persistedData, saveErr := c.stateStore.SaveState(ctx, instancesCopy)
+	if saveErr != nil {
 		return saveErr
 	}
-	c.lastPersistedStateHash = hash
+	c.lastPersistedStateHash = sha256.Sum256(persistedData)
 	return nil
 }

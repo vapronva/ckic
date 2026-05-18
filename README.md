@@ -8,7 +8,7 @@ flowchart LR
     LeaderElection["Leader election"] --> |"Only leader runs controller"| Controller
     LeaderElection --> |"Acquire/Renew <code>Lease</code>"| K8sAPI
     CLIFlags["CLI flags"] --> |"Parse"| Controller
-    CLIFlags --> |"<code>leader-elect</code> & <code>leader-election-*</code> & <code>readiness-require-leader</code>"| LeaderElection
+    CLIFlags --> |"<code>leader-elect</code> & <code>leader-election-*</code>"| LeaderElection
     CLIFlags --> |"<code>health-bind-address</code>"| ProbeServer
     CLIFlags --> |"<code>node-label</code>"| NodeWatcher
     CLIFlags --> |"<code>config-map</code> & <code>config-namespace</code> & <code>bootstrap-default-config</code>"| ConfigWatcher

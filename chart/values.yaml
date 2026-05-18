@@ -10,7 +10,7 @@ updateStrategy:
 image:
   repository: docker.horse
   image: vapronva/ckic/manager
-  tag: 0.28.0
+  tag: 0.29.0
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -25,17 +25,33 @@ serviceAccount:
 
 podAnnotations: {}
 
-podSecurityContext: {}
+podSecurityContext:
+  seccompProfile:
+    type: RuntimeDefault
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
 
 securityContext:
   readOnlyRootFilesystem: true
   runAsNonRoot: true
   runAsUser: 1000
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  seccompProfile:
+    type: RuntimeDefault
 
 resources:
   requests:
     cpu: 50m
-    memory: 15Mi
+    memory: 32Mi
+  limits:
+    memory: 96Mi
+
+terminationGracePeriodSeconds: 60
 
 nodeSelector: {}
 tolerations: []
@@ -43,7 +59,6 @@ affinity: {}
 
 leaderElection:
   enabled: true
-  readinessRequireLeader: false
   leaseName: ckic-manager-leader
   leaseNamespace: ""
   leaseDuration: 15s
@@ -67,7 +82,9 @@ config:
   bootstrapDefaultConfig: false
   communicationMethod: clusterip
   logLevel: info
-  caddyImage: docker.horse/oss-images/zerossl-caddy/caddy:2.11.2-alpine
+  caddyImage: docker.horse/oss-images/zerossl-caddy/caddy:2.11.3-alpine
+  imagePullPolicy: IfNotPresent
+  prePullImage: true
   enableLoadBalancer: true
   useHostNetwork: false
   httpHostPort: 80

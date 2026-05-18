@@ -14,6 +14,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	"git.horse/vapronva/ckic/pkg/constants"
+	"git.horse/vapronva/ckic/pkg/utils"
 )
 
 type ConfigHandlerFunc func(string)
@@ -25,12 +26,12 @@ type ConfigWatcher struct {
 	configMapName       string
 	configHandler       ConfigHandlerFunc
 	forceSyncHandler    func()
-	lastResourceVersion string
 	nodeAvailableCheck  func() bool
 	isPaused            bool
 	cachedConfig        string
 	hasCachedConfig     bool
 	lastProcessedConfig string
+	configSeq           uint64
 	failureCount        int
 	maxFailures         int
 	resetTimeout        time.Duration
@@ -77,6 +78,7 @@ func (w *ConfigWatcher) Pause() {
 func (w *ConfigWatcher) recordSuccessAndDispatch(configData string) {
 	w.mu.Lock()
 	w.lastProcessedConfig = configData
+	w.configSeq++
 	w.lastSuccess = time.Now()
 	w.failureCount = 0
 	w.mu.Unlock()
@@ -103,6 +105,7 @@ func (w *ConfigWatcher) EnsureSync() {
 		w.hasCachedConfig = false
 	}
 	lastProcessed := w.lastProcessedConfig
+	startSeq := w.configSeq
 	forceSyncHandler := w.forceSyncHandler
 	configHandler := w.configHandler
 	nodeAvailableCheck := w.nodeAvailableCheck
@@ -110,6 +113,7 @@ func (w *ConfigWatcher) EnsureSync() {
 	if shouldProcessCached && cachedConfig != "" && configHandler != nil {
 		w.mu.Lock()
 		w.lastProcessedConfig = cachedConfig
+		w.configSeq++
 		w.lastSuccess = time.Now()
 		w.failureCount = 0
 		w.mu.Unlock()
@@ -132,6 +136,12 @@ func (w *ConfigWatcher) EnsureSync() {
 	if shouldProcessCached || lastProcessed == "" || configHandler == nil {
 		return
 	}
+	w.mu.Lock()
+	if w.configSeq != startSeq {
+		w.mu.Unlock()
+		return
+	}
+	w.mu.Unlock()
 	configHandler(lastProcessed)
 	w.mu.Lock()
 	w.lastSuccess = time.Now()
@@ -139,7 +149,7 @@ func (w *ConfigWatcher) EnsureSync() {
 	w.mu.Unlock()
 }
 
-func (w *ConfigWatcher) refreshResourceVersion(
+func (w *ConfigWatcher) reloadConfig(
 	ctx context.Context,
 	logger zerolog.Logger,
 ) error {
@@ -149,10 +159,7 @@ func (w *ConfigWatcher) refreshResourceVersion(
 	if err != nil {
 		return err
 	}
-	w.lastResourceVersion = cm.ResourceVersion
-	logger.Info().
-		Str("resourceVersion", w.lastResourceVersion).
-		Msg("Resource version refreshed")
+	logger.Info().Msg("Reloaded ConfigMap after circuit-breaker cooldown")
 	if configData, exists := cm.Data[constants.CaddyfileKey]; exists {
 		w.mu.RLock()
 		lastProcessed := w.lastProcessedConfig
@@ -193,7 +200,9 @@ func (w *ConfigWatcher) Start(ctx context.Context) {
 		}
 		if w.isWatcherPaused() {
 			logger.Debug().Msg("Config watcher is paused; sleeping until resumed")
-			time.Sleep(configPauseSleep)
+			if !utils.SleepCtx(ctx, configPauseSleep) {
+				return
+			}
 			continue
 		}
 		nextDelay, keepRunning := w.runConfigWatchCycle(
@@ -262,7 +271,9 @@ func (w *ConfigWatcher) runConfigWatchCycle(
 		return delay, false
 	}
 	logger.Info().Msg("ConfigMap watch channel closed, restarting")
-	time.Sleep(delay)
+	if !utils.SleepCtx(ctx, delay) {
+		return delay, false
+	}
 	return min(time.Duration(float64(delay)*multiplier), maxDelay), true
 }
 
@@ -287,18 +298,22 @@ func (w *ConfigWatcher) handleWatchCreateFailure(
 		sleepTime := w.resetTimeout - time.Since(lastSuccess)
 		if sleepTime > 0 {
 			logger.Warn().Msgf("Circuit breaker open, sleeping for %v", sleepTime)
-			time.Sleep(sleepTime)
+			if !utils.SleepCtx(ctx, sleepTime) {
+				return delay
+			}
 		}
 		w.mu.Lock()
 		w.failureCount = 0
 		w.lastSuccess = time.Now()
 		w.mu.Unlock()
-		if errRV := w.refreshResourceVersion(ctx, logger); errRV != nil {
-			logger.Error().Err(errRV).Msg("Failed to refresh resource version")
+		if reloadErr := w.reloadConfig(ctx, logger); reloadErr != nil {
+			logger.Error().Err(reloadErr).Msg("Failed to reload ConfigMap")
 		}
 		return delay
 	}
-	time.Sleep(delay)
+	if !utils.SleepCtx(ctx, delay) {
+		return delay
+	}
 	return min(time.Duration(float64(delay)*multiplier), maxDelay)
 }
 
@@ -453,6 +468,7 @@ func (w *ConfigWatcher) applyInitialConfig(
 	if w.nodeAvailableCheck() {
 		w.mu.Lock()
 		w.lastProcessedConfig = configData
+		w.configSeq++
 		w.mu.Unlock()
 		w.configHandler(configData)
 		return

@@ -17,6 +17,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	"git.horse/vapronva/ckic/pkg/constants"
+	"git.horse/vapronva/ckic/pkg/utils"
 )
 
 type ExternalConfigUpdateFunc func(namespace, fragment string)
@@ -166,7 +167,9 @@ func (w *ExternalConfigWatcher) runWatchCycle(
 		return delay, false
 	}
 	logger.Info().Msg("External ConfigMap watch channel closed, restarting")
-	time.Sleep(delay)
+	if !utils.SleepCtx(ctx, delay) {
+		return delay, false
+	}
 	return min(time.Duration(float64(delay)*multiplier), maxDelay), true
 }
 
@@ -314,13 +317,13 @@ func (w *ExternalConfigWatcher) handleWatchCreateError(
 	logger.Error().Err(err).Msg("Failed to create external ConfigMap watcher, retrying")
 	w.failureCount++
 	if w.failureCount < w.maxFailures {
-		time.Sleep(delay)
+		_ = utils.SleepCtx(ctx, delay)
 		return min(time.Duration(float64(delay)*multiplier), maxDelay)
 	}
 	sleepTime := w.resetTimeout - time.Since(w.lastSuccess)
 	if sleepTime > 0 {
 		logger.Warn().Msgf("Circuit breaker open, sleeping for %v", sleepTime)
-		time.Sleep(sleepTime)
+		_ = utils.SleepCtx(ctx, sleepTime)
 	}
 	w.failureCount = 0
 	return delay

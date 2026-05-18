@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
@@ -29,6 +30,9 @@ func getKubernetesConfig(kubeconfig string) (*rest.Config, error) {
 		config, err := rest.InClusterConfig()
 		if err == nil {
 			return config, nil
+		}
+		if !errors.Is(err, rest.ErrNotInCluster) {
+			return nil, fmt.Errorf("in-cluster config failed: %w", err)
 		}
 	}
 	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(

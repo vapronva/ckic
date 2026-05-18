@@ -15,6 +15,8 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
+
+	"git.horse/vapronva/ckic/pkg/utils"
 )
 
 type NodeEventType int
@@ -125,7 +127,9 @@ func (w *NodeWatcher) Start(ctx context.Context) {
 		}
 		if err := w.syncCurrentNodes(ctx); err != nil {
 			logger.Error().Err(err).Msg("Failed to list nodes")
-			time.Sleep(nodeListRetryDelay)
+			if !utils.SleepCtx(ctx, nodeListRetryDelay) {
+				return
+			}
 			continue
 		}
 		watcher, err := w.clientset.CoreV1().Nodes().Watch(ctx, metav1.ListOptions{
@@ -134,14 +138,18 @@ func (w *NodeWatcher) Start(ctx context.Context) {
 		})
 		if err != nil {
 			logger.Error().Err(err).Msg("Failed to create node watcher")
-			time.Sleep(nodeListRetryDelay)
+			if !utils.SleepCtx(ctx, nodeListRetryDelay) {
+				return
+			}
 			continue
 		}
 		if !w.consumeWatchEvents(ctx, watcher, logger) {
 			return
 		}
 		logger.Info().Msg("Node watcher channel closed, restarting")
-		time.Sleep(nodeWatchRetryDelay)
+		if !utils.SleepCtx(ctx, nodeWatchRetryDelay) {
+			return
+		}
 	}
 }
 
@@ -166,13 +174,13 @@ func (w *NodeWatcher) syncCurrentNodes(ctx context.Context) error {
 func (w *NodeWatcher) replaceCurrentNodes(
 	newNodes map[string]struct{},
 ) ([]string, []string) {
-	var addedNodes []string
-	var removedNodes []string
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.currentNodes == nil {
 		w.currentNodes = make(map[string]struct{})
 	}
+	addedNodes := make([]string, 0, len(newNodes))
+	removedNodes := make([]string, 0, len(w.currentNodes))
 	for nodeName := range newNodes {
 		if _, tracked := w.currentNodes[nodeName]; !tracked {
 			addedNodes = append(addedNodes, nodeName)

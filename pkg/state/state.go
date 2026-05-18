@@ -109,7 +109,8 @@ func (s *ConfigMapStateStore) LoadState(
 ) (map[string]*caddy.Instance, error) {
 	stateMap := make(map[string]*caddy.Instance)
 	cm, err := s.client.CoreV1().ConfigMaps(s.namespace).Get(
-		ctx, s.name, metav1.GetOptions{})
+		ctx, s.name, metav1.GetOptions{},
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get state ConfigMap: %w", err)
 	}

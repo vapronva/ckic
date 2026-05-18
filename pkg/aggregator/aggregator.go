@@ -35,6 +35,7 @@ type NamespaceAggregator struct {
 	configUpdateHandler     func(string)
 	nodeAvailabilityCheck   func() bool
 	initializing            bool
+	lifetimeCtx             context.Context
 }
 
 const mirrorPublishTimeout = 30 * time.Second
@@ -64,7 +65,19 @@ func NewNamespaceAggregator(
 		configUpdateHandler:     configUpdateHandler,
 		nodeAvailabilityCheck:   nodeAvailabilityCheck,
 		initializing:            true,
+		lifetimeCtx:             context.Background(),
 	}
+}
+
+func (a *NamespaceAggregator) Attach(ctx context.Context) {
+	a.lifetimeCtx = ctx
+}
+
+func (a *NamespaceAggregator) ctx() context.Context {
+	if a.lifetimeCtx == nil {
+		return context.Background()
+	}
+	return a.lifetimeCtx
 }
 
 type dispatchOpts struct {
@@ -232,13 +245,14 @@ func (a *NamespaceAggregator) pushSnapshotToNodes(
 	operation string,
 ) {
 	a.nodePushMu.Lock()
-	defer a.nodePushMu.Unlock()
 	if a.isStaleNodePush(snapshot.version) {
+		a.nodePushMu.Unlock()
 		logger.Debug().Msgf("Skipping stale node push for %s", operation)
 		return
 	}
-	a.configUpdateHandler(snapshot.merged)
 	a.recordNodePush(snapshot.version)
+	a.nodePushMu.Unlock()
+	a.configUpdateHandler(snapshot.merged)
 }
 
 func (a *NamespaceAggregator) isStaleMirrorPublish(version uint64) bool {
@@ -308,21 +322,18 @@ func (a *NamespaceAggregator) EnsureNodeSync() {
 		return
 	}
 	a.nodePushMu.Lock()
-	defer a.nodePushMu.Unlock()
 	a.mu.RLock()
 	version := a.stateVersion
 	merged := a.currentMergedLocked()
 	handler := a.configUpdateHandler
 	a.mu.RUnlock()
 	if handler == nil {
+		a.nodePushMu.Unlock()
 		return
 	}
+	a.recordNodePush(version)
+	a.nodePushMu.Unlock()
 	handler(merged)
-	a.mu.Lock()
-	if version > a.lastPushedVersion {
-		a.lastPushedVersion = version
-	}
-	a.mu.Unlock()
 	logger.Info().Msg("Forced sync pushed current merged config to nodes")
 }
 
@@ -331,7 +342,7 @@ func (a *NamespaceAggregator) publishMirrorConfigMap(mergedConfig string) error 
 		Str("component", "aggregator").
 		Str("configmap", a.aggregatedConfigMapName).
 		Logger()
-	ctx, cancel := context.WithTimeout(context.Background(), mirrorPublishTimeout)
+	ctx, cancel := context.WithTimeout(a.ctx(), mirrorPublishTimeout)
 	defer cancel()
 	cm, err := a.clientset.CoreV1().
 		ConfigMaps(a.namespace).
@@ -344,10 +355,7 @@ func (a *NamespaceAggregator) publishMirrorConfigMap(mergedConfig string) error 
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      a.aggregatedConfigMapName,
 				Namespace: a.namespace,
-				Labels: map[string]string{
-					"ckic.cmld.ru/managed": "true",
-					"ckic.cmld.ru/type":    "aggregated-config",
-				},
+				Labels:    constants.AggregatedConfigLabels(),
 			},
 			Data: map[string]string{
 				constants.CaddyfileKey: mergedConfig,

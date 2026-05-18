@@ -3,8 +3,6 @@ package controller
 import (
 	"sync"
 
-	"github.com/rs/zerolog/log"
-
 	"git.horse/vapronva/ckic/pkg/caddy"
 )
 
@@ -40,8 +38,7 @@ func (wc *WatcherCoordinator) NotifyNodeChange() {
 	wc.mu.RUnlock()
 	if hasNodes {
 		wc.configWatcher.EnsureSync()
-	} else {
-		wc.configWatcher.Pause()
+		return
 	}
-	log.Info().Msg("WatcherCoordinator notified node change")
+	wc.configWatcher.Pause()
 }

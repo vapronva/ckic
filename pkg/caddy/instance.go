@@ -77,27 +77,33 @@ func (i *Instance) Delete(ctx context.Context) error {
 		Str("deployment", i.DeploymentName).
 		Logger()
 	if err := i.KubeClient.CoreV1().Services(i.Namespace).Delete(
-		ctx, i.ServiceName, metav1.DeleteOptions{}); err != nil {
-		logger.Warn().Err(err).Msg("Failed to delete ClusterIP Caddy service")
+		ctx, i.ServiceName, metav1.DeleteOptions{},
+	); err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.Debug().Msg("ClusterIP Caddy service already deleted or never created")
+		} else {
+			logger.Warn().Err(err).Msg("Failed to delete ClusterIP Caddy service")
+		}
 	} else {
 		logger.Info().Msg("Deleted ClusterIP Caddy service")
 	}
 	if err := i.KubeClient.CoreV1().Services(i.Namespace).Delete(
-		ctx, i.LoadBalancerServiceName(), metav1.DeleteOptions{}); err != nil {
-		logger.Warn().
-			Err(err).
-			Msg("Failed to delete LoadBalancer Caddy service (if exists)")
+		ctx, i.LoadBalancerServiceName(), metav1.DeleteOptions{},
+	); err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.Debug().
+				Msg("LoadBalancer Caddy service already deleted or never created")
+		} else {
+			logger.Warn().
+				Err(err).
+				Msg("Failed to delete LoadBalancer Caddy service")
+		}
 	} else {
 		logger.Info().Msg("Deleted LoadBalancer Caddy service")
 	}
-	if err := i.KubeClient.PolicyV1().PodDisruptionBudgets(i.Namespace).Delete(
-		ctx, i.DeploymentName, metav1.DeleteOptions{}); err != nil {
-		logger.Warn().Err(err).Msg("Failed to delete PodDisruptionBudget")
-	} else {
-		logger.Info().Msg("Deleted PodDisruptionBudget")
-	}
 	if err := i.KubeClient.AppsV1().Deployments(i.Namespace).Delete(
-		ctx, i.DeploymentName, metav1.DeleteOptions{}); err != nil {
+		ctx, i.DeploymentName, metav1.DeleteOptions{},
+	); err != nil {
 		if apierrors.IsNotFound(err) {
 			logger.Debug().Msg("Caddy deployment already deleted")
 			return nil

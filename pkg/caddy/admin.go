@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -42,23 +43,53 @@ func (m CommunicationMethod) String() string {
 }
 
 type AdminAPIConfig struct {
-	OriginKey string
+	OriginKey        string
+	ReadinessClient  *http.Client
+	ConfigPushClient *http.Client
+}
+
+type AdminClients struct {
+	Readiness  *http.Client
+	ConfigPush *http.Client
+}
+
+func NewAdminClients() *AdminClients {
+	transport := newAdminTransport()
+	return &AdminClients{
+		Readiness: &http.Client{
+			Timeout:   readinessRequestTimeout,
+			Transport: transport,
+		},
+		ConfigPush: &http.Client{
+			Timeout:   configPushTimeout,
+			Transport: transport,
+		},
+	}
 }
 
 const (
-	readinessRequestTimeout = 10 * time.Second
-	configPushTimeout       = 30 * time.Second
-	caddyAPIInitialDelay    = 5 * time.Second
-	caddyAPIMaxDelay        = 600 * time.Second
-	caddyAPIReadyTimeout    = 5 * time.Minute
+	readinessRequestTimeout     = 10 * time.Second
+	configPushTimeout           = 30 * time.Second
+	caddyAPIInitialDelay        = 5 * time.Second
+	caddyAPIMaxDelay            = 600 * time.Second
+	caddyAPIReadyTimeout        = 5 * time.Minute
+	adminClientIdleConnsPerHost = 4
+	adminClientIdleTimeout      = 60 * time.Second
+	errorBodyLogMax             = 1024
 )
 
-func newReadinessHTTPClient() *http.Client {
-	return &http.Client{Timeout: readinessRequestTimeout}
-}
-
-func newConfigPushHTTPClient() *http.Client {
-	return &http.Client{Timeout: configPushTimeout}
+func newAdminTransport() *http.Transport {
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return &http.Transport{
+			MaxIdleConnsPerHost: adminClientIdleConnsPerHost,
+			IdleConnTimeout:     adminClientIdleTimeout,
+		}
+	}
+	t := base.Clone()
+	t.MaxIdleConnsPerHost = adminClientIdleConnsPerHost
+	t.IdleConnTimeout = adminClientIdleTimeout
+	return t
 }
 
 func waitForCaddyAPIReady(
@@ -66,21 +97,37 @@ func waitForCaddyAPIReady(
 	adminURL string,
 	apiConfig *AdminAPIConfig,
 	client *http.Client,
+	initialDelay time.Duration,
 ) error {
-	initialDelay := caddyAPIInitialDelay
-	maxDelay := caddyAPIMaxDelay
+	const multiplier = 1.5
 	delay := initialDelay
-	multiplier := 1.5
 	readyURL := readinessURL(adminURL)
-	client = readinessClient(client)
+	first := true
 	for {
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf(
-				"context deadline exceeded while waiting for Caddy API: %w",
-				ctx.Err(),
-			)
-		case <-time.After(delay):
+		if first {
+			first = false
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf(
+					"context deadline exceeded while waiting for Caddy API: %w",
+					ctx.Err(),
+				)
+			default:
+			}
+		} else {
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return fmt.Errorf(
+					"context deadline exceeded while waiting for Caddy API: %w",
+					ctx.Err(),
+				)
+			case <-timer.C:
+			}
+			delay = min(time.Duration(float64(delay)*multiplier), caddyAPIMaxDelay)
 		}
 		ready, err := readinessProbe(ctx, client, readyURL, apiConfig, adminURL)
 		if err != nil {
@@ -98,7 +145,6 @@ func waitForCaddyAPIReady(
 				Str("readyURL", readyURL).
 				Msgf("Caddy Admin API not ready, retrying in %v", delay)
 		}
-		delay = min(time.Duration(float64(delay)*multiplier), maxDelay)
 	}
 }
 
@@ -107,13 +153,6 @@ func readinessURL(adminURL string) string {
 		return before + "/config/"
 	}
 	return adminURL
-}
-
-func readinessClient(client *http.Client) *http.Client {
-	if client != nil {
-		return client
-	}
-	return newReadinessHTTPClient()
 }
 
 func readinessProbe(
@@ -140,6 +179,20 @@ func readinessProbe(
 
 func adminOrigin(originKey string) string {
 	return fmt.Sprintf("http://%s.caddy-admin-api.ckic.cmld.ru", originKey)
+}
+
+func adminReadinessClient(cfg *AdminAPIConfig) *http.Client {
+	if cfg != nil && cfg.ReadinessClient != nil {
+		return cfg.ReadinessClient
+	}
+	return &http.Client{Timeout: readinessRequestTimeout}
+}
+
+func adminConfigPushClient(cfg *AdminAPIConfig) *http.Client {
+	if cfg != nil && cfg.ConfigPushClient != nil {
+		return cfg.ConfigPushClient
+	}
+	return &http.Client{Timeout: configPushTimeout}
 }
 
 func drainAndCloseReadinessBody(resp *http.Response, adminURL, readyURL string) {
@@ -189,7 +242,8 @@ func (i *Instance) UpdateConfig(
 		readyCtx,
 		adminURL,
 		apiConfig,
-		newReadinessHTTPClient(),
+		adminReadinessClient(apiConfig),
+		caddyAPIInitialDelay,
 	); readyErr != nil {
 		logger.Error().Err(readyErr).Msg("Caddy Admin API not ready")
 		return &ConfigurationFailedError{
@@ -213,7 +267,7 @@ func (i *Instance) UpdateConfig(
 			Err:      reqErr,
 		}
 	}
-	resp, doErr := newConfigPushHTTPClient().Do(req)
+	resp, doErr := adminConfigPushClient(apiConfig).Do(req)
 	if doErr != nil {
 		logger.Error().Err(doErr).Msg("Failed to send configuration to Caddy")
 		return &ConfigurationFailedError{
@@ -274,7 +328,7 @@ func clusterIPAdminURL(serviceName, namespace string) string {
 func adminLoadURL(host string) string {
 	return (&url.URL{
 		Scheme: "http",
-		Host:   net.JoinHostPort(host, constants.CaddyAdminPortStr),
+		Host:   net.JoinHostPort(host, strconv.Itoa(constants.CaddyAdminPort)),
 		Path:   "/load",
 	}).String()
 }
@@ -355,9 +409,7 @@ func (i *Instance) buildConfigUpdateRequest(
 		return req, nil
 	}
 	req.Header.Set("Origin", adminOrigin(apiConfig.OriginKey))
-	logger.Debug().
-		Str("origin", req.Header.Get("Origin")).
-		Msg("Added Origin header for admin API security")
+	logger.Debug().Msg("Added Origin header for admin API security")
 	return req, nil
 }
 
@@ -366,7 +418,11 @@ func (i *Instance) logConfigUpdateFailure(
 	body []byte,
 	logger zerolog.Logger,
 ) error {
-	err := fmt.Errorf("caddy returned status %d: %s", statusCode, string(body))
+	truncated := body
+	if len(truncated) > errorBodyLogMax {
+		truncated = truncated[:errorBodyLogMax]
+	}
+	err := fmt.Errorf("caddy returned status %d: %s", statusCode, string(truncated))
 	if statusCode >= 400 && statusCode < 500 {
 		logger.Error().
 			Err(err).

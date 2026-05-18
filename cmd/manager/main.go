@@ -26,12 +26,10 @@ import (
 )
 
 const (
-	defaultHTTPHostPort           = 80
-	defaultHTTPSHostPort          = 443
-	probeShutdownTimeout          = 5 * time.Second
-	probeReadHeaderTimeout        = 10 * time.Second
-	leaderElectionShutdownMinWait = 1 * time.Second
-	leaderElectionShutdownMaxWait = 30 * time.Second
+	defaultHTTPHostPort    = 80
+	defaultHTTPSHostPort   = 443
+	probeShutdownTimeout   = 5 * time.Second
+	probeReadHeaderTimeout = 10 * time.Second
 )
 
 var errLeaderElectionLost = errors.New("leader election lost")
@@ -46,6 +44,8 @@ type cliOptions struct {
 	communicationMethod          string
 	logLevel                     string
 	caddyImage                   string
+	imagePullPolicy              string
+	prePullImage                 bool
 	enableLoadBalancer           bool
 	secretName                   string
 	secretEnvKeys                []string
@@ -65,7 +65,6 @@ type cliOptions struct {
 	externalPublishAggregated    bool
 	externalAggregatedConfigName string
 	leaderElectionEnabled        bool
-	readinessRequireLeader       bool
 	leaderElectionLeaseName      string
 	leaderElectionLeaseNamespace string
 	leaderElectionLeaseDuration  time.Duration
@@ -91,6 +90,10 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("Invalid communication mode configuration")
 	}
+	imagePullPolicy, err := resolveImagePullPolicy(options.imagePullPolicy)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Invalid image pull policy")
+	}
 	clientset, err := utils.GetKubernetesClient(options.kubeconfigPath)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to build Kubernetes client")
@@ -103,13 +106,14 @@ func main() {
 		log.Fatal().Err(err).Msg("Failed to parse external endpoints")
 	}
 	cfg := controller.ControllerConfig{
-		Kubeconfig:                   options.kubeconfigPath,
 		NodeLabel:                    options.nodeLabel,
 		ConfigMapName:                options.configMapName,
 		ConfigMapNamespace:           options.configMapNamespace,
 		BootstrapDefaultConfig:       options.bootstrapDefaultConfig,
 		CommunicationMethod:          commMethod,
 		CaddyImage:                   options.caddyImage,
+		ImagePullPolicy:              imagePullPolicy,
+		PrePullImage:                 options.prePullImage,
 		EnableLoadBalancer:           options.enableLoadBalancer,
 		EnvSecretName:                options.secretName,
 		EnvSecretKeys:                options.secretEnvKeys,
@@ -131,7 +135,6 @@ func main() {
 	ctrl := newControllerOrDie(clientset, cfg)
 	ctx, cancel := context.WithCancel(context.Background())
 	readiness := &atomic.Bool{}
-	readiness.Store(false)
 	probeErrCh := startHealthProbeServer(ctx, options.healthBindAddress, readiness)
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -174,67 +177,92 @@ func parseCLIOptions() cliOptions {
 
 func registerCoreCLIFlags(opts *cliOptions) {
 	pflag.StringVar(&opts.kubeconfigPath, "kubeconfig", "", "Path to kubeconfig file")
-	pflag.StringVar(&opts.nodeLabel,
+	pflag.StringVar(
+		&opts.nodeLabel,
 		"node-label",
 		"ckic.cmld.ru/enabled=true",
 		"Kubernetes label selector used to choose managed nodes",
 	)
-	pflag.StringVar(&opts.configMapName,
+	pflag.StringVar(
+		&opts.configMapName,
 		"config-map",
 		"caddy-config",
 		"ConfigMap containing Caddy configuration",
 	)
-	pflag.StringVar(&opts.configMapNamespace,
+	pflag.StringVar(
+		&opts.configMapNamespace,
 		"config-namespace",
 		"caddy-system",
 		"Namespace of the ConfigMap and deployments",
 	)
-	pflag.BoolVar(&opts.bootstrapDefaultConfig,
+	pflag.BoolVar(
+		&opts.bootstrapDefaultConfig,
 		"bootstrap-default-config",
 		false,
 		"Create a default ConfigMap on startup only when it is missing",
 	)
-	pflag.StringVar(&opts.healthBindAddress,
+	pflag.StringVar(
+		&opts.healthBindAddress,
 		"health-bind-address",
 		":8081",
 		"Address where health and readiness probes are served (set empty to disable)",
 	)
-	pflag.StringVar(&opts.communicationMethod,
+	pflag.StringVar(
+		&opts.communicationMethod,
 		"comm-method",
 		"clusterip",
 		"Communication method (clusterip, direct, hostnetwork)",
 	)
-	pflag.StringVar(&opts.logLevel,
+	pflag.StringVar(
+		&opts.logLevel,
 		"log-level",
 		"info",
 		"Log level (debug, info, warn, error)",
 	)
-	pflag.StringVar(&opts.caddyImage,
+	pflag.StringVar(
+		&opts.caddyImage,
 		"caddy-image",
-		"docker.horse/oss-images/zerossl-caddy/caddy:2.11.2-alpine",
+		"docker.horse/oss-images/zerossl-caddy/caddy:2.11.3-alpine",
 		"Caddy image (format image:tag)",
 	)
-	pflag.BoolVar(&opts.enableLoadBalancer,
+	pflag.StringVar(
+		&opts.imagePullPolicy,
+		"image-pull-policy",
+		"IfNotPresent",
+		"ImagePullPolicy for deployed Caddy pods (Always, IfNotPresent, Never)",
+	)
+	pflag.BoolVar(
+		&opts.prePullImage,
+		"prepull-image",
+		true,
+		"Pre-pull the Caddy image on a node before creating or updating its Deployment",
+	)
+	pflag.BoolVar(
+		&opts.enableLoadBalancer,
 		"enable-loadbalancer",
 		false,
 		"Enable LoadBalancer service exposure",
 	)
-	pflag.StringVar(&opts.secretName,
+	pflag.StringVar(
+		&opts.secretName,
 		"env-secret",
 		"",
 		"Name of the Kubernetes Secret to use for environment variables",
 	)
-	pflag.StringSliceVar(&opts.secretEnvKeys,
+	pflag.StringSliceVar(
+		&opts.secretEnvKeys,
 		"env-keys",
 		[]string{},
 		"Keys from the Secret to use as environment variables",
 	)
-	pflag.StringVar(&opts.dataVolumePVC,
+	pflag.StringVar(
+		&opts.dataVolumePVC,
 		"data-pvc",
 		"",
 		"Name of PVC to use for the /data volume (defaults to HostPath if empty)",
 	)
-	pflag.StringVar(&opts.configVolumePVC,
+	pflag.StringVar(
+		&opts.configVolumePVC,
 		"config-pvc",
 		"",
 		"Name of PVC to use for the /config volume (defaults to HostPath if empty)",
@@ -243,32 +271,38 @@ func registerCoreCLIFlags(opts *cliOptions) {
 }
 
 func registerCoreNetworkingCLIFlags(opts *cliOptions) {
-	pflag.StringArrayVar(&opts.externalEndpoints,
+	pflag.StringArrayVar(
+		&opts.externalEndpoints,
 		"external-endpoints",
 		[]string{},
 		"External endpoints for nodes (format: nodeName=ip1,ip2,...)",
 	)
-	pflag.StringVar(&opts.externalEndpointsFile,
+	pflag.StringVar(
+		&opts.externalEndpointsFile,
 		"external-endpoints-file",
 		"",
 		"Path to JSON file containing external endpoints mapping",
 	)
-	pflag.BoolVar(&opts.useHostNetwork,
+	pflag.BoolVar(
+		&opts.useHostNetwork,
 		"use-host-network",
 		false,
 		"Use hostNetwork for Caddy pods",
 	)
-	pflag.StringVar(&opts.caddyAdminOriginKey,
+	pflag.StringVar(
+		&opts.caddyAdminOriginKey,
 		"caddy-admin-origin-key",
 		"",
 		"Origin key for Caddy admin API security",
 	)
-	pflag.IntVar(&opts.httpHostPort,
+	pflag.IntVar(
+		&opts.httpHostPort,
 		"http-host-port",
 		defaultHTTPHostPort,
 		"Host port for HTTP when using hostNetwork",
 	)
-	pflag.IntVar(&opts.httpsHostPort,
+	pflag.IntVar(
+		&opts.httpsHostPort,
 		"https-host-port",
 		defaultHTTPSHostPort,
 		"Host port for HTTPS when using hostNetwork",
@@ -276,37 +310,44 @@ func registerCoreNetworkingCLIFlags(opts *cliOptions) {
 }
 
 func registerExternalCLIFlags(opts *cliOptions) {
-	pflag.BoolVar(&opts.externalEnable,
+	pflag.BoolVar(
+		&opts.externalEnable,
 		"external-enable",
 		false,
 		"Enable external namespace ConfigMap aggregation",
 	)
-	pflag.StringVar(&opts.externalLabel,
+	pflag.StringVar(
+		&opts.externalLabel,
 		"external-label",
 		"ckic.cmld.ru/aggregate=true",
 		"Label selector for external ConfigMaps",
 	)
-	pflag.StringVar(&opts.externalNsMode,
+	pflag.StringVar(
+		&opts.externalNsMode,
 		"external-ns-mode",
 		"all",
 		"Namespace mode: all, allow, or deny",
 	)
-	pflag.StringVar(&opts.externalAllowNamespaces,
+	pflag.StringVar(
+		&opts.externalAllowNamespaces,
 		"external-allow-namespaces",
 		"",
 		"Comma-separated list of allowed namespaces (for allow mode)",
 	)
-	pflag.StringVar(&opts.externalDenyNamespaces,
+	pflag.StringVar(
+		&opts.externalDenyNamespaces,
 		"external-deny-namespaces",
 		"",
 		"Comma-separated list of denied namespaces (for deny mode)",
 	)
-	pflag.BoolVar(&opts.externalPublishAggregated,
+	pflag.BoolVar(
+		&opts.externalPublishAggregated,
 		"external-publish-aggregated",
 		true,
 		"Publish aggregated Caddyfile to a mirror ConfigMap",
 	)
-	pflag.StringVar(&opts.externalAggregatedConfigName,
+	pflag.StringVar(
+		&opts.externalAggregatedConfigName,
 		"external-aggregated-config-name",
 		"ckic-caddy-config-working",
 		"Name of the mirror ConfigMap for aggregated config",
@@ -314,17 +355,14 @@ func registerExternalCLIFlags(opts *cliOptions) {
 }
 
 func registerLeaderElectionCLIFlags(opts *cliOptions) {
-	pflag.BoolVar(&opts.leaderElectionEnabled,
+	pflag.BoolVar(
+		&opts.leaderElectionEnabled,
 		"leader-elect",
 		true,
 		"Enable leader election so only one manager instance reconciles resources",
 	)
-	pflag.BoolVar(&opts.readinessRequireLeader,
-		"readiness-require-leader",
-		false,
-		"Report readiness only while leading (set true to keep legacy behavior)",
-	)
-	pflag.StringVar(&opts.leaderElectionLeaseName,
+	pflag.StringVar(
+		&opts.leaderElectionLeaseName,
 		"leader-election-lease-name",
 		"ckic-manager-leader",
 		"Name of the Lease resource used for leader election",
@@ -335,17 +373,20 @@ func registerLeaderElectionCLIFlags(opts *cliOptions) {
 		"",
 		"Namespace of the Lease resource used for leader election (defaults to --config-namespace)",
 	)
-	pflag.DurationVar(&opts.leaderElectionLeaseDuration,
+	pflag.DurationVar(
+		&opts.leaderElectionLeaseDuration,
 		"leader-election-lease-duration",
 		15*time.Second,
 		"Duration non-leaders wait before forcing a leader election",
 	)
-	pflag.DurationVar(&opts.leaderElectionRenewDeadline,
+	pflag.DurationVar(
+		&opts.leaderElectionRenewDeadline,
 		"leader-election-renew-deadline",
 		10*time.Second,
 		"Duration the acting leader retries refreshing leadership before giving up",
 	)
-	pflag.DurationVar(&opts.leaderElectionRetryPeriod,
+	pflag.DurationVar(
+		&opts.leaderElectionRetryPeriod,
 		"leader-election-retry-period",
 		2*time.Second,
 		"Time between attempts by clients to acquire or renew leadership",
@@ -409,6 +450,18 @@ func resolveCommunicationMethod(
 	return commMethod, nil
 }
 
+func resolveImagePullPolicy(policy string) (string, error) {
+	switch policy {
+	case "Always", "IfNotPresent", "Never":
+		return policy, nil
+	default:
+		return "", fmt.Errorf(
+			"invalid image pull policy %q (want Always, IfNotPresent, or Never)",
+			policy,
+		)
+	}
+}
+
 func newControllerOrDie(
 	clientset *kubernetes.Clientset,
 	cfg controller.ControllerConfig,
@@ -445,49 +498,50 @@ func runControllerWithLeaderElectionWithRunner(
 	readiness *atomic.Bool,
 	runLeaderElection leaderElectionRunFunc,
 ) error {
-	if !options.leaderElectionEnabled {
-		return runControllerWithoutLeaderElection(ctx, ctrl, readiness)
-	}
-	readiness.Store(!options.readinessRequireLeader)
-	defer readiness.Store(false)
-	leaseNamespace := leaderElectionLeaseNamespace(options)
-	identity := leaderElectionIdentity()
-	lock := leaderElectionLock(clientset, options, leaseNamespace, identity)
-	runErrCh := make(chan error, 1)
-	controllerDoneCh := make(chan error, 1)
-	controllerStarted := &atomic.Bool{}
-	electionDoneCh := startLeaderElectionLoop(
-		ctx,
-		lock,
-		options,
-		identity,
-		ctrl,
-		readiness,
-		options.readinessRequireLeader,
-		runLeaderElection,
-		runErrCh,
-		controllerDoneCh,
-		controllerStarted,
-		leaseNamespace,
-	)
-	return waitForLeaderElectionResult(
-		ctx,
-		options,
-		runErrCh,
-		controllerDoneCh,
-		controllerStarted,
-		electionDoneCh,
-	)
-}
-
-func runControllerWithoutLeaderElection(
-	ctx context.Context,
-	ctrl controllerRunner,
-	readiness *atomic.Bool,
-) error {
 	readiness.Store(true)
 	defer readiness.Store(false)
-	return ctrl.Run(ctx)
+	if !options.leaderElectionEnabled {
+		return ctrl.Run(ctx)
+	}
+	leaseNamespace := leaderElectionLeaseNamespace(options)
+	identity := leaderElectionIdentity()
+	logLeaderElectionEnabled(options, leaseNamespace)
+	var led atomic.Bool
+	runErrCh := make(chan error, 1)
+	runLeaderElection(ctx, leaderelection.LeaderElectionConfig{
+		Lock:            leaderElectionLock(clientset, options, leaseNamespace, identity),
+		ReleaseOnCancel: true,
+		LeaseDuration:   options.leaderElectionLeaseDuration,
+		RenewDeadline:   options.leaderElectionRenewDeadline,
+		RetryPeriod:     options.leaderElectionRetryPeriod,
+		Callbacks: leaderelection.LeaderCallbacks{
+			OnStartedLeading: func(leadCtx context.Context) {
+				led.Store(true)
+				log.Info().Str("identity", identity).Msg("Acquired leadership")
+				runErr := ctrl.Run(leadCtx)
+				if errors.Is(runErr, context.Canceled) {
+					runErr = nil
+				}
+				if runErr == nil && ctx.Err() == nil {
+					runErr = errLeaderElectionLost
+				}
+				runErrCh <- runErr
+			},
+			OnStoppedLeading: func() {
+				log.Info().Str("identity", identity).Msg("Lost leadership")
+			},
+			OnNewLeader: func(leader string) {
+				log.Info().
+					Str("leaderIdentity", leader).
+					Bool("isLocalLeader", leader == identity).
+					Msg("Observed leader election update")
+			},
+		},
+	})
+	if !led.Load() {
+		return nil
+	}
+	return <-runErrCh
 }
 
 func leaderElectionLeaseNamespace(options cliOptions) string {
@@ -522,56 +576,6 @@ func leaderElectionLock(
 	}
 }
 
-func startLeaderElectionLoop(
-	ctx context.Context,
-	lock resourcelock.Interface,
-	options cliOptions,
-	identity string,
-	ctrl controllerRunner,
-	readiness *atomic.Bool,
-	readinessRequireLeader bool,
-	runLeaderElection leaderElectionRunFunc,
-	runErrCh chan<- error,
-	controllerDoneCh chan<- error,
-	controllerStarted *atomic.Bool,
-	leaseNamespace string,
-) <-chan struct{} {
-	electionDoneCh := make(chan struct{})
-	logLeaderElectionEnabled(options, leaseNamespace)
-	go func() {
-		defer close(electionDoneCh)
-		runLeaderElection(ctx, leaderelection.LeaderElectionConfig{
-			Lock:            lock,
-			ReleaseOnCancel: true,
-			LeaseDuration:   options.leaderElectionLeaseDuration,
-			RenewDeadline:   options.leaderElectionRenewDeadline,
-			RetryPeriod:     options.leaderElectionRetryPeriod,
-			Callbacks: leaderelection.LeaderCallbacks{
-				OnStartedLeading: func(leadCtx context.Context) {
-					onStartedLeading(
-						leadCtx,
-						ctx,
-						identity,
-						ctrl,
-						readiness,
-						readinessRequireLeader,
-						runErrCh,
-						controllerDoneCh,
-						controllerStarted,
-					)
-				},
-				OnStoppedLeading: func() {
-					onStoppedLeading(ctx, readiness, readinessRequireLeader, runErrCh)
-				},
-				OnNewLeader: func(newLeaderIdentity string) {
-					onNewLeader(identity, newLeaderIdentity)
-				},
-			},
-		})
-	}()
-	return electionDoneCh
-}
-
 func logLeaderElectionEnabled(options cliOptions, leaseNamespace string) {
 	log.Info().
 		Str("leaseName", options.leaderElectionLeaseName).
@@ -579,261 +583,7 @@ func logLeaderElectionEnabled(options cliOptions, leaseNamespace string) {
 		Dur("leaseDuration", options.leaderElectionLeaseDuration).
 		Dur("renewDeadline", options.leaderElectionRenewDeadline).
 		Dur("retryPeriod", options.leaderElectionRetryPeriod).
-		Bool("readinessRequireLeader", options.readinessRequireLeader).
 		Msg("Leader election is enabled")
-}
-
-func onStartedLeading(
-	leadCtx context.Context,
-	ctx context.Context,
-	identity string,
-	ctrl controllerRunner,
-	readiness *atomic.Bool,
-	readinessRequireLeader bool,
-	runErrCh chan<- error,
-	controllerDoneCh chan<- error,
-	controllerStarted *atomic.Bool,
-) {
-	log.Info().Str("identity", identity).Msg("Acquired leadership")
-	controllerStarted.Store(true)
-	if readinessRequireLeader {
-		readiness.Store(true)
-		defer readiness.Store(false)
-	}
-	runErr := ctrl.Run(leadCtx)
-	if errors.Is(runErr, context.Canceled) {
-		runErr = nil
-	}
-	if runErr == nil && ctx.Err() == nil && leadCtx.Err() != nil {
-		runErr = errLeaderElectionLost
-	}
-	reportRunResult(controllerDoneCh, runErr)
-	reportRunResult(runErrCh, runErr)
-}
-
-func onStoppedLeading(
-	ctx context.Context,
-	readiness *atomic.Bool,
-	readinessRequireLeader bool,
-	runErrCh chan<- error,
-) {
-	if readinessRequireLeader {
-		readiness.Store(false)
-	}
-	if ctx.Err() != nil {
-		return
-	}
-	reportRunResult(runErrCh, errLeaderElectionLost)
-}
-
-func onNewLeader(identity, newLeaderIdentity string) {
-	log.Info().
-		Str("leaderIdentity", newLeaderIdentity).
-		Bool("isLocalLeader", newLeaderIdentity == identity).
-		Msg("Observed leader election update")
-}
-
-func reportRunResult(runErrCh chan<- error, runErr error) {
-	select {
-	case runErrCh <- runErr:
-	default:
-	}
-}
-
-func waitForLeaderElectionResult(
-	ctx context.Context,
-	options cliOptions,
-	runErrCh <-chan error,
-	controllerDoneCh <-chan error,
-	controllerStarted *atomic.Bool,
-	electionDoneCh <-chan struct{},
-) error {
-	for {
-		select {
-		case runErr := <-runErrCh:
-			return handleRunResult(
-				ctx,
-				options,
-				runErr,
-				electionDoneCh,
-				controllerDoneCh,
-				controllerStarted,
-			)
-		case <-ctx.Done():
-			return handleContextDone(
-				options,
-				runErrCh,
-				electionDoneCh,
-				controllerDoneCh,
-				controllerStarted,
-			)
-		case <-electionDoneCh:
-			return handleElectionDone(
-				ctx,
-				options,
-				runErrCh,
-				controllerDoneCh,
-				controllerStarted,
-			)
-		}
-	}
-}
-
-func handleRunResult(
-	ctx context.Context,
-	options cliOptions,
-	runErr error,
-	electionDoneCh <-chan struct{},
-	controllerDoneCh <-chan error,
-	controllerStarted *atomic.Bool,
-) error {
-	if runErr != nil {
-		if errors.Is(runErr, errLeaderElectionLost) {
-			waitForElectionShutdown(options, electionDoneCh)
-			if controllerRunErr, hasControllerRunErr := waitForControllerShutdownResult(
-				options,
-				controllerStarted,
-				controllerDoneCh,
-			); hasControllerRunErr && controllerRunErr != nil {
-				return controllerRunErr
-			}
-		}
-		return runErr
-	}
-	waitForElectionShutdown(options, electionDoneCh)
-	if isContextDone(ctx) {
-		return nil
-	}
-	return errors.New("controller loop exited unexpectedly without context cancellation")
-}
-
-func handleContextDone(
-	options cliOptions,
-	runErrCh <-chan error,
-	electionDoneCh <-chan struct{},
-	controllerDoneCh <-chan error,
-	controllerStarted *atomic.Bool,
-) error {
-	waitForElectionShutdown(options, electionDoneCh)
-	if controllerRunErr, hasControllerRunErr := waitForControllerShutdownResult(
-		options,
-		controllerStarted,
-		controllerDoneCh,
-	); hasControllerRunErr {
-		if controllerRunErr != nil {
-			return controllerRunErr
-		}
-		return nil
-	}
-	if runErr, hasRunErr := readRunErrNonBlocking(runErrCh); hasRunErr && runErr != nil {
-		return runErr
-	}
-	return nil
-}
-
-func handleElectionDone(
-	ctx context.Context,
-	options cliOptions,
-	runErrCh <-chan error,
-	controllerDoneCh <-chan error,
-	controllerStarted *atomic.Bool,
-) error {
-	if runErr, hasRunErr := readRunErrNonBlocking(runErrCh); hasRunErr && runErr != nil {
-		if errors.Is(runErr, errLeaderElectionLost) {
-			if controllerRunErr, hasControllerRunErr := waitForControllerShutdownResult(
-				options,
-				controllerStarted,
-				controllerDoneCh,
-			); hasControllerRunErr && controllerRunErr != nil {
-				return controllerRunErr
-			}
-		}
-		return runErr
-	}
-	if isContextDone(ctx) {
-		if controllerRunErr, hasControllerRunErr := waitForControllerShutdownResult(
-			options,
-			controllerStarted,
-			controllerDoneCh,
-		); hasControllerRunErr && controllerRunErr != nil {
-			return controllerRunErr
-		}
-		return nil
-	}
-	return errors.New("leader election loop exited unexpectedly")
-}
-
-func readRunErrNonBlocking(runErrCh <-chan error) (error, bool) {
-	select {
-	case runErr := <-runErrCh:
-		return runErr, true
-	default:
-		return nil, false
-	}
-}
-
-func isContextDone(ctx context.Context) bool {
-	select {
-	case <-ctx.Done():
-		return true
-	default:
-		return false
-	}
-}
-
-func waitForElectionShutdown(options cliOptions, electionDoneCh <-chan struct{}) {
-	timeout := leaderElectionShutdownTimeout(
-		options.leaderElectionRenewDeadline,
-		options.leaderElectionRetryPeriod,
-	)
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case <-electionDoneCh:
-	case <-timer.C:
-		log.Warn().
-			Dur("timeout", timeout).
-			Msg("Timed out waiting for leader election shutdown; lease handoff may wait for expiration")
-	}
-}
-
-func waitForControllerShutdownResult(
-	options cliOptions,
-	controllerStarted *atomic.Bool,
-	controllerDoneCh <-chan error,
-) (error, bool) {
-	if controllerStarted == nil || !controllerStarted.Load() {
-		return nil, false
-	}
-	timeout := leaderElectionShutdownTimeout(
-		options.leaderElectionRenewDeadline,
-		options.leaderElectionRetryPeriod,
-	)
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case runErr := <-controllerDoneCh:
-		return runErr, true
-	case <-timer.C:
-		log.Warn().
-			Dur("timeout", timeout).
-			Msg("Timed out waiting for controller shutdown completion")
-		return nil, false
-	}
-}
-
-func leaderElectionShutdownTimeout(
-	renewDeadline, retryPeriod time.Duration,
-) time.Duration {
-	timeout := renewDeadline + retryPeriod
-	switch {
-	case timeout < leaderElectionShutdownMinWait:
-		return leaderElectionShutdownMinWait
-	case timeout > leaderElectionShutdownMaxWait:
-		return leaderElectionShutdownMaxWait
-	default:
-		return timeout
-	}
 }
 
 func startHealthProbeServer(
@@ -871,7 +621,9 @@ func startHealthProbeServer(
 			probeShutdownTimeout,
 		)
 		defer cancel()
-		_ = server.Shutdown(shutdownCtx)
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Warn().Err(err).Msg("Probe server shutdown returned error")
+		}
 	}()
 	go func() {
 		log.Info().Str("bindAddress", bindAddress).Msg("Starting probe server")
