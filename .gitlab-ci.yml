@@ -93,7 +93,6 @@ container scanning:
 validate + lint (helm chart):
   <<:
     - *chart-build-and-publish-rules
-    - *alpine-mirror-before-script
   stage: test
   image: $CT_IMAGE
   script:
@@ -103,7 +102,6 @@ validate + lint (helm chart):
 publish helm chart to gitlab registry:
   <<:
     - *chart-build-and-publish-rules
-    - *alpine-mirror-before-script
   stage: publish
   image: $CT_IMAGE
   needs:
