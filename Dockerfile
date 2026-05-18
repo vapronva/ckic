@@ -1,11 +1,12 @@
-FROM docker.io/library/golang:1.26-alpine AS build
+FROM docker.io/library/golang:1.26.3-alpine AS build
 
 WORKDIR /usr/src/app/ckic
 
-RUN apk update && \
-    apk upgrade && \
-    apk add git ca-certificates tzdata && \
-    rm -rf /var/cache/apk/*
+RUN sed --in-place 's!https://dl-cdn.alpinelinux.org/alpine!https://linux.sex/dl-cdn.alpinelinux.org!g' /etc/apk/repositories || true && \
+    apk --verbose update && \
+    apk --verbose upgrade --available && \
+    apk add --no-cache git ca-certificates tzdata && \
+    update-ca-certificates
 
 COPY go.mod go.sum ./
 
@@ -18,10 +19,12 @@ RUN CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -a -o ckic-manager ./cmd/m
 
 FROM docker.io/library/alpine:3
 
-RUN apk update && \
-    apk upgrade && \
-    apk add ca-certificates tzdata && \
-    rm -rf /var/cache/apk/*
+RUN sed --in-place 's!https://dl-cdn.alpinelinux.org/alpine!https://linux.sex/dl-cdn.alpinelinux.org!g' /etc/apk/repositories || true && \
+    apk --verbose update && \
+    apk --verbose upgrade --available && \
+    apk add --no-cache ca-certificates tzdata && \
+    update-ca-certificates && \
+    apk cache clean
 
 COPY --from=build /usr/src/app/ckic/ckic-manager /usr/bin/ckic-manager
 
