@@ -181,7 +181,7 @@ func registerCoreCLIFlags(opts *cliOptions) {
 		&opts.nodeLabel,
 		"node-label",
 		"ckic.cmld.ru/enabled=true",
-		"Kubernetes label selector used to choose managed nodes",
+		"Kubernetes label selector used to choose managed nodes (empty for all nodes)",
 	)
 	pflag.StringVar(
 		&opts.configMapName,

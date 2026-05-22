@@ -2,7 +2,6 @@ package watcher
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -76,7 +75,7 @@ func normalizeLegacyNodeSelector(labelSelector string) string {
 func NormalizeNodeLabelSelector(labelSelector string) (string, error) {
 	selector := strings.TrimSpace(labelSelector)
 	if selector == "" {
-		return "", errors.New("node label selector is empty")
+		return "", nil
 	}
 	selector = normalizeLegacyNodeSelector(selector)
 	parsed, err := labels.Parse(selector)
