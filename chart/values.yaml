@@ -10,7 +10,7 @@ updateStrategy:
 image:
   repository: docker.horse
   image: vapronva/ckic/manager
-  tag: 0.29.4
+  tag: 0.30.0
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -85,7 +85,6 @@ config:
   caddyImage: docker.horse/oss-images/zerossl-caddy/caddy:2.11.3-alpine
   imagePullPolicy: IfNotPresent
   prePullImage: true
-  enableLoadBalancer: true
   useHostNetwork: false
   httpHostPort: 80
   httpsHostPort: 443
@@ -96,13 +95,21 @@ config:
   configVolumePVC: caddy-config-lv
   externalEndpoints: []
   external:
-    enable: false
+    enable: true
     label: ckic.cmld.ru/aggregate=true
     nsMode: all
     allowNamespaces: []
     denyNamespaces: []
     publishAggregated: true
     aggregatedConfigName: ckic-caddy-config-working
+
+loadBalancer:
+  mode: cilium
+  clientIP: proxy-protocol
+  externalTrafficPolicy: ""
+  loadBalancerIP: ""
+  trustedProxyCIDRs: 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
+  annotations: {}
 
 caddyConfig:
   debug: true

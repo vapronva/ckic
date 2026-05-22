@@ -32,6 +32,12 @@ const (
 	probeReadHeaderTimeout = 10 * time.Second
 )
 
+const (
+	commMethodClusterIP   = "clusterip"
+	commMethodDirect      = "direct"
+	commMethodHostNetwork = "hostnetwork"
+)
+
 var errLeaderElectionLost = errors.New("leader election lost")
 
 type cliOptions struct {
@@ -46,7 +52,7 @@ type cliOptions struct {
 	caddyImage                   string
 	imagePullPolicy              string
 	prePullImage                 bool
-	enableLoadBalancer           bool
+	loadBalancerMode             string
 	secretName                   string
 	secretEnvKeys                []string
 	dataVolumePVC                string
@@ -82,10 +88,14 @@ func main() {
 	options := parseCLIOptions()
 	level := parseLogLevel(options.logLevel)
 	setupLogger(level)
+	lbMode, err := caddy.ParseLoadBalancerMode(options.loadBalancerMode)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Invalid loadbalancer mode")
+	}
 	commMethod, err := resolveCommunicationMethod(
 		options.communicationMethod,
 		options.useHostNetwork,
-		options.enableLoadBalancer,
+		lbMode,
 	)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Invalid communication mode configuration")
@@ -114,7 +124,7 @@ func main() {
 		CaddyImage:                   options.caddyImage,
 		ImagePullPolicy:              imagePullPolicy,
 		PrePullImage:                 options.prePullImage,
-		EnableLoadBalancer:           options.enableLoadBalancer,
+		LoadBalancerMode:             lbMode,
 		EnvSecretName:                options.secretName,
 		EnvSecretKeys:                options.secretEnvKeys,
 		DataVolumePVC:                options.dataVolumePVC,
@@ -210,7 +220,7 @@ func registerCoreCLIFlags(opts *cliOptions) {
 	pflag.StringVar(
 		&opts.communicationMethod,
 		"comm-method",
-		"clusterip",
+		commMethodClusterIP,
 		"Communication method (clusterip, direct, hostnetwork)",
 	)
 	pflag.StringVar(
@@ -237,11 +247,11 @@ func registerCoreCLIFlags(opts *cliOptions) {
 		true,
 		"Pre-pull the Caddy image on a node before creating or updating its Deployment",
 	)
-	pflag.BoolVar(
-		&opts.enableLoadBalancer,
-		"enable-loadbalancer",
-		false,
-		"Enable LoadBalancer service exposure",
+	pflag.StringVar(
+		&opts.loadBalancerMode,
+		"loadbalancer-mode",
+		"none",
+		"LoadBalancer strategy: none, cilium (one LB per node), or shared (one chart-managed LB for all Caddy pods)",
 	)
 	pflag.StringVar(
 		&opts.secretName,
@@ -418,20 +428,21 @@ func parseLogLevel(level string) zerolog.Level {
 
 func resolveCommunicationMethod(
 	method string,
-	useHostNetwork, enableLoadBalancer bool,
+	useHostNetwork bool,
+	lbMode caddy.LoadBalancerMode,
 ) (caddy.CommunicationMethod, error) {
-	if useHostNetwork && enableLoadBalancer {
-		return caddy.CommunicationMethodClusterIP, errors.New(
-			"cannot use both hostNetwork and LoadBalancer at the same time",
+	if useHostNetwork && lbMode != caddy.LoadBalancerModeNone {
+		return caddy.CommunicationMethodClusterIP, fmt.Errorf(
+			"cannot combine hostNetwork with loadbalancer mode %q", lbMode,
 		)
 	}
 	commMethod := caddy.CommunicationMethodClusterIP
 	switch method {
-	case "clusterip":
+	case commMethodClusterIP:
 		commMethod = caddy.CommunicationMethodClusterIP
-	case "direct":
+	case commMethodDirect:
 		commMethod = caddy.CommunicationMethodDirect
-	case "hostnetwork":
+	case commMethodHostNetwork:
 		commMethod = caddy.CommunicationMethodHostNetwork
 	default:
 		log.Warn().

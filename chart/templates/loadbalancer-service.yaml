@@ -1,0 +1,47 @@
+{{- if eq .Values.loadBalancer.mode "shared" }}
+---
+kind: Service
+apiVersion: v1
+
+metadata:
+  name: caddy-loadbalancer
+  labels:
+    {{- include "ckic-manager.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+    {{- if eq .Values.loadBalancer.clientIP "proxy-protocol" }}
+    loadbalancer.openstack.org/proxy-protocol: "true"
+    {{- end }}
+    {{- with .Values.loadBalancer.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+
+spec:
+  type: LoadBalancer
+  selector:
+    app: caddy
+    ckic.cmld.ru/caddy-managed: "true"
+  externalTrafficPolicy: {{ .Values.loadBalancer.externalTrafficPolicy | default (ternary "Cluster" "Local" (eq .Values.loadBalancer.clientIP "proxy-protocol")) }}
+  {{- with .Values.loadBalancer.loadBalancerIP }}
+  loadBalancerIP: {{ . | quote }}
+  {{- end }}
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+      protocol: TCP
+    - name: https
+      port: 443
+      targetPort: 443
+      protocol: TCP
+    {{- if eq .Values.loadBalancer.clientIP "local" }}
+    - name: http-udp
+      port: 80
+      targetPort: 80
+      protocol: UDP
+    - name: https-udp
+      port: 443
+      targetPort: 443
+      protocol: UDP
+    {{- end }}
+{{- end }}

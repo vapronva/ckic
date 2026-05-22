@@ -33,7 +33,17 @@ data:
         max_header_size 5MB
         enable_full_duplex
         keepalive_interval 30s
+        {{- if and (eq $.Values.loadBalancer.mode "shared") (eq $.Values.loadBalancer.clientIP "proxy-protocol") }}
+        protocols h1 h2 h2c
+        listener_wrappers {
+          proxy_protocol {
+            allow {{ $.Values.loadBalancer.trustedProxyCIDRs }}
+          }
+          tls
+        }
+        {{- else }}
         protocols h1 h2 h2c h3
+        {{- end }}
         {{- with .servers }}
         {{ . | nindent 8 }}
         {{- end }}

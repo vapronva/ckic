@@ -34,7 +34,7 @@ type ControllerConfig struct {
 	CaddyImage                   string
 	ImagePullPolicy              string
 	PrePullImage                 bool
-	EnableLoadBalancer           bool
+	LoadBalancerMode             caddy.LoadBalancerMode
 	EnvSecretName                string
 	EnvSecretKeys                []string
 	DataVolumePVC                string
@@ -100,20 +100,20 @@ func NewController(
 ) (*Controller, error) {
 	deployedInstances, mutex, nodeAvailabilityCheck := newControllerState()
 	deployOpts := caddy.DeployOptions{
-		Clientset:          clientset,
-		Namespace:          config.ConfigMapNamespace,
-		CaddyImage:         config.CaddyImage,
-		ImagePullPolicy:    corev1.PullPolicy(config.ImagePullPolicy),
-		PrePullImage:       config.PrePullImage,
-		EnableLoadBalancer: config.EnableLoadBalancer,
-		EnvSecretName:      config.EnvSecretName,
-		EnvSecretKeys:      config.EnvSecretKeys,
-		DataVolumePVC:      config.DataVolumePVC,
-		ConfigVolumePVC:    config.ConfigVolumePVC,
-		ConfigMapName:      config.ConfigMapName,
-		UseHostNetwork:     config.UseHostNetwork,
-		HTTPHostPort:       config.HTTPHostPort,
-		HTTPSHostPort:      config.HTTPSHostPort,
+		Clientset:        clientset,
+		Namespace:        config.ConfigMapNamespace,
+		CaddyImage:       config.CaddyImage,
+		ImagePullPolicy:  corev1.PullPolicy(config.ImagePullPolicy),
+		PrePullImage:     config.PrePullImage,
+		LoadBalancerMode: config.LoadBalancerMode,
+		EnvSecretName:    config.EnvSecretName,
+		EnvSecretKeys:    config.EnvSecretKeys,
+		DataVolumePVC:    config.DataVolumePVC,
+		ConfigVolumePVC:  config.ConfigVolumePVC,
+		ConfigMapName:    config.ConfigMapName,
+		UseHostNetwork:   config.UseHostNetwork,
+		HTTPHostPort:     config.HTTPHostPort,
+		HTTPSHostPort:    config.HTTPSHostPort,
 	}
 	nodeHandler := handlers.NewNodeHandler(
 		deployOpts,

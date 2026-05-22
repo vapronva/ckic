@@ -65,7 +65,7 @@ spec:
             - "--caddy-image={{ .Values.config.caddyImage }}"
             - "--image-pull-policy={{ .Values.config.imagePullPolicy }}"
             - "--prepull-image={{ .Values.config.prePullImage }}"
-            - "--enable-loadbalancer={{ .Values.config.enableLoadBalancer }}"
+            - "--loadbalancer-mode={{ if .Values.config.useHostNetwork }}none{{ else }}{{ .Values.loadBalancer.mode }}{{ end }}"
             - "--env-secret={{ .Values.config.secretName }}"
             {{- range .Values.config.secretEnvKeys }}
             - "--env-keys={{ . }}"

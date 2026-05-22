@@ -87,20 +87,20 @@ func trafficServicePorts() []corev1.ServicePort {
 }
 
 type DeployOptions struct {
-	Clientset          kubernetes.Interface
-	Namespace          string
-	CaddyImage         string
-	EnableLoadBalancer bool
-	EnvSecretName      string
-	EnvSecretKeys      []string
-	DataVolumePVC      string
-	ConfigVolumePVC    string
-	ConfigMapName      string
-	UseHostNetwork     bool
-	HTTPHostPort       int
-	HTTPSHostPort      int
-	ImagePullPolicy    corev1.PullPolicy
-	PrePullImage       bool
+	Clientset        kubernetes.Interface
+	Namespace        string
+	CaddyImage       string
+	LoadBalancerMode LoadBalancerMode
+	EnvSecretName    string
+	EnvSecretKeys    []string
+	DataVolumePVC    string
+	ConfigVolumePVC  string
+	ConfigMapName    string
+	UseHostNetwork   bool
+	HTTPHostPort     int
+	HTTPSHostPort    int
+	ImagePullPolicy  corev1.PullPolicy
+	PrePullImage     bool
 }
 
 func (o DeployOptions) imagePullPolicy() corev1.PullPolicy {
@@ -142,7 +142,7 @@ func DeployCaddy(
 		opts.Clientset,
 		instance,
 		opts.UseHostNetwork,
-		opts.EnableLoadBalancer,
+		opts.LoadBalancerMode,
 		deploymentCreated,
 		logger,
 	); err != nil {
@@ -181,7 +181,9 @@ func deployCaddyServices(
 	cleanupCtx context.Context,
 	clientset kubernetes.Interface,
 	instance *Instance,
-	useHostNetwork, enableLoadBalancer, deploymentCreated bool,
+	useHostNetwork bool,
+	lbMode LoadBalancerMode,
+	deploymentCreated bool,
 	logger zerolog.Logger,
 ) error {
 	if useHostNetwork {
@@ -192,7 +194,7 @@ func deployCaddyServices(
 		rollbackCreatedDeployment(cleanupCtx, instance, deploymentCreated)
 		return err
 	}
-	if !enableLoadBalancer {
+	if lbMode != LoadBalancerModeCilium {
 		return nil
 	}
 	if _, err := deployLoadBalancerService(deployCtx, clientset, instance); err != nil {
@@ -1015,6 +1017,7 @@ func desiredLoadBalancerService(instance *Instance) *corev1.Service {
 			Type:                  corev1.ServiceTypeLoadBalancer,
 			LoadBalancerClass:     new(constants.CiliumNodeLoadBalancerClass),
 			ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyTypeLocal,
+			InternalTrafficPolicy: new(corev1.ServiceInternalTrafficPolicyLocal),
 		},
 	}
 }
@@ -1030,6 +1033,9 @@ func mergeServiceForUpdate(existing, desired *corev1.Service) {
 	existing.Spec.ExternalIPs = desired.Spec.ExternalIPs
 	existing.Spec.ExternalTrafficPolicy = desired.Spec.ExternalTrafficPolicy
 	existing.Spec.LoadBalancerClass = desired.Spec.LoadBalancerClass
+	if desired.Spec.InternalTrafficPolicy != nil {
+		existing.Spec.InternalTrafficPolicy = desired.Spec.InternalTrafficPolicy
+	}
 	existing.Spec.Ports = mergeServicePortsKeepingNodePorts(
 		existing.Spec.Ports,
 		desired.Spec.Ports,
@@ -1055,6 +1061,13 @@ func serviceNeedsUpdate(existing, desired *corev1.Service) bool {
 		return true
 	}
 	if existing.Spec.ExternalTrafficPolicy != desired.Spec.ExternalTrafficPolicy {
+		return true
+	}
+	if desired.Spec.InternalTrafficPolicy != nil &&
+		!equality.Semantic.DeepEqual(
+			existing.Spec.InternalTrafficPolicy,
+			desired.Spec.InternalTrafficPolicy,
+		) {
 		return true
 	}
 	if !equality.Semantic.DeepEqual(
