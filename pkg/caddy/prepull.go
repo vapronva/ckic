@@ -157,12 +157,27 @@ func prePullImagePresent(pod *corev1.Pod) (bool, error) {
 			continue
 		}
 		switch waiting.Reason {
-		case "ImagePullBackOff", "ErrImagePull", "InvalidImageName":
+		case "ImagePullBackOff",
+			"ErrImagePull",
+			"ErrImageNeverPull",
+			"InvalidImageName",
+			"ImageInspectError",
+			"RegistryUnavailable",
+			"SignatureValidationFailed":
 			return false, fmt.Errorf(
 				"image pull failed (%s): %s",
 				waiting.Reason,
 				waiting.Message,
 			)
+		case "CreateContainerConfigError",
+			"CreateContainerError",
+			"PreCreateHookError",
+			"PreStartHookError",
+			"PostStartHookError",
+			"RunContainerError",
+			"StartError",
+			"CrashLoopBackOff":
+			return true, nil
 		}
 	}
 	return false, nil

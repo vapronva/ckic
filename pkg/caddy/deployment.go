@@ -678,7 +678,7 @@ func upsertDeployment(
 			)
 		}
 		logger.Info().Msg("Updated existing Caddy deployment")
-		deleteLegacyPodDisruptionBudget(ctx, clientset, instance, logger)
+		DeleteLegacyPodDisruptionBudget(ctx, clientset, instance, logger)
 		return true, false, nil
 	case apierrors.IsNotFound(err):
 		prePullBeforeChange(ctx, opts, instance, deployment, logger)
@@ -694,7 +694,7 @@ func upsertDeployment(
 			)
 		}
 		logger.Info().Msg("Created Caddy deployment")
-		deleteLegacyPodDisruptionBudget(ctx, clientset, instance, logger)
+		DeleteLegacyPodDisruptionBudget(ctx, clientset, instance, logger)
 		return true, true, nil
 	default:
 		logger.Error().Err(err).Msg("Failed to fetch existing Caddy deployment")
@@ -735,16 +735,21 @@ func prePullBeforeChange(
 	}
 }
 
-func deleteLegacyPodDisruptionBudget(
+func DeleteLegacyPodDisruptionBudget(
 	ctx context.Context,
 	clientset kubernetes.Interface,
 	instance *Instance,
 	logger zerolog.Logger,
 ) {
-	if cleanupErr := clientset.PolicyV1().
+	err := clientset.PolicyV1().
 		PodDisruptionBudgets(instance.Namespace).
-		Delete(ctx, instance.DeploymentName, metav1.DeleteOptions{}); cleanupErr == nil {
+		Delete(ctx, instance.DeploymentName, metav1.DeleteOptions{})
+	switch {
+	case err == nil:
 		logger.Info().Msg("Deleted legacy PodDisruptionBudget")
+	case apierrors.IsNotFound(err):
+	default:
+		logger.Warn().Err(err).Msg("Failed to delete legacy PodDisruptionBudget")
 	}
 }
 
@@ -780,6 +785,8 @@ func mergeDeploymentForUpdate(existing, desired *appsv1.Deployment) {
 	existing.Spec.Selector = desired.Spec.Selector
 	existing.Spec.Template.Labels = desired.Spec.Template.Labels
 	existing.Spec.Template.Spec.NodeSelector = desired.Spec.Template.Spec.NodeSelector
+	existing.Spec.Template.Spec.AutomountServiceAccountToken = desired.Spec.Template.Spec.AutomountServiceAccountToken
+	existing.Spec.Template.Spec.SecurityContext = desired.Spec.Template.Spec.SecurityContext
 	existing.Spec.Template.Spec.Volumes = desired.Spec.Template.Spec.Volumes
 	existing.Spec.Template.Spec.Containers = desired.Spec.Template.Spec.Containers
 	existing.Spec.Template.Spec.HostNetwork = desired.Spec.Template.Spec.HostNetwork
@@ -788,6 +795,15 @@ func mergeDeploymentForUpdate(existing, desired *appsv1.Deployment) {
 
 func podTemplateNeedsUpdate(existing, desired corev1.PodSpec) bool {
 	if !equality.Semantic.DeepEqual(existing.NodeSelector, desired.NodeSelector) {
+		return true
+	}
+	if !equality.Semantic.DeepEqual(
+		existing.AutomountServiceAccountToken,
+		desired.AutomountServiceAccountToken,
+	) {
+		return true
+	}
+	if !equality.Semantic.DeepEqual(existing.SecurityContext, desired.SecurityContext) {
 		return true
 	}
 	if volumesNeedUpdate(existing.Volumes, desired.Volumes) {

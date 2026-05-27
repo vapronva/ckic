@@ -23,6 +23,9 @@ type NamespaceAggregator struct {
 	mu                      sync.RWMutex
 	publishMu               sync.Mutex
 	nodePushMu              sync.Mutex
+	inFlightVersion         uint64
+	pendingVersion          uint64
+	pendingMerged           string
 	stateVersion            uint64
 	lastPushedVersion       uint64
 	lastPublishedVersion    uint64
@@ -244,15 +247,63 @@ func (a *NamespaceAggregator) pushSnapshotToNodes(
 	snapshot updateSnapshot,
 	operation string,
 ) {
-	a.nodePushMu.Lock()
-	if a.isStaleNodePush(snapshot.version) {
-		a.nodePushMu.Unlock()
+	if !a.enqueuePush(snapshot, false) {
 		logger.Debug().Msgf("Skipping stale node push for %s", operation)
-		return
 	}
-	a.recordNodePush(snapshot.version)
+}
+
+func (a *NamespaceAggregator) enqueuePush(snapshot updateSnapshot, force bool) bool {
+	a.nodePushMu.Lock()
+	if a.isStaleNodePush(snapshot.version, force) {
+		a.nodePushMu.Unlock()
+		return false
+	}
+	if a.inFlightVersion > 0 {
+		if snapshot.version > a.inFlightVersion &&
+			snapshot.version > a.pendingVersion {
+			a.pendingVersion = snapshot.version
+			a.pendingMerged = snapshot.merged
+		}
+		a.nodePushMu.Unlock()
+		return true
+	}
+	a.inFlightVersion = snapshot.version
 	a.nodePushMu.Unlock()
-	a.configUpdateHandler(snapshot.merged)
+	a.drainPushQueue(snapshot)
+	return true
+}
+
+func (a *NamespaceAggregator) drainPushQueue(initial updateSnapshot) {
+	defer func() {
+		a.nodePushMu.Lock()
+		if a.inFlightVersion != 0 {
+			a.inFlightVersion = 0
+			a.pendingVersion = 0
+			a.pendingMerged = ""
+		}
+		a.nodePushMu.Unlock()
+	}()
+	next := initial
+	for {
+		a.configUpdateHandler(next.merged)
+		a.recordNodePush(next.version)
+		a.nodePushMu.Lock()
+		if a.pendingVersion == 0 {
+			a.inFlightVersion = 0
+			a.nodePushMu.Unlock()
+			return
+		}
+		next = a.promotePendingLocked()
+		a.nodePushMu.Unlock()
+	}
+}
+
+func (a *NamespaceAggregator) promotePendingLocked() updateSnapshot {
+	next := updateSnapshot{version: a.pendingVersion, merged: a.pendingMerged}
+	a.inFlightVersion = a.pendingVersion
+	a.pendingVersion = 0
+	a.pendingMerged = ""
+	return next
 }
 
 func (a *NamespaceAggregator) isStaleMirrorPublish(version uint64) bool {
@@ -261,10 +312,16 @@ func (a *NamespaceAggregator) isStaleMirrorPublish(version uint64) bool {
 	return version < a.stateVersion || version <= a.lastPublishedVersion
 }
 
-func (a *NamespaceAggregator) isStaleNodePush(version uint64) bool {
+func (a *NamespaceAggregator) isStaleNodePush(version uint64, force bool) bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return version < a.stateVersion || version <= a.lastPushedVersion
+	if version < a.stateVersion {
+		return true
+	}
+	if force {
+		return version < a.lastPushedVersion
+	}
+	return version <= a.lastPushedVersion
 }
 
 func (a *NamespaceAggregator) recordMirrorPublish(version uint64) {
@@ -321,20 +378,20 @@ func (a *NamespaceAggregator) EnsureNodeSync() {
 			Msg("Forced node sync requested but no nodes available, skipping push")
 		return
 	}
-	a.nodePushMu.Lock()
 	a.mu.RLock()
 	version := a.stateVersion
 	merged := a.currentMergedLocked()
 	handler := a.configUpdateHandler
 	a.mu.RUnlock()
 	if handler == nil {
-		a.nodePushMu.Unlock()
 		return
 	}
-	a.recordNodePush(version)
-	a.nodePushMu.Unlock()
-	handler(merged)
-	logger.Info().Msg("Forced sync pushed current merged config to nodes")
+	if a.enqueuePush(updateSnapshot{version: version, merged: merged}, true) {
+		logger.Info().Msg("Forced sync queued current merged config for nodes")
+		return
+	}
+	logger.Debug().
+		Msg("Forced sync snapshot superseded by newer state; active dispatch will deliver")
 }
 
 func (a *NamespaceAggregator) publishMirrorConfigMap(mergedConfig string) error {

@@ -106,11 +106,14 @@ func (i *Instance) Delete(ctx context.Context) error {
 	); err != nil {
 		if apierrors.IsNotFound(err) {
 			logger.Debug().Msg("Caddy deployment already deleted")
+			DeleteLegacyPodDisruptionBudget(ctx, i.KubeClient, i, logger)
 			return nil
 		}
 		logger.Error().Err(err).Msg("Failed to delete Caddy deployment")
+		DeleteLegacyPodDisruptionBudget(ctx, i.KubeClient, i, logger)
 		return fmt.Errorf("failed to delete deployment %s: %w", i.DeploymentName, err)
 	}
 	logger.Info().Msg("Deleted Caddy deployment")
+	DeleteLegacyPodDisruptionBudget(ctx, i.KubeClient, i, logger)
 	return nil
 }
