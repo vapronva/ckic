@@ -130,7 +130,7 @@ func NewController(
 			EnvSecretKeys:    config.EnvSecretKeys,
 			DataVolumePVC:    config.DataVolumePVC,
 			ConfigVolumePVC:  config.ConfigVolumePVC,
-			ConfigMapName:    config.ConfigMapName,
+			ConfigMapName:    bootConfigMapName(config),
 			UseHostNetwork:   config.UseHostNetwork,
 			HTTPHostPort:     config.HTTPHostPort,
 			HTTPSHostPort:    config.HTTPSHostPort,
@@ -158,6 +158,13 @@ func NewController(
 	)
 	c.setupInformers()
 	return c, nil
+}
+
+func bootConfigMapName(config Config) string {
+	if config.ExternalPublishAggregated && config.ExternalAggregatedConfigName != "" {
+		return config.ExternalAggregatedConfigName
+	}
+	return config.ConfigMapName
 }
 
 func parseNamespaceSet(csv string) map[string]struct{} {

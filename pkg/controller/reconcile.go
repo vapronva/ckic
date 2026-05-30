@@ -11,7 +11,6 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 
 	"git.horse/vapronva/ckic/pkg/caddy"
-	"git.horse/vapronva/ckic/pkg/constants"
 )
 
 func (c *Controller) processNextItem(ctx context.Context) bool {
@@ -98,28 +97,13 @@ func (c *Controller) reconcileNode(ctx context.Context, nodeName string) error {
 
 func (c *Controller) deployOptionsForNode(nodeName string) caddy.DeployOptions {
 	opts := c.deployOpts
-	existing, err := c.deployLister.
-		Deployments(c.config.Namespace).
-		Get("caddy-" + nodeName)
-	if err != nil {
-		existing = nil
+	if c.config.PrePullImage {
+		existing, err := c.deployLister.
+			Deployments(c.config.Namespace).
+			Get("caddy-" + nodeName)
+		opts.PrePullImage = err != nil || caddyImageOf(existing) != c.config.CaddyImage
 	}
-	rolling := existing == nil || caddyImageOf(existing) != c.config.CaddyImage
-	opts.PrePullImage = c.config.PrePullImage && rolling
-	opts.ConfigMapName = c.mountConfigMapName(rolling, existing)
 	return opts
-}
-
-func (c *Controller) mountConfigMapName(rolling bool, existing *appsv1.Deployment) string {
-	if !rolling {
-		if current := caddyConfigMountOf(existing); current != "" {
-			return current
-		}
-	}
-	if c.config.ExternalPublishAggregated && c.config.ExternalAggregatedConfigName != "" {
-		return c.config.ExternalAggregatedConfigName
-	}
-	return c.config.ConfigMapName
 }
 
 func caddyImageOf(dep *appsv1.Deployment) string {
@@ -127,18 +111,6 @@ func caddyImageOf(dep *appsv1.Deployment) string {
 		return ""
 	}
 	return dep.Spec.Template.Spec.Containers[0].Image
-}
-
-func caddyConfigMountOf(dep *appsv1.Deployment) string {
-	if dep == nil {
-		return ""
-	}
-	for _, vol := range dep.Spec.Template.Spec.Volumes {
-		if vol.Name == constants.VolumeNameCaddyConfig && vol.ConfigMap != nil {
-			return vol.ConfigMap.Name
-		}
-	}
-	return ""
 }
 
 func (c *Controller) teardownNode(ctx context.Context, nodeName string) error {

@@ -40,7 +40,7 @@ flowchart LR
     Aggregator -->|"publish (SSA)"| MirrorCM
     Deployer -->|"apply objects (SSA)"| K8s
     K8s -->|"schedules"| Instances
-    MirrorCM -.->|"mounted at boot<br/>(new and rolling pods)"| Instances
+    MirrorCM -.->|"mounted at boot"| Instances
     Admin -->|"push via admin API"| Instances
     Deployer -.-> LB
     LB -->|"traffic"| Instances
