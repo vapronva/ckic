@@ -15,7 +15,6 @@ type Instance struct {
 	NodeName       string
 	Namespace      string
 	PodName        string
-	ServiceName    string
 	DeploymentName string
 	ExternalIPs    []string
 	KubeClient     kubernetes.Interface
@@ -30,12 +29,11 @@ func (i *Instance) Delete(ctx context.Context) error {
 		Str("node", i.NodeName).
 		Str("deployment", i.DeploymentName).
 		Logger()
-	i.deleteService(ctx, i.ServiceName, "ClusterIP", logger)
+	i.deleteService(ctx, i.DeploymentName, "ClusterIP", logger)
 	i.deleteService(ctx, i.LoadBalancerServiceName(), "LoadBalancer", logger)
 	err := i.KubeClient.AppsV1().Deployments(i.Namespace).Delete(
 		ctx, i.DeploymentName, metav1.DeleteOptions{},
 	)
-	DeleteLegacyPodDisruptionBudget(ctx, i.KubeClient, i, logger)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			logger.Debug().Msg("Caddy deployment already deleted")

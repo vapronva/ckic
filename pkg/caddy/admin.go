@@ -62,7 +62,6 @@ const (
 	configPushTimeout           = 30 * time.Second
 	caddyAPIInitialDelay        = 5 * time.Second
 	caddyAPIMaxDelay            = 600 * time.Second
-	caddyAPIReadyTimeout        = 5 * time.Minute
 	adminClientIdleConnsPerHost = 4
 	adminClientIdleTimeout      = 60 * time.Second
 	errorBodyLogMax             = 1024
@@ -204,14 +203,8 @@ func (i *Instance) UpdateConfig(
 			Err:      resolveErr,
 		}
 	}
-	readyCtx := ctx
-	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
-		var cancel context.CancelFunc
-		readyCtx, cancel = context.WithTimeout(ctx, caddyAPIReadyTimeout)
-		defer cancel()
-	}
 	if readyErr := waitForCaddyAPIReady(
-		readyCtx, adminURL, apiConfig, apiConfig.Readiness, caddyAPIInitialDelay,
+		ctx, adminURL, apiConfig, apiConfig.Readiness, caddyAPIInitialDelay,
 	); readyErr != nil {
 		return &ConfigurationFailedError{
 			NodeName: i.NodeName,
@@ -219,21 +212,10 @@ func (i *Instance) UpdateConfig(
 			Err:      readyErr,
 		}
 	}
-	req, reqErr := i.buildConfigUpdateRequest(
-		ctx,
-		adminURL,
-		configData,
-		apiConfig,
-		logger,
-	)
-	if reqErr != nil {
-		return &ConfigurationFailedError{
-			NodeName: i.NodeName,
-			Reason:   "failed to create HTTP request",
-			Err:      reqErr,
-		}
+	if validateErr := i.validateConfig(ctx, adminURL, configData, apiConfig, logger); validateErr != nil {
+		return validateErr
 	}
-	resp, doErr := apiConfig.ConfigPush.Do(req)
+	resp, doErr := i.postCaddyfile(ctx, apiConfig.ConfigPush, adminURL, configData, apiConfig)
 	if doErr != nil {
 		return &ConfigurationFailedError{
 			NodeName: i.NodeName,
@@ -258,7 +240,7 @@ func (i *Instance) UpdateConfig(
 		return &ConfigurationFailedError{
 			NodeName:   i.NodeName,
 			Reason:     "non-2xx response",
-			Err:        i.logConfigUpdateFailure(resp.StatusCode, body, logger),
+			Err:        i.logCaddyAPIFailure("/load", resp.StatusCode, body, logger),
 			StatusCode: resp.StatusCode,
 		}
 	}
@@ -273,7 +255,7 @@ func (i *Instance) resolveAdminURL(
 ) (string, error) {
 	switch method {
 	case CommunicationMethodClusterIP:
-		return clusterIPAdminURL(i.ServiceName, i.Namespace), nil
+		return clusterIPAdminURL(i.DeploymentName, i.Namespace), nil
 	case CommunicationMethodDirect:
 		return i.directAdminURL(ctx, logger)
 	case CommunicationMethodHostNetwork:
@@ -347,29 +329,75 @@ func nodeAddressByType(node *corev1.Node, addrType corev1.NodeAddressType) strin
 	return ""
 }
 
-func (i *Instance) buildConfigUpdateRequest(
+func (i *Instance) postCaddyfile(
 	ctx context.Context,
-	adminURL string,
-	configData string,
+	client *http.Client,
+	targetURL, configData string,
 	apiConfig *AdminAPIConfig,
-	logger zerolog.Logger,
-) (*http.Request, error) {
+) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(
-		ctx, http.MethodPost, adminURL, bytes.NewBufferString(configData),
+		ctx, http.MethodPost, targetURL, bytes.NewBufferString(configData),
 	)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "text/caddyfile")
-	if apiConfig == nil || apiConfig.OriginKey == "" {
-		return req, nil
+	if apiConfig != nil && apiConfig.OriginKey != "" {
+		req.Header.Set("Origin", adminOrigin(apiConfig.OriginKey))
 	}
-	req.Header.Set("Origin", adminOrigin(apiConfig.OriginKey))
-	logger.Debug().Msg("Added Origin header for admin API security")
-	return req, nil
+	return client.Do(req)
 }
 
-func (i *Instance) logConfigUpdateFailure(
+func (i *Instance) validateConfig(
+	ctx context.Context,
+	adminURL, configData string,
+	apiConfig *AdminAPIConfig,
+	logger zerolog.Logger,
+) error {
+	resp, err := i.postCaddyfile(
+		ctx, apiConfig.ConfigPush, adaptURL(adminURL), configData, apiConfig,
+	)
+	if err != nil {
+		return &ConfigurationFailedError{
+			NodeName: i.NodeName,
+			Reason:   "failed to send configuration for validation",
+			Err:      err,
+		}
+	}
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			logger.Warn().Err(closeErr).Msg("Failed to close validation response body")
+		}
+	}()
+	body, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		return &ConfigurationFailedError{
+			NodeName: i.NodeName,
+			Reason:   "failed to read validation response",
+			Err:      readErr,
+		}
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return &ConfigurationFailedError{
+			NodeName:   i.NodeName,
+			Reason:     "configuration rejected by /adapt",
+			Err:        i.logCaddyAPIFailure("/adapt", resp.StatusCode, body, logger),
+			StatusCode: resp.StatusCode,
+		}
+	}
+	logger.Debug().Msg("Configuration validated via /adapt")
+	return nil
+}
+
+func adaptURL(adminURL string) string {
+	if before, ok := strings.CutSuffix(adminURL, "/load"); ok {
+		return before + "/adapt"
+	}
+	return adminURL
+}
+
+func (i *Instance) logCaddyAPIFailure(
+	action string,
 	statusCode int,
 	body []byte,
 	logger zerolog.Logger,
@@ -378,10 +406,11 @@ func (i *Instance) logConfigUpdateFailure(
 	if len(truncated) > errorBodyLogMax {
 		truncated = truncated[:errorBodyLogMax]
 	}
-	err := fmt.Errorf("caddy returned status %d: %s", statusCode, string(truncated))
+	err := fmt.Errorf("caddy %s returned status %d: %s", action, statusCode, string(truncated))
 	logger.Error().
 		Err(err).
 		Int("status", statusCode).
-		Msg("Caddy configuration update failed")
+		Str("action", action).
+		Msg("Caddy admin API request failed")
 	return err
 }

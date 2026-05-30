@@ -17,8 +17,8 @@ flowchart LR
         Aggregator["<b><code>pkg/aggregator</code></b><br/>merge base + external <code>Caddyfile</code>s"]
         subgraph CaddyPkg["<b><code>pkg/caddy</code></b>"]
             direction TB
-            Deployer["<b>Deployer</b><br/>SSA <code>Deployment</code> and <code>Service</code> + image prepull"]
-            Admin["<b>Admin client</b><br/>push config via <code>/load</code>"]
+            Deployer["<b>Deployer</b><br/>SSA <code>Deployment</code> and <code>Service</code> + prepull on image change"]
+            Admin["<b>Admin client</b><br/>validate (<code>/adapt</code>) then push (<code>/load</code>)"]
         end
         Entry -->|"run <i>(leader only)</i>"| Reconciler
         Informers -->|"enqueue node and config keys"| Reconciler
@@ -40,6 +40,7 @@ flowchart LR
     Aggregator -->|"publish (SSA)"| MirrorCM
     Deployer -->|"apply objects (SSA)"| K8s
     K8s -->|"schedules"| Instances
+    MirrorCM -.->|"mounted at boot<br/>(new and rolling pods)"| Instances
     Admin -->|"push via admin API"| Instances
     Deployer -.-> LB
     LB -->|"traffic"| Instances

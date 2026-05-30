@@ -9,7 +9,6 @@ import (
 	"github.com/rs/zerolog/log"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	appsv1ac "k8s.io/client-go/applyconfigurations/apps/v1"
@@ -96,7 +95,6 @@ func EnsureCaddy(
 		NodeName:       nodeName,
 		Namespace:      opts.Namespace,
 		DeploymentName: deploymentName,
-		ServiceName:    deploymentName,
 		ExternalIPs:    externalIPs,
 		KubeClient:     opts.Clientset,
 	}
@@ -141,7 +139,7 @@ func applyCaddyServices(
 	if _, err := opts.Clientset.CoreV1().
 		Services(instance.Namespace).
 		Apply(ctx, clusterIPServiceApplyConfig(instance), applyOptions()); err != nil {
-		return fmt.Errorf("failed to apply service %s: %w", instance.ServiceName, err)
+		return fmt.Errorf("failed to apply service %s: %w", instance.DeploymentName, err)
 	}
 	if opts.LoadBalancerMode != LoadBalancerModeCilium {
 		return nil
@@ -426,7 +424,7 @@ func clusterIPServiceApplyConfig(instance *Instance) *corev1ac.ServiceApplyConfi
 		WithPort(int32(constants.CaddyAdminPort)).
 		WithTargetPort(intstr.FromInt32(int32(constants.CaddyAdminPort))).
 		WithProtocol(corev1.ProtocolTCP)
-	return corev1ac.Service(instance.ServiceName, instance.Namespace).
+	return corev1ac.Service(instance.DeploymentName, instance.Namespace).
 		WithLabels(managedLabels(instance.NodeName)).
 		WithSpec(
 			corev1ac.ServiceSpec().
@@ -529,22 +527,4 @@ func SelectNewestActivePodName(pods []corev1.Pod) (string, bool) {
 		return "", false
 	}
 	return selected.Name, true
-}
-
-func DeleteLegacyPodDisruptionBudget(
-	ctx context.Context,
-	clientset kubernetes.Interface,
-	instance *Instance,
-	logger zerolog.Logger,
-) {
-	err := clientset.PolicyV1().
-		PodDisruptionBudgets(instance.Namespace).
-		Delete(ctx, instance.DeploymentName, metav1.DeleteOptions{})
-	switch {
-	case err == nil:
-		logger.Info().Msg("Deleted legacy PodDisruptionBudget")
-	case apierrors.IsNotFound(err):
-	default:
-		logger.Warn().Err(err).Msg("Failed to delete legacy PodDisruptionBudget")
-	}
 }

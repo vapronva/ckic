@@ -331,7 +331,7 @@ func (c *Controller) Run(ctx context.Context) error {
 		return errors.New("failed to sync informer caches")
 	}
 	logger.Info().Msg("Caches synced; starting reconcile workers")
-	c.sweepLegacyPodDisruptionBudgets(ctx, logger)
+	c.publishInitialMirror(ctx, logger)
 	c.enqueueExistingDeployments(logger)
 	c.queue.Add(configReconcileKey)
 	var wg sync.WaitGroup
@@ -368,26 +368,24 @@ func (c *Controller) runConfigResync(stopCh <-chan struct{}) {
 	}
 }
 
-func (c *Controller) sweepLegacyPodDisruptionBudgets(
-	ctx context.Context,
-	logger zerolog.Logger,
-) {
-	deployments, err := c.deployLister.Deployments(c.config.Namespace).List(
-		labels.SelectorFromSet(labels.Set{
-			constants.LabelCaddyManaged: constants.LabelManagedValue,
-		}),
-	)
-	if err != nil {
-		logger.Warn().Err(err).Msg("Failed to list deployments for legacy PDB cleanup")
+func (c *Controller) publishInitialMirror(ctx context.Context, logger zerolog.Logger) {
+	if !c.config.ExternalPublishAggregated {
 		return
 	}
-	for _, dep := range deployments {
-		caddy.DeleteLegacyPodDisruptionBudget(
-			ctx,
-			c.clientset,
-			&caddy.Instance{Namespace: c.config.Namespace, DeploymentName: dep.Name},
-			logger,
-		)
+	cm, err := c.clientset.CoreV1().
+		ConfigMaps(c.config.Namespace).
+		Get(ctx, c.config.ConfigMapName, metav1.GetOptions{})
+	switch {
+	case err == nil:
+		if data, ok := cm.Data[constants.CaddyfileKey]; ok {
+			c.aggregator.UpdateBase(data)
+		}
+	case apierrors.IsNotFound(err):
+	default:
+		logger.Warn().Err(err).Msg("Failed to read base ConfigMap for initial mirror")
+	}
+	if pubErr := c.aggregator.PublishMirror(ctx); pubErr != nil {
+		logger.Warn().Err(pubErr).Msg("Failed to publish initial mirror ConfigMap")
 	}
 }
 

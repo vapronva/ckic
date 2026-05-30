@@ -7,9 +7,11 @@ import (
 	"errors"
 
 	"github.com/rs/zerolog/log"
+	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/labels"
 
 	"git.horse/vapronva/ckic/pkg/caddy"
+	"git.horse/vapronva/ckic/pkg/constants"
 )
 
 func (c *Controller) processNextItem(ctx context.Context) bool {
@@ -74,7 +76,7 @@ func (c *Controller) reconcileNode(ctx context.Context, nodeName string) error {
 	}
 	instance, err := c.deployFn(
 		ctx,
-		c.deployOpts,
+		c.deployOptionsForNode(nodeName),
 		nodeName,
 		c.config.ExternalEndpoints[nodeName],
 	)
@@ -94,12 +96,56 @@ func (c *Controller) reconcileNode(ctx context.Context, nodeName string) error {
 	return nil
 }
 
+func (c *Controller) deployOptionsForNode(nodeName string) caddy.DeployOptions {
+	opts := c.deployOpts
+	existing, err := c.deployLister.
+		Deployments(c.config.Namespace).
+		Get("caddy-" + nodeName)
+	if err != nil {
+		existing = nil
+	}
+	rolling := existing == nil || caddyImageOf(existing) != c.config.CaddyImage
+	opts.PrePullImage = c.config.PrePullImage && rolling
+	opts.ConfigMapName = c.mountConfigMapName(rolling, existing)
+	return opts
+}
+
+func (c *Controller) mountConfigMapName(rolling bool, existing *appsv1.Deployment) string {
+	if !rolling {
+		if current := caddyConfigMountOf(existing); current != "" {
+			return current
+		}
+	}
+	if c.config.ExternalPublishAggregated && c.config.ExternalAggregatedConfigName != "" {
+		return c.config.ExternalAggregatedConfigName
+	}
+	return c.config.ConfigMapName
+}
+
+func caddyImageOf(dep *appsv1.Deployment) string {
+	if dep == nil || len(dep.Spec.Template.Spec.Containers) == 0 {
+		return ""
+	}
+	return dep.Spec.Template.Spec.Containers[0].Image
+}
+
+func caddyConfigMountOf(dep *appsv1.Deployment) string {
+	if dep == nil {
+		return ""
+	}
+	for _, vol := range dep.Spec.Template.Spec.Volumes {
+		if vol.Name == constants.VolumeNameCaddyConfig && vol.ConfigMap != nil {
+			return vol.ConfigMap.Name
+		}
+	}
+	return ""
+}
+
 func (c *Controller) teardownNode(ctx context.Context, nodeName string) error {
 	instance := &caddy.Instance{
 		NodeName:       nodeName,
 		Namespace:      c.config.Namespace,
 		DeploymentName: "caddy-" + nodeName,
-		ServiceName:    "caddy-" + nodeName,
 		KubeClient:     c.clientset,
 	}
 	if err := instance.Delete(ctx); err != nil {
@@ -122,13 +168,13 @@ func (c *Controller) maybeRedeploy(
 	if errors.As(pushErr, &cfgErr) && cfgErr.IsPermanent() {
 		return
 	}
-	if c.queue.NumRequeues(nodeName) < maxPushFailures {
+	if c.queue.NumRequeues(nodeName) != maxPushFailures {
 		return
 	}
 	log.Warn().
 		Str("node", nodeName).
 		Int("failures", c.queue.NumRequeues(nodeName)).
-		Msg("Too many config-push failures; redeploying Caddy instance")
+		Msg("Config-push failure threshold reached; redeploying Caddy instance once")
 	if err := instance.Delete(ctx); err != nil {
 		log.Error().
 			Err(err).

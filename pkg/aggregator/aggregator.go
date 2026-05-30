@@ -3,7 +3,6 @@ package aggregator
 import (
 	"context"
 	"fmt"
-	"maps"
 	"sort"
 	"strings"
 	"sync"
@@ -67,19 +66,6 @@ func (a *Aggregator) SetExternal(source, fragment string) {
 	a.mu.Lock()
 	changed := a.externals[source] != fragment
 	a.externals[source] = fragment
-	a.mu.Unlock()
-	a.notifyIfChanged(changed)
-}
-
-func (a *Aggregator) SetExternalBatch(externals map[string]string) {
-	a.mu.Lock()
-	changed := false
-	for source, fragment := range externals {
-		if a.externals[source] != fragment {
-			changed = true
-		}
-	}
-	maps.Copy(a.externals, externals)
 	a.mu.Unlock()
 	a.notifyIfChanged(changed)
 }
