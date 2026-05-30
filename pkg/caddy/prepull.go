@@ -10,6 +10,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 
 	"git.horse/vapronva/ckic/pkg/constants"
@@ -111,43 +112,24 @@ func waitForImagePulled(
 	clientset kubernetes.Interface,
 	namespace, podName string,
 ) error {
-	deadlineCtx, cancel := context.WithTimeout(ctx, imagePrePullTimeout)
-	defer cancel()
-	for {
-		pod, err := clientset.CoreV1().
-			Pods(namespace).
-			Get(deadlineCtx, podName, metav1.GetOptions{})
-		if err != nil {
-			return fmt.Errorf("failed to get pre-pull pod: %w", err)
-		}
-		pulled, pullErr := prePullImagePresent(pod)
-		if pullErr != nil {
-			return pullErr
-		}
-		if pulled {
-			return nil
-		}
-		timer := time.NewTimer(imagePrePullPollDelay)
-		select {
-		case <-deadlineCtx.Done():
-			if !timer.Stop() {
-				<-timer.C
+	return wait.PollUntilContextTimeout(
+		ctx,
+		imagePrePullPollDelay,
+		imagePrePullTimeout,
+		true,
+		func(ctx context.Context) (bool, error) {
+			pod, err := clientset.CoreV1().
+				Pods(namespace).
+				Get(ctx, podName, metav1.GetOptions{})
+			if err != nil {
+				return false, fmt.Errorf("failed to get pre-pull pod: %w", err)
 			}
-			return fmt.Errorf(
-				"timed out waiting for image pre-pull: %w",
-				deadlineCtx.Err(),
-			)
-		case <-timer.C:
-		}
-	}
+			return prePullImagePresent(pod)
+		},
+	)
 }
 
 func prePullImagePresent(pod *corev1.Pod) (bool, error) {
-	switch pod.Status.Phase {
-	case corev1.PodSucceeded, corev1.PodRunning, corev1.PodFailed:
-		return true, nil
-	case corev1.PodPending, corev1.PodUnknown:
-	}
 	for _, status := range pod.Status.ContainerStatuses {
 		if status.State.Running != nil || status.State.Terminated != nil {
 			return true, nil
@@ -175,10 +157,20 @@ func prePullImagePresent(pod *corev1.Pod) (bool, error) {
 			"PreStartHookError",
 			"PostStartHookError",
 			"RunContainerError",
-			"StartError",
 			"CrashLoopBackOff":
 			return true, nil
 		}
+	}
+	switch pod.Status.Phase {
+	case corev1.PodSucceeded, corev1.PodRunning:
+		return true, nil
+	case corev1.PodFailed:
+		return false, fmt.Errorf(
+			"pre-pull pod failed before image pull (reason=%s): %s",
+			pod.Status.Reason,
+			pod.Status.Message,
+		)
+	case corev1.PodPending, corev1.PodUnknown:
 	}
 	return false, nil
 }

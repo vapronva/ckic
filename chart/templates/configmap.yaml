@@ -3,7 +3,7 @@ kind: ConfigMap
 apiVersion: v1
 
 metadata:
-  name: caddy-config
+  name: {{ .Values.config.configMapName }}
   labels:
     {{- include "ckic-manager.labels" . | nindent 4 }}
 

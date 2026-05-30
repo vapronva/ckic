@@ -2,33 +2,37 @@ package controller
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"maps"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
+	appsv1listers "k8s.io/client-go/listers/apps/v1"
+	corev1listers "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 
 	"git.horse/vapronva/ckic/pkg/aggregator"
 	"git.horse/vapronva/ckic/pkg/caddy"
 	"git.horse/vapronva/ckic/pkg/constants"
-	"git.horse/vapronva/ckic/pkg/handlers"
-	"git.horse/vapronva/ckic/pkg/state"
 	"git.horse/vapronva/ckic/pkg/utils"
-	"git.horse/vapronva/ckic/pkg/watcher"
 )
 
-type ControllerConfig struct {
+type Config struct {
 	NodeLabel                    string
 	ConfigMapName                string
-	ConfigMapNamespace           string
+	Namespace                    string
 	BootstrapDefaultConfig       bool
 	CommunicationMethod          caddy.CommunicationMethod
 	CaddyImage                   string
@@ -51,657 +55,400 @@ type ControllerConfig struct {
 	ExternalDenyNamespaces       string
 	ExternalPublishAggregated    bool
 	ExternalAggregatedConfigName string
+	ConfigResyncInterval         time.Duration
+}
+
+const (
+	configReconcileKey = "\x00config-reconcile"
+	workerCount        = 4
+	reconcileTimeout   = 2 * time.Minute
+	informerResync     = 10 * time.Minute
+	maxPushFailures    = 5
+	nsModeAll          = "all"
+	nsModeAllow        = "allow"
+	nsModeDeny         = "deny"
+)
+
+type pushRecord struct {
+	digest  string
+	podName string
 }
 
 type Controller struct {
-	clientset                kubernetes.Interface
-	config                   ControllerConfig
-	deployOpts               caddy.DeployOptions
-	nodeWatcher              *watcher.NodeWatcher
-	configWatcher            *watcher.ConfigWatcher
-	externalWatcher          *watcher.ExternalConfigWatcher
-	nodeHandler              *handlers.NodeHandler
-	configHandler            *handlers.ConfigHandler
-	deployedInstances        map[string]*caddy.Instance
-	instancesMutex           *sync.RWMutex
-	stateStore               *state.ConfigMapStateStore
-	coordinator              *WatcherCoordinator
-	aggregator               *aggregator.NamespaceAggregator
-	lastPersistedStateHashMu sync.Mutex
-	lastPersistedStateHash   [sha256.Size]byte
-	deployFn                 deployFunc
-}
-
-type deployFunc func(
-	ctx context.Context,
-	opts caddy.DeployOptions,
-	nodeName string,
-	externalIPs []string,
-) (*caddy.Instance, error)
-
-const (
-	nodeHandlerWorkerCount           = 4
-	configReconciliationInterval     = 5 * time.Minute
-	periodicStatePersistenceInterval = 2 * time.Minute
-	shutdownStatePersistTimeout      = 15 * time.Second
-)
-
-var errConfigMapMissingCaddyfile = errors.New("configmap missing Caddyfile key")
-
-type watcherBundle struct {
-	configWatcher   *watcher.ConfigWatcher
-	externalWatcher *watcher.ExternalConfigWatcher
-	agg             *aggregator.NamespaceAggregator
+	clientset         kubernetes.Interface
+	config            Config
+	deployOpts        caddy.DeployOptions
+	comm              caddy.CommunicationMethod
+	adminConfig       *caddy.AdminAPIConfig
+	aggregator        *aggregator.Aggregator
+	nodeSelector      labels.Selector
+	allowedNamespaces map[string]struct{}
+	deniedNamespaces  map[string]struct{}
+	nodeFactory       informers.SharedInformerFactory
+	nsFactory         informers.SharedInformerFactory
+	extFactory        informers.SharedInformerFactory
+	nodeLister        corev1listers.NodeLister
+	deployLister      appsv1listers.DeploymentLister
+	cacheSyncs        []cache.InformerSynced
+	queue             workqueue.TypedRateLimitingInterface[string]
+	pushMu            sync.Mutex
+	pushState         map[string]pushRecord
+	deployFn          func(context.Context, caddy.DeployOptions, string, []string) (*caddy.Instance, error)
+	pushFn            func(context.Context, *caddy.Instance, string) error
 }
 
 func NewController(
 	clientset kubernetes.Interface,
-	config ControllerConfig,
+	config Config,
 ) (*Controller, error) {
-	deployedInstances, mutex, nodeAvailabilityCheck := newControllerState()
-	deployOpts := caddy.DeployOptions{
-		Clientset:        clientset,
-		Namespace:        config.ConfigMapNamespace,
-		CaddyImage:       config.CaddyImage,
-		ImagePullPolicy:  corev1.PullPolicy(config.ImagePullPolicy),
-		PrePullImage:     config.PrePullImage,
-		LoadBalancerMode: config.LoadBalancerMode,
-		EnvSecretName:    config.EnvSecretName,
-		EnvSecretKeys:    config.EnvSecretKeys,
-		DataVolumePVC:    config.DataVolumePVC,
-		ConfigVolumePVC:  config.ConfigVolumePVC,
-		ConfigMapName:    config.ConfigMapName,
-		UseHostNetwork:   config.UseHostNetwork,
-		HTTPHostPort:     config.HTTPHostPort,
-		HTTPSHostPort:    config.HTTPSHostPort,
-	}
-	nodeHandler := handlers.NewNodeHandler(
-		deployOpts,
-		deployedInstances,
-		mutex,
-		config.ExternalEndpoints,
-		nil,
-	)
-	nodeWatcher, err := watcher.NewNodeWatcher(
-		clientset,
-		config.NodeLabel,
-		nodeHandler.Handle,
-	)
+	normalized, selector, err := utils.NormalizeNodeLabelSelector(config.NodeLabel)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create node watcher: %w", err)
+		return nil, err
 	}
-	configHandler := handlers.NewConfigHandler(
-		deployOpts,
-		config.CommunicationMethod,
-		config.CaddyAdminOriginKey,
-		config.ExternalEndpoints,
-		deployedInstances,
-		mutex,
-		nodeHandler,
+	config.NodeLabel = normalized
+	if config.ExternalEnable {
+		switch config.ExternalNsMode {
+		case nsModeAll, nsModeAllow, nsModeDeny:
+		default:
+			return nil, fmt.Errorf(
+				"invalid external namespace mode %q (want all, allow, or deny)",
+				config.ExternalNsMode,
+			)
+		}
+	}
+	c := &Controller{
+		clientset: clientset,
+		config:    config,
+		deployOpts: caddy.DeployOptions{
+			Clientset:        clientset,
+			Namespace:        config.Namespace,
+			CaddyImage:       config.CaddyImage,
+			ImagePullPolicy:  corev1.PullPolicy(config.ImagePullPolicy),
+			PrePullImage:     config.PrePullImage,
+			LoadBalancerMode: config.LoadBalancerMode,
+			EnvSecretName:    config.EnvSecretName,
+			EnvSecretKeys:    config.EnvSecretKeys,
+			DataVolumePVC:    config.DataVolumePVC,
+			ConfigVolumePVC:  config.ConfigVolumePVC,
+			ConfigMapName:    config.ConfigMapName,
+			UseHostNetwork:   config.UseHostNetwork,
+			HTTPHostPort:     config.HTTPHostPort,
+			HTTPSHostPort:    config.HTTPSHostPort,
+		},
+		comm:              config.CommunicationMethod,
+		adminConfig:       caddy.NewAdminAPIConfig(config.CaddyAdminOriginKey),
+		nodeSelector:      selector,
+		allowedNamespaces: parseNamespaceSet(config.ExternalAllowNamespaces),
+		deniedNamespaces:  parseNamespaceSet(config.ExternalDenyNamespaces),
+		pushState:         make(map[string]pushRecord),
+		deployFn:          caddy.EnsureCaddy,
+	}
+	c.pushFn = func(ctx context.Context, instance *caddy.Instance, merged string) error {
+		return instance.UpdateConfig(ctx, merged, c.comm, c.adminConfig)
+	}
+	c.queue = workqueue.NewTypedRateLimitingQueue(
+		workqueue.DefaultTypedControllerRateLimiter[string](),
 	)
-	watchers := buildWatcherBundle(
+	c.aggregator = aggregator.New(
 		clientset,
-		config,
-		configHandler,
-		nodeAvailabilityCheck,
-	)
-	coordinator := NewWatcherCoordinator(
-		watchers.configWatcher,
-		deployedInstances,
-		mutex,
-	)
-	nodeHandler.SetNodeChangeNotifier(coordinator.NotifyNodeChange)
-	stateStore := state.NewConfigMapStateStore(
-		clientset,
-		config.ConfigMapNamespace,
-		constants.StateConfigMapName,
-	)
-	ctrl := &Controller{
-		clientset:         clientset,
-		config:            config,
-		deployOpts:        deployOpts,
-		nodeWatcher:       nodeWatcher,
-		configWatcher:     watchers.configWatcher,
-		externalWatcher:   watchers.externalWatcher,
-		nodeHandler:       nodeHandler,
-		configHandler:     configHandler,
-		deployedInstances: deployedInstances,
-		instancesMutex:    mutex,
-		stateStore:        stateStore,
-		coordinator:       coordinator,
-		aggregator:        watchers.agg,
-		deployFn:          caddy.DeployCaddy,
-	}
-	return ctrl, nil
-}
-
-func newControllerState() (
-	map[string]*caddy.Instance,
-	*sync.RWMutex,
-	func() bool,
-) {
-	deployedInstances := make(map[string]*caddy.Instance)
-	mutex := &sync.RWMutex{}
-	nodeAvailabilityCheck := func() bool {
-		mutex.RLock()
-		defer mutex.RUnlock()
-		return len(deployedInstances) > 0
-	}
-	return deployedInstances, mutex, nodeAvailabilityCheck
-}
-
-func buildWatcherBundle(
-	clientset kubernetes.Interface,
-	config ControllerConfig,
-	configHandler *handlers.ConfigHandler,
-	nodeAvailabilityCheck func() bool,
-) watcherBundle {
-	bundle := watcherBundle{}
-	if !config.ExternalEnable {
-		bundle.configWatcher = watcher.NewConfigWatcher(
-			clientset,
-			config.ConfigMapNamespace,
-			config.ConfigMapName,
-			configHandler.Handle,
-			nodeAvailabilityCheck,
-			config.BootstrapDefaultConfig,
-		)
-		return bundle
-	}
-	bundle.agg = aggregator.NewNamespaceAggregator(
-		clientset,
-		config.ConfigMapNamespace,
+		config.Namespace,
 		config.ExternalPublishAggregated,
 		config.ExternalAggregatedConfigName,
-		configHandler.Handle,
-		nodeAvailabilityCheck,
+		func() { c.queue.Add(configReconcileKey) },
 	)
-	bundle.configWatcher = watcher.NewConfigWatcher(
-		clientset,
-		config.ConfigMapNamespace,
-		config.ConfigMapName,
-		bundle.agg.UpdateBase,
-		nodeAvailabilityCheck,
-		config.BootstrapDefaultConfig,
+	c.setupInformers()
+	return c, nil
+}
+
+func parseNamespaceSet(csv string) map[string]struct{} {
+	set := make(map[string]struct{})
+	for ns := range strings.SplitSeq(csv, ",") {
+		if ns = strings.TrimSpace(ns); ns != "" {
+			set[ns] = struct{}{}
+		}
+	}
+	return set
+}
+
+func (c *Controller) setupInformers() {
+	c.nodeFactory = informers.NewSharedInformerFactory(c.clientset, informerResync)
+	c.nsFactory = informers.NewSharedInformerFactoryWithOptions(
+		c.clientset, informerResync, informers.WithNamespace(c.config.Namespace),
 	)
-	bundle.configWatcher.SetForceSyncHandler(bundle.agg.EnsureNodeSync)
-	bundle.externalWatcher = watcher.NewExternalConfigWatcher(
-		clientset,
-		config.ConfigMapNamespace,
-		config.ConfigMapName,
-		config.ExternalLabel,
-		config.ExternalNsMode,
-		config.ExternalAllowNamespaces,
-		config.ExternalDenyNamespaces,
-		bundle.agg.SetExternal,
-		bundle.agg.RemoveExternal,
+	nodeInformer := c.nodeFactory.Core().V1().Nodes()
+	cmInformer := c.nsFactory.Core().V1().ConfigMaps()
+	deployInformer := c.nsFactory.Apps().V1().Deployments()
+	c.nodeLister = nodeInformer.Lister()
+	c.deployLister = deployInformer.Lister()
+	c.addNodeHandler(nodeInformer.Informer())
+	c.addBaseConfigMapHandler(cmInformer.Informer())
+	c.addDeploymentHandler(deployInformer.Informer())
+	c.cacheSyncs = []cache.InformerSynced{
+		nodeInformer.Informer().HasSynced,
+		cmInformer.Informer().HasSynced,
+		deployInformer.Informer().HasSynced,
+	}
+	if !c.config.ExternalEnable {
+		return
+	}
+	label := c.config.ExternalLabel
+	c.extFactory = informers.NewSharedInformerFactoryWithOptions(
+		c.clientset, informerResync,
+		informers.WithTweakListOptions(func(opts *metav1.ListOptions) {
+			opts.LabelSelector = label
+		}),
 	)
-	return bundle
+	extInformer := c.extFactory.Core().V1().ConfigMaps()
+	c.addExternalConfigMapHandler(extInformer.Informer())
+	c.cacheSyncs = append(c.cacheSyncs, extInformer.Informer().HasSynced)
+}
+
+func (c *Controller) addNodeHandler(informer cache.SharedIndexInformer) {
+	enqueueIfManaged := func(node *corev1.Node) {
+		if c.nodeSelector.Matches(labels.Set(node.Labels)) {
+			c.queue.Add(node.Name)
+		}
+	}
+	_, _ = informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj any) {
+			if node, ok := obj.(*corev1.Node); ok {
+				enqueueIfManaged(node)
+			}
+		},
+		UpdateFunc: func(oldObj, newObj any) {
+			oldNode, ok1 := oldObj.(*corev1.Node)
+			newNode, ok2 := newObj.(*corev1.Node)
+			if !ok2 {
+				return
+			}
+			if (ok1 && c.nodeSelector.Matches(labels.Set(oldNode.Labels))) ||
+				c.nodeSelector.Matches(labels.Set(newNode.Labels)) {
+				c.queue.Add(newNode.Name)
+			}
+		},
+		DeleteFunc: func(obj any) {
+			if node, ok := tombstone[*corev1.Node](obj); ok {
+				c.queue.Add(node.Name)
+			}
+		},
+	})
+}
+
+func (c *Controller) addBaseConfigMapHandler(informer cache.SharedIndexInformer) {
+	handle := func(obj any) {
+		cm, ok := obj.(*corev1.ConfigMap)
+		if !ok || cm.Name != c.config.ConfigMapName {
+			return
+		}
+		if data, exists := cm.Data[constants.CaddyfileKey]; exists {
+			c.aggregator.UpdateBase(data)
+		}
+	}
+	_, _ = informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    handle,
+		UpdateFunc: func(_, newObj any) { handle(newObj) },
+		DeleteFunc: func(obj any) {
+			if cm, ok := tombstone[*corev1.ConfigMap](obj); ok &&
+				cm.Name == c.config.ConfigMapName {
+				log.Warn().
+					Str("configmap", cm.Name).
+					Msg("Base ConfigMap deleted; keeping last known configuration")
+			}
+		},
+	})
+}
+
+func (c *Controller) addExternalConfigMapHandler(informer cache.SharedIndexInformer) {
+	upsert := func(obj any) {
+		cm, ok := obj.(*corev1.ConfigMap)
+		if !ok || !c.namespaceAllowed(cm.Namespace) {
+			return
+		}
+		source := cm.Namespace + "/" + cm.Name
+		if fragment, exists := cm.Data[constants.CaddyfileKey]; exists {
+			c.aggregator.SetExternal(source, fragment)
+		} else {
+			c.aggregator.RemoveExternal(source)
+		}
+	}
+	_, _ = informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    upsert,
+		UpdateFunc: func(_, newObj any) { upsert(newObj) },
+		DeleteFunc: func(obj any) {
+			if cm, ok := tombstone[*corev1.ConfigMap](obj); ok {
+				c.aggregator.RemoveExternal(cm.Namespace + "/" + cm.Name)
+			}
+		},
+	})
+}
+
+func (c *Controller) addDeploymentHandler(informer cache.SharedIndexInformer) {
+	_, _ = informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		DeleteFunc: func(obj any) {
+			dep, ok := tombstone[*appsv1.Deployment](obj)
+			if !ok ||
+				dep.Labels[constants.LabelCaddyManaged] != constants.LabelManagedValue {
+				return
+			}
+			if node := dep.Labels[constants.LabelInstance]; node != "" {
+				c.queue.Add(node)
+			}
+		},
+	})
+}
+
+func (c *Controller) namespaceAllowed(namespace string) bool {
+	if namespace == c.config.Namespace {
+		return false
+	}
+	switch c.config.ExternalNsMode {
+	case nsModeAll:
+		return true
+	case nsModeAllow:
+		_, ok := c.allowedNamespaces[namespace]
+		return ok
+	case nsModeDeny:
+		_, denied := c.deniedNamespaces[namespace]
+		return !denied
+	default:
+		return false
+	}
 }
 
 func (c *Controller) Run(ctx context.Context) error {
-	c.configHandler.Attach(ctx)
-	if c.aggregator != nil {
-		c.aggregator.Attach(ctx)
-	}
-	if err := c.ReconcileState(ctx); err != nil {
-		log.Error().Err(err).Msg("Reconciliation failed")
+	logger := log.With().Str("component", "controller").Logger()
+	if err := c.bootstrapBaseConfig(ctx, logger); err != nil {
 		return err
 	}
-	c.nodeHandler.StartWorkerPool(ctx, nodeHandlerWorkerCount)
-	go c.nodeWatcher.Start(ctx)
-	go c.configWatcher.Start(ctx)
-	if c.config.ExternalEnable && c.externalWatcher != nil {
-		log.Info().Msg("Starting external ConfigMap watcher")
-		go c.externalWatcher.Start(ctx)
+	stopCh := ctx.Done()
+	c.nodeFactory.Start(stopCh)
+	c.nsFactory.Start(stopCh)
+	if c.extFactory != nil {
+		c.extFactory.Start(stopCh)
 	}
-	go c.runPeriodicConfigReconciliation(ctx)
-	go c.runPeriodicStatePersistence(ctx)
-	<-ctx.Done()
-	log.Info().Msg("Controller shutting down")
-	c.persistStateOnShutdown()
-	return nil
-}
-
-func (c *Controller) ReconcileState(ctx context.Context) error {
-	logger := log.With().Str("component", "reconcile").Logger()
-	logger.Info().Msg("Starting reconciliation process")
-	eligibleNodes, nodeSelector, err := c.listEligibleNodes(ctx)
-	if err != nil {
-		return err
+	logger.Info().Msg("Waiting for informer caches to sync")
+	if !cache.WaitForCacheSync(stopCh, c.cacheSyncs...) {
+		return errors.New("failed to sync informer caches")
 	}
-	discovered, err := c.discoverManagedDeployments(
-		ctx,
-		eligibleNodes,
-		nodeSelector,
-		logger,
-	)
-	if err != nil {
-		return err
-	}
-	c.reconcileDiscoveredDeployments(ctx, discovered)
-	c.mergeSavedState(ctx, discovered, logger)
-	c.replaceAndPersistState(ctx, discovered, logger)
-	c.initializeConfiguration(ctx, logger)
-	logger.Info().Msg("Reconciliation process completed")
-	return nil
-}
-
-func (c *Controller) listEligibleNodes(
-	ctx context.Context,
-) (map[string]struct{}, string, error) {
-	nodeSelector, err := watcher.NormalizeNodeLabelSelector(c.config.NodeLabel)
-	if err != nil {
-		return nil, "", fmt.Errorf(
-			"invalid node label selector for reconciliation: %w",
-			err,
-		)
-	}
-	nodes, err := c.clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{
-		LabelSelector: nodeSelector,
-	})
-	if err != nil {
-		return nil, "", fmt.Errorf(
-			"failed to list nodes for reconciliation selector %q: %w",
-			nodeSelector,
-			err,
-		)
-	}
-	eligibleNodes := make(map[string]struct{}, len(nodes.Items))
-	for _, node := range nodes.Items {
-		eligibleNodes[node.Name] = struct{}{}
-	}
-	return eligibleNodes, nodeSelector, nil
-}
-
-func (c *Controller) discoverManagedDeployments(
-	ctx context.Context,
-	eligibleNodes map[string]struct{},
-	nodeSelector string,
-	logger zerolog.Logger,
-) (map[string]*caddy.Instance, error) {
-	discovered := make(map[string]*caddy.Instance)
-	deployments, err := c.clientset.AppsV1().
-		Deployments(c.config.ConfigMapNamespace).
-		List(ctx, metav1.ListOptions{
-			LabelSelector: constants.ManagedLabelSelector,
-		})
-	if err != nil {
-		return nil, fmt.Errorf("failed to list deployments for reconciliation: %w", err)
-	}
-	for _, dep := range deployments.Items {
-		nodeName, ok := dep.Labels[constants.LabelInstance]
-		if !ok || nodeName == "" {
-			logger.Warn().Msg("Deployment missing instance label, skipping")
-			continue
-		}
-		instance := &caddy.Instance{
-			NodeName:       nodeName,
-			Namespace:      c.config.ConfigMapNamespace,
-			DeploymentName: dep.Name,
-			ServiceName:    dep.Name,
-			KubeClient:     c.clientset,
-		}
-		if _, matchesSelector := eligibleNodes[nodeName]; !matchesSelector {
-			c.deleteOutOfScopeDeployment(ctx, instance, nodeName, nodeSelector, logger)
-			continue
-		}
-		c.attachPodNameForAdoptedDeployment(ctx, nodeName, instance, logger)
-		discovered[nodeName] = instance
-		c.logAdoptedDeployment(dep.Status.ReadyReplicas > 0, nodeName, logger)
-	}
-	return discovered, nil
-}
-
-func (c *Controller) deleteOutOfScopeDeployment(
-	ctx context.Context,
-	instance *caddy.Instance,
-	nodeName, nodeSelector string,
-	logger zerolog.Logger,
-) {
-	logger.Warn().
-		Str("node", nodeName).
-		Str("selector", nodeSelector).
-		Msg("Deleting managed deployment outside NodeLabel selector scope")
-	if err := instance.Delete(ctx); err != nil {
-		logger.Error().
-			Err(err).
-			Msgf("Failed to delete orphaned deployment on node %s", nodeName)
-		return
-	}
-	logger.Info().Msgf("Deleted orphaned deployment on node %s", nodeName)
-}
-
-func (c *Controller) attachPodNameForAdoptedDeployment(
-	ctx context.Context,
-	nodeName string,
-	instance *caddy.Instance,
-	logger zerolog.Logger,
-) {
-	podList, err := c.clientset.CoreV1().
-		Pods(c.config.ConfigMapNamespace).
-		List(ctx, metav1.ListOptions{
-			LabelSelector: constants.InstanceLabelSelector(nodeName),
-		})
-	if err != nil {
-		logger.Warn().
-			Err(err).
-			Msgf("Failed to list pods while adopting deployment on node %s", nodeName)
-		return
-	}
-	if len(podList.Items) == 0 {
-		logger.Debug().
-			Str("node", nodeName).
-			Msg("No pods found yet for managed deployment; adopting transitional deployment")
-		return
-	}
-	if podName, selected := caddy.SelectNewestActivePodName(podList.Items); selected {
-		instance.PodName = podName
-		return
-	}
-	logger.Debug().
-		Str("node", nodeName).
-		Msg("Only terminating pods found for managed deployment; adopting transitional deployment")
-}
-
-func (c *Controller) logAdoptedDeployment(
-	healthy bool,
-	nodeName string,
-	logger zerolog.Logger,
-) {
-	if healthy {
-		logger.Info().Msgf("Adopted existing healthy deployment on node %s", nodeName)
-		return
-	}
-	logger.Info().Msgf("Adopted existing transitioning deployment on node %s", nodeName)
-}
-
-func (c *Controller) mergeSavedState(
-	ctx context.Context,
-	discovered map[string]*caddy.Instance,
-	logger zerolog.Logger,
-) {
-	savedState, err := c.stateStore.LoadState(ctx)
-	if err != nil {
-		logger.Warn().
-			Err(err).
-			Msg("Could not load saved state, proceeding with discovered state")
-	}
-	var restored int
-	for node := range discovered {
-		savedInst, exists := savedState[node]
-		if !exists || savedInst == nil {
-			continue
-		}
-		if savedInst.FailureCount.Load() > 0 {
-			discovered[node].FailureCount.Store(savedInst.FailureCount.Load())
-			restored++
-			logger.Debug().
-				Str("node", node).
-				Int32("failureCount", savedInst.FailureCount.Load()).
-				Msg("Restored FailureCount from saved state")
-		}
-	}
-	logger.Info().
-		Int("restored", restored).
-		Msg("Merged saved state failure counts into discovered state")
-}
-
-func (c *Controller) replaceAndPersistState(
-	ctx context.Context,
-	discovered map[string]*caddy.Instance,
-	logger zerolog.Logger,
-) {
-	c.instancesMutex.Lock()
-	clear(c.deployedInstances)
-	maps.Copy(c.deployedInstances, discovered)
-	instancesCopy := make(map[string]*caddy.Instance, len(c.deployedInstances))
-	maps.Copy(instancesCopy, c.deployedInstances)
-	c.instancesMutex.Unlock()
-	c.lastPersistedStateHashMu.Lock()
-	defer c.lastPersistedStateHashMu.Unlock()
-	data, saveErr := c.stateStore.SaveState(ctx, instancesCopy)
-	if saveErr != nil {
-		logger.Error().Err(saveErr).Msg("Failed to persist state")
-		return
-	}
-	c.lastPersistedStateHash = sha256.Sum256(data)
-}
-
-func (c *Controller) initializeConfiguration(ctx context.Context, logger zerolog.Logger) {
-	if c.config.ExternalEnable {
-		c.initializeExternalConfiguration(ctx, logger)
-		return
-	}
-	if c.deployedInstanceCount() == 0 {
-		return
-	}
-	logger.Info().Msg("Pushing initial configuration to discovered instances")
-	configData, err := c.loadConfigData(ctx)
-	if err != nil {
-		c.logConfigLoadError(err, logger, "initial config push")
-		return
-	}
-	c.configHandler.Handle(configData)
-}
-
-func (c *Controller) initializeExternalConfiguration(
-	ctx context.Context,
-	logger zerolog.Logger,
-) {
-	if c.aggregator == nil {
-		logger.Error().
-			Msg("External aggregation enabled but aggregator is nil, skipping initial config setup")
-		return
-	}
-	c.loadExternalBatch(ctx, c.aggregator, logger)
-	configData, err := c.loadConfigData(ctx)
-	if err != nil {
-		c.logConfigLoadError(err, logger, "initial config push")
-	} else {
-		c.aggregator.UpdateBase(configData)
-	}
-	c.aggregator.MarkInitialized()
-	if c.deployedInstanceCount() > 0 {
-		logger.Info().Msg("Initial configuration pushed to discovered instances")
-		return
-	}
-	logger.Info().Msg("Aggregator initialized (no instances to push to yet)")
-}
-
-func (c *Controller) loadExternalBatch(
-	ctx context.Context,
-	agg *aggregator.NamespaceAggregator,
-	logger zerolog.Logger,
-) {
-	if c.externalWatcher == nil {
-		return
-	}
-	externals, err := c.externalWatcher.InitialListBatch(ctx)
-	if err != nil {
-		logger.Error().Err(err).Msg("Failed to batch load external ConfigMaps")
-		return
-	}
-	if len(externals) > 0 {
-		agg.SetExternalBatch(externals)
-	}
-}
-
-func (c *Controller) deployedInstanceCount() int {
-	c.instancesMutex.RLock()
-	defer c.instancesMutex.RUnlock()
-	return len(c.deployedInstances)
-}
-
-func (c *Controller) loadConfigData(ctx context.Context) (string, error) {
-	configMap, err := c.clientset.CoreV1().
-		ConfigMaps(c.config.ConfigMapNamespace).
-		Get(ctx, c.config.ConfigMapName, metav1.GetOptions{})
-	if err != nil {
-		return "", err
-	}
-	configData, exists := configMap.Data[constants.CaddyfileKey]
-	if !exists {
-		return "", errConfigMapMissingCaddyfile
-	}
-	return configData, nil
-}
-
-func (c *Controller) logConfigLoadError(
-	err error,
-	logger zerolog.Logger,
-	contextName string,
-) {
-	if errors.Is(err, errConfigMapMissingCaddyfile) {
-		logger.Warn().
-			Msgf("ConfigMap missing Caddyfile key, skipping %s", contextName)
-		return
-	}
-	logger.Error().
-		Err(err).
-		Msgf("Failed to get ConfigMap for %s", contextName)
-}
-
-func (c *Controller) reconcileDiscoveredDeployments(
-	ctx context.Context,
-	discovered map[string]*caddy.Instance,
-) {
-	logger := log.With().Str("component", "reconcile").Logger()
-	deployFn := c.deployFn
-	if deployFn == nil {
-		deployFn = caddy.DeployCaddy
-	}
-	for nodeName, adopted := range discovered {
-		reconciled, err := deployFn(
-			ctx,
-			c.deployOpts,
-			nodeName,
-			c.config.ExternalEndpoints[nodeName],
-		)
-		if err != nil {
-			logger.Error().
-				Err(err).
-				Str("node", nodeName).
-				Msg("Failed to reconcile adopted deployment, keeping discovered instance")
-			continue
-		}
-		discovered[nodeName] = reconciled
-		if adopted == nil || adopted.PodName != reconciled.PodName {
-			logger.Info().Msgf("Reconciled adopted deployment on node %s", nodeName)
-			continue
-		}
-		logger.Debug().
-			Str("node", nodeName).
-			Msg("Adopted deployment already matches desired spec")
-	}
-}
-
-func (c *Controller) runPeriodicConfigReconciliation(ctx context.Context) {
-	ticker := time.NewTicker(configReconciliationInterval)
-	defer ticker.Stop()
-	logger := log.With().Str("component", "config_reconciliation").Logger()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			c.runPeriodicConfigReconciliationTick(ctx, logger)
-		}
-	}
-}
-
-func (c *Controller) runPeriodicConfigReconciliationTick(
-	ctx context.Context,
-	logger zerolog.Logger,
-) {
-	logger.Info().Msg("Performing periodic configuration reconciliation")
-	configData, err := c.loadConfigData(ctx)
-	if err != nil {
-		c.logConfigLoadError(err, logger, "reconciliation")
-		return
-	}
-	if !c.applyPeriodicConfigData(configData, logger) {
-		return
-	}
-	logger.Info().Msg("Periodic configuration reconciliation completed")
-}
-
-func (c *Controller) applyPeriodicConfigData(
-	configData string,
-	logger zerolog.Logger,
-) bool {
-	if !c.config.ExternalEnable {
-		c.configHandler.Handle(configData)
-		return true
-	}
-	if c.aggregator == nil {
-		logger.Error().
-			Msg("External aggregation enabled but aggregator is nil, skipping reconciliation to prevent configuration drift")
-		return false
-	}
-	c.aggregator.UpdateBase(configData)
-	return true
-}
-
-func (c *Controller) runPeriodicStatePersistence(ctx context.Context) {
-	ticker := time.NewTicker(periodicStatePersistenceInterval)
-	defer ticker.Stop()
-	logger := log.With().Str("component", "state_persistence").Logger()
-	logger.Info().Msg("Starting periodic state persistence (every 2 minutes)")
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if err := c.snapshotAndPersistState(ctx); err != nil {
-				logger.Error().
-					Err(err).
-					Msg("Failed to persist state during periodic save")
-			} else {
-				logger.Debug().Msg("Periodic state persistence completed")
+	logger.Info().Msg("Caches synced; starting reconcile workers")
+	c.sweepLegacyPodDisruptionBudgets(ctx, logger)
+	c.enqueueExistingDeployments(logger)
+	c.queue.Add(configReconcileKey)
+	var wg sync.WaitGroup
+	for range workerCount {
+		wg.Go(func() {
+			for c.processNextItem(ctx) {
 			}
+		})
+	}
+	if c.config.ConfigResyncInterval > 0 {
+		logger.Info().
+			Dur("interval", c.config.ConfigResyncInterval).
+			Msg("Periodic config re-push enabled")
+		wg.Go(func() { c.runConfigResync(stopCh) })
+	}
+	<-stopCh
+	logger.Info().Msg("Controller shutting down; draining workqueue")
+	c.queue.ShutDown()
+	wg.Wait()
+	logger.Info().Msg("Controller stopped")
+	return nil
+}
+
+func (c *Controller) runConfigResync(stopCh <-chan struct{}) {
+	ticker := time.NewTicker(c.config.ConfigResyncInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stopCh:
+			return
+		case <-ticker.C:
+			c.forceConfigResync()
 		}
 	}
 }
 
-func (c *Controller) persistStateOnShutdown() {
-	logger := log.With().Str("component", "state_persistence").Logger()
-	logger.Info().Msg("Persisting state before shutdown")
-	ctx, cancel := context.WithTimeout(
-		context.Background(),
-		shutdownStatePersistTimeout,
+func (c *Controller) sweepLegacyPodDisruptionBudgets(
+	ctx context.Context,
+	logger zerolog.Logger,
+) {
+	deployments, err := c.deployLister.Deployments(c.config.Namespace).List(
+		labels.SelectorFromSet(labels.Set{
+			constants.LabelCaddyManaged: constants.LabelManagedValue,
+		}),
 	)
-	defer cancel()
-	if err := c.snapshotAndPersistState(ctx); err != nil {
-		logger.Error().Err(err).Msg("Failed to persist state during shutdown")
-	} else {
-		logger.Info().Msg("State persisted successfully before shutdown")
+	if err != nil {
+		logger.Warn().Err(err).Msg("Failed to list deployments for legacy PDB cleanup")
+		return
+	}
+	for _, dep := range deployments {
+		caddy.DeleteLegacyPodDisruptionBudget(
+			ctx,
+			c.clientset,
+			&caddy.Instance{Namespace: c.config.Namespace, DeploymentName: dep.Name},
+			logger,
+		)
 	}
 }
 
-func (c *Controller) snapshotAndPersistState(ctx context.Context) error {
-	c.instancesMutex.RLock()
-	if len(c.deployedInstances) == 0 {
-		c.instancesMutex.RUnlock()
-		return nil
-	}
-	instancesCopy := make(map[string]*caddy.Instance, len(c.deployedInstances))
-	maps.Copy(instancesCopy, c.deployedInstances)
-	c.instancesMutex.RUnlock()
-	data, err := json.Marshal(instancesCopy)
+func (c *Controller) enqueueExistingDeployments(logger zerolog.Logger) {
+	deployments, err := c.deployLister.Deployments(c.config.Namespace).List(
+		labels.SelectorFromSet(labels.Set{
+			constants.LabelCaddyManaged: constants.LabelManagedValue,
+		}),
+	)
 	if err != nil {
-		return fmt.Errorf("failed to marshal state for hash: %w", err)
+		logger.Warn().Err(err).Msg("Failed to list managed deployments for adoption")
+		return
 	}
-	hash := sha256.Sum256(data)
-	c.lastPersistedStateHashMu.Lock()
-	defer c.lastPersistedStateHashMu.Unlock()
-	if hash == c.lastPersistedStateHash {
+	for _, dep := range deployments {
+		if node := dep.Labels[constants.LabelInstance]; node != "" {
+			c.queue.Add(node)
+		}
+	}
+}
+
+func (c *Controller) bootstrapBaseConfig(
+	ctx context.Context,
+	logger zerolog.Logger,
+) error {
+	_, err := c.clientset.CoreV1().
+		ConfigMaps(c.config.Namespace).
+		Get(ctx, c.config.ConfigMapName, metav1.GetOptions{})
+	if err == nil {
 		return nil
 	}
-	persistedData, saveErr := c.stateStore.SaveState(ctx, instancesCopy)
-	if saveErr != nil {
-		return saveErr
+	if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("failed to read base ConfigMap: %w", err)
 	}
-	c.lastPersistedStateHash = sha256.Sum256(persistedData)
+	if !c.config.BootstrapDefaultConfig {
+		logger.Warn().
+			Str("configmap", c.config.ConfigMapName).
+			Msg("Base ConfigMap not found and bootstrap disabled; waiting for it to be created")
+		return nil
+	}
+	apply := corev1ac.ConfigMap(c.config.ConfigMapName, c.config.Namespace).
+		WithData(map[string]string{
+			constants.CaddyfileKey: ":80 {\n    respond \"Hello, world!\"\n}\n",
+		})
+	if _, err = c.clientset.CoreV1().ConfigMaps(c.config.Namespace).Apply(
+		ctx, apply, metav1.ApplyOptions{FieldManager: "ckic", Force: true},
+	); err != nil {
+		return fmt.Errorf("failed to bootstrap default ConfigMap: %w", err)
+	}
+	logger.Info().Msg("Bootstrapped default base ConfigMap")
 	return nil
+}
+
+func tombstone[T any](obj any) (T, bool) {
+	if typed, ok := obj.(T); ok {
+		return typed, true
+	}
+	if deleted, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+		if typed, typedOK := deleted.Obj.(T); typedOK {
+			return typed, true
+		}
+	}
+	var zero T
+	return zero, false
 }

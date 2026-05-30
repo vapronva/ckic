@@ -43,27 +43,17 @@ func (m CommunicationMethod) String() string {
 }
 
 type AdminAPIConfig struct {
-	OriginKey        string
-	ReadinessClient  *http.Client
-	ConfigPushClient *http.Client
-}
-
-type AdminClients struct {
+	OriginKey  string
 	Readiness  *http.Client
 	ConfigPush *http.Client
 }
 
-func NewAdminClients() *AdminClients {
+func NewAdminAPIConfig(originKey string) *AdminAPIConfig {
 	transport := newAdminTransport()
-	return &AdminClients{
-		Readiness: &http.Client{
-			Timeout:   readinessRequestTimeout,
-			Transport: transport,
-		},
-		ConfigPush: &http.Client{
-			Timeout:   configPushTimeout,
-			Transport: transport,
-		},
+	return &AdminAPIConfig{
+		OriginKey:  originKey,
+		Readiness:  &http.Client{Timeout: readinessRequestTimeout, Transport: transport},
+		ConfigPush: &http.Client{Timeout: configPushTimeout, Transport: transport},
 	}
 }
 
@@ -130,21 +120,14 @@ func waitForCaddyAPIReady(
 			delay = min(time.Duration(float64(delay)*multiplier), caddyAPIMaxDelay)
 		}
 		ready, err := readinessProbe(ctx, client, readyURL, apiConfig, adminURL)
-		if err != nil {
-			log.Debug().
-				Err(err).
-				Str("adminURL", adminURL).
-				Str("readyURL", readyURL).
-				Msgf("Caddy Admin API readiness probe failed, retrying in %v", delay)
-		} else if ready {
+		if ready {
 			return nil
 		}
-		if err == nil {
-			log.Debug().
-				Str("adminURL", adminURL).
-				Str("readyURL", readyURL).
-				Msgf("Caddy Admin API not ready, retrying in %v", delay)
-		}
+		log.Debug().
+			Err(err).
+			Str("adminURL", adminURL).
+			Str("readyURL", readyURL).
+			Msgf("Caddy Admin API not ready, retrying in %v", delay)
 	}
 }
 
@@ -181,20 +164,6 @@ func adminOrigin(originKey string) string {
 	return fmt.Sprintf("http://%s.caddy-admin-api.ckic.cmld.ru", originKey)
 }
 
-func adminReadinessClient(cfg *AdminAPIConfig) *http.Client {
-	if cfg != nil && cfg.ReadinessClient != nil {
-		return cfg.ReadinessClient
-	}
-	return &http.Client{Timeout: readinessRequestTimeout}
-}
-
-func adminConfigPushClient(cfg *AdminAPIConfig) *http.Client {
-	if cfg != nil && cfg.ConfigPushClient != nil {
-		return cfg.ConfigPushClient
-	}
-	return &http.Client{Timeout: configPushTimeout}
-}
-
 func drainAndCloseReadinessBody(resp *http.Response, adminURL, readyURL string) {
 	if resp == nil || resp.Body == nil {
 		return
@@ -229,23 +198,21 @@ func (i *Instance) UpdateConfig(
 	logger.Debug().Msg("Updating Caddy configuration")
 	adminURL, resolveErr := i.resolveAdminURL(ctx, method, logger)
 	if resolveErr != nil {
-		logger.Error().Err(resolveErr).Msg("Failed to resolve admin URL")
 		return &ConfigurationFailedError{
 			NodeName: i.NodeName,
 			Reason:   "failed to resolve admin URL",
 			Err:      resolveErr,
 		}
 	}
-	readyCtx, cancel := context.WithTimeout(ctx, caddyAPIReadyTimeout)
-	defer cancel()
+	readyCtx := ctx
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		readyCtx, cancel = context.WithTimeout(ctx, caddyAPIReadyTimeout)
+		defer cancel()
+	}
 	if readyErr := waitForCaddyAPIReady(
-		readyCtx,
-		adminURL,
-		apiConfig,
-		adminReadinessClient(apiConfig),
-		caddyAPIInitialDelay,
+		readyCtx, adminURL, apiConfig, apiConfig.Readiness, caddyAPIInitialDelay,
 	); readyErr != nil {
-		logger.Error().Err(readyErr).Msg("Caddy Admin API not ready")
 		return &ConfigurationFailedError{
 			NodeName: i.NodeName,
 			Reason:   "admin API not ready",
@@ -260,16 +227,14 @@ func (i *Instance) UpdateConfig(
 		logger,
 	)
 	if reqErr != nil {
-		logger.Error().Err(reqErr).Msg("Failed to create HTTP request")
 		return &ConfigurationFailedError{
 			NodeName: i.NodeName,
 			Reason:   "failed to create HTTP request",
 			Err:      reqErr,
 		}
 	}
-	resp, doErr := adminConfigPushClient(apiConfig).Do(req)
+	resp, doErr := apiConfig.ConfigPush.Do(req)
 	if doErr != nil {
-		logger.Error().Err(doErr).Msg("Failed to send configuration to Caddy")
 		return &ConfigurationFailedError{
 			NodeName: i.NodeName,
 			Reason:   "failed to send configuration",
@@ -283,7 +248,6 @@ func (i *Instance) UpdateConfig(
 	}()
 	body, readErr := io.ReadAll(resp.Body)
 	if readErr != nil {
-		logger.Error().Err(readErr).Msg("Failed to read response body")
 		return &ConfigurationFailedError{
 			NodeName: i.NodeName,
 			Reason:   "failed to read response",
@@ -291,11 +255,11 @@ func (i *Instance) UpdateConfig(
 		}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		err := i.logConfigUpdateFailure(resp.StatusCode, body, logger)
 		return &ConfigurationFailedError{
-			NodeName: i.NodeName,
-			Reason:   "non-2xx response",
-			Err:      err,
+			NodeName:   i.NodeName,
+			Reason:     "non-2xx response",
+			Err:        i.logConfigUpdateFailure(resp.StatusCode, body, logger),
+			StatusCode: resp.StatusCode,
 		}
 	}
 	logger.Info().Msg("Successfully updated Caddy configuration")
@@ -320,9 +284,7 @@ func (i *Instance) resolveAdminURL(
 }
 
 func clusterIPAdminURL(serviceName, namespace string) string {
-	return adminLoadURL(
-		fmt.Sprintf("%s.%s.svc.cluster.local", serviceName, namespace),
-	)
+	return adminLoadURL(fmt.Sprintf("%s.%s.svc.cluster.local", serviceName, namespace))
 }
 
 func adminLoadURL(host string) string {
@@ -344,20 +306,17 @@ func (i *Instance) directAdminURL(
 		logger.Error().Err(err).Msg("Failed to get pod information")
 		return "", fmt.Errorf("failed to get pod info: %w", err)
 	}
-	podIP := pod.Status.PodIP
-	if podIP == "" {
+	if pod.Status.PodIP == "" {
 		return "", stdErrors.New("pod IP is empty")
 	}
-	return adminLoadURL(podIP), nil
+	return adminLoadURL(pod.Status.PodIP), nil
 }
 
 func (i *Instance) hostNetworkAdminURL(
 	ctx context.Context,
 	logger zerolog.Logger,
 ) (string, error) {
-	node, err := i.KubeClient.CoreV1().
-		Nodes().
-		Get(ctx, i.NodeName, metav1.GetOptions{})
+	node, err := i.KubeClient.CoreV1().Nodes().Get(ctx, i.NodeName, metav1.GetOptions{})
 	if err != nil {
 		logger.Error().Err(err).Msg("Failed to get node information")
 		return "", fmt.Errorf("failed to get node info: %w", err)
@@ -396,10 +355,7 @@ func (i *Instance) buildConfigUpdateRequest(
 	logger zerolog.Logger,
 ) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(
-		ctx,
-		http.MethodPost,
-		adminURL,
-		bytes.NewBufferString(configData),
+		ctx, http.MethodPost, adminURL, bytes.NewBufferString(configData),
 	)
 	if err != nil {
 		return nil, err
@@ -423,13 +379,6 @@ func (i *Instance) logConfigUpdateFailure(
 		truncated = truncated[:errorBodyLogMax]
 	}
 	err := fmt.Errorf("caddy returned status %d: %s", statusCode, string(truncated))
-	if statusCode >= 400 && statusCode < 500 {
-		logger.Error().
-			Err(err).
-			Int("status", statusCode).
-			Msg("Caddy configuration update failed with client error")
-		return err
-	}
 	logger.Error().
 		Err(err).
 		Int("status", statusCode).

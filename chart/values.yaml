@@ -10,7 +10,7 @@ updateStrategy:
 image:
   repository: docker.horse
   image: vapronva/ckic/manager
-  tag: 0.30.1
+  tag: 0.31.0
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -78,8 +78,8 @@ probes:
 config:
   nodeLabel: ckic.cmld.ru/enabled=true
   configMapName: caddy-config
-  configMapNamespace: caddy-system
   bootstrapDefaultConfig: false
+  configResyncInterval: 0s
   communicationMethod: clusterip
   logLevel: info
   caddyImage: docker.horse/oss-images/zerossl-caddy/caddy:2.11.3-alpine
@@ -108,6 +108,7 @@ loadBalancer:
   clientIP: proxy-protocol
   externalTrafficPolicy: ""
   loadBalancerIP: ""
+  enableUDP: false
   trustedProxyCIDRs: 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
   annotations: {}
 

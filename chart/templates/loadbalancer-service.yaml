@@ -34,7 +34,7 @@ spec:
       port: 443
       targetPort: 443
       protocol: TCP
-    {{- if eq .Values.loadBalancer.clientIP "local" }}
+    {{- if and (eq .Values.loadBalancer.clientIP "local") .Values.loadBalancer.enableUDP }}
     - name: http-udp
       port: 80
       targetPort: 80

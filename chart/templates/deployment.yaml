@@ -42,11 +42,16 @@ spec:
             {{- toYaml .Values.securityContext | nindent 12 }}
           image: "{{ .Values.image.repository }}/{{ .Values.image.image }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: CKIC_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           args:
             - "--node-label={{ .Values.config.nodeLabel }}"
             - "--config-map={{ .Values.config.configMapName }}"
-            - "--config-namespace={{ .Values.config.configMapNamespace }}"
             - "--bootstrap-default-config={{ .Values.config.bootstrapDefaultConfig }}"
+            - "--config-resync-interval={{ .Values.config.configResyncInterval }}"
             - "--leader-elect={{ .Values.leaderElection.enabled }}"
             - "--leader-election-lease-name={{ .Values.leaderElection.leaseName }}"
             {{- if .Values.leaderElection.leaseNamespace }}

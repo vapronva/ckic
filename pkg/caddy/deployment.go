@@ -3,44 +3,47 @@ package caddy
 import (
 	"context"
 	"fmt"
-	"maps"
 	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	appsv1ac "k8s.io/client-go/applyconfigurations/apps/v1"
+	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
+	metav1ac "k8s.io/client-go/applyconfigurations/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
 	"git.horse/vapronva/ckic/pkg/constants"
 )
 
 const (
-	deploymentTimeout      = 3 * time.Minute
-	deploymentPollDelay    = 5 * time.Second
-	caddyHTTPPort          = 80
-	caddyHTTPSPort         = 443
-	configMapDefaultMode   = int32(0o644)
-	hostPortMin            = 1
-	hostPortMax            = 65535
-	caddyBinary            = "caddy"
-	caddyContainerName     = caddyBinary
-	defaultImagePullPolicy = corev1.PullIfNotPresent
-	caddyCapabilityNetAdm  = corev1.Capability("NET_ADMIN")
-	caddyCapabilityBind    = corev1.Capability("NET_BIND_SERVICE")
-	caddyCapabilityDrop    = corev1.Capability("ALL")
-	caddyRunAsUser         = int64(1000)
-	caddyRunAsGroup        = int64(1000)
-	downwardAPIEnvVarCount = 3
-	portNameHTTPTCP        = "http-tcp"
-	portNameHTTPUDP        = "http-udp"
-	portNameHTTPSTCP       = "https-tcp"
-	portNameHTTPSUDP       = "https-udp"
+	caddyHTTPPort          int32 = 80
+	caddyHTTPSPort         int32 = 443
+	hostPortMin                  = 1
+	hostPortMax                  = 65535
+	caddyBinary                  = "caddy"
+	caddyContainerName           = caddyBinary
+	defaultImagePullPolicy       = corev1.PullIfNotPresent
+	caddyCapabilityNetAdm        = corev1.Capability("NET_ADMIN")
+	caddyCapabilityBind          = corev1.Capability("NET_BIND_SERVICE")
+	caddyCapabilityDrop          = corev1.Capability("ALL")
+	caddyRunAsUser               = int64(1000)
+	caddyRunAsGroup              = int64(1000)
+	downwardAPIEnvVarCount       = 3
+	portNameHTTPTCP              = "http-tcp"
+	portNameHTTPUDP              = "http-udp"
+	portNameHTTPSTCP             = "https-tcp"
+	portNameHTTPSUDP             = "https-udp"
+	fieldManager                 = "ckic"
 )
+
+func applyOptions() metav1.ApplyOptions {
+	return metav1.ApplyOptions{FieldManager: fieldManager, Force: true}
+}
 
 func managedLabels(nodeName string) map[string]string {
 	return map[string]string{
@@ -54,35 +57,6 @@ func selectorLabels(nodeName string) map[string]string {
 	return map[string]string{
 		constants.LabelApp:      constants.LabelAppValue,
 		constants.LabelInstance: nodeName,
-	}
-}
-
-func trafficServicePorts() []corev1.ServicePort {
-	return []corev1.ServicePort{
-		{
-			Name:       portNameHTTPTCP,
-			Port:       caddyHTTPPort,
-			TargetPort: intstr.FromInt(caddyHTTPPort),
-			Protocol:   corev1.ProtocolTCP,
-		},
-		{
-			Name:       portNameHTTPUDP,
-			Port:       caddyHTTPPort,
-			TargetPort: intstr.FromInt(caddyHTTPPort),
-			Protocol:   corev1.ProtocolUDP,
-		},
-		{
-			Name:       portNameHTTPSTCP,
-			Port:       caddyHTTPSPort,
-			TargetPort: intstr.FromInt(caddyHTTPSPort),
-			Protocol:   corev1.ProtocolTCP,
-		},
-		{
-			Name:       portNameHTTPSUDP,
-			Port:       caddyHTTPSPort,
-			TargetPort: intstr.FromInt(caddyHTTPSPort),
-			Protocol:   corev1.ProtocolUDP,
-		},
 	}
 }
 
@@ -110,16 +84,14 @@ func (o DeployOptions) imagePullPolicy() corev1.PullPolicy {
 	return o.ImagePullPolicy
 }
 
-func DeployCaddy(
+func EnsureCaddy(
 	ctx context.Context,
 	opts DeployOptions,
 	nodeName string,
 	externalIPs []string,
 ) (*Instance, error) {
-	deployCtx, cancel := context.WithTimeout(ctx, deploymentTimeout)
-	defer cancel()
 	logger := log.With().Str("node", nodeName).Logger()
-	deploymentName := fmt.Sprintf("caddy-%s", nodeName)
+	deploymentName := "caddy-" + nodeName
 	instance := &Instance{
 		NodeName:       nodeName,
 		Namespace:      opts.Namespace,
@@ -128,133 +100,360 @@ func DeployCaddy(
 		ExternalIPs:    externalIPs,
 		KubeClient:     opts.Clientset,
 	}
-	deploymentChanged, deploymentCreated, err := deployDeployment(
-		deployCtx,
-		opts,
-		instance,
-	)
+	deployment, err := buildDeploymentApplyConfig(instance, opts, logger)
 	if err != nil {
 		return nil, err
 	}
-	if err = deployCaddyServices(
-		deployCtx,
-		ctx,
-		opts.Clientset,
-		instance,
-		opts.UseHostNetwork,
-		opts.LoadBalancerMode,
-		deploymentCreated,
-		logger,
-	); err != nil {
+	if opts.PrePullImage {
+		prePullBeforeApply(ctx, opts, instance, logger)
+	}
+	if _, err = opts.Clientset.AppsV1().
+		Deployments(instance.Namespace).
+		Apply(ctx, deployment, applyOptions()); err != nil {
+		return nil, fmt.Errorf("failed to apply deployment %s: %w", deploymentName, err)
+	}
+	logger.Debug().Msg("Applied Caddy deployment")
+	if err = applyCaddyServices(ctx, opts, instance, logger); err != nil {
 		return nil, err
 	}
-	if err = waitForDeploymentReadyIfChanged(
-		deployCtx,
-		ctx,
-		opts.Clientset,
-		opts.Namespace,
-		deploymentName,
-		deploymentChanged,
-		deploymentCreated,
-		instance,
-	); err != nil {
-		return nil, err
+	if podName, resolveErr := resolvePodName(
+		ctx, opts.Clientset, opts.Namespace, nodeName,
+	); resolveErr != nil {
+		logger.Debug().
+			Err(resolveErr).
+			Msg("Active Caddy pod not resolved yet; will reconcile on next requeue")
+	} else {
+		instance.PodName = podName
 	}
-	if err = resolveAndAssignPodName(
-		deployCtx,
-		ctx,
-		opts.Clientset,
-		opts.Namespace,
-		nodeName,
-		instance,
-		deploymentCreated,
-		logger,
-	); err != nil {
-		return nil, err
-	}
-	logger.Info().Str("pod", instance.PodName).Msg("Caddy instance deployed successfully")
 	return instance, nil
 }
 
-func deployCaddyServices(
-	deployCtx context.Context,
-	cleanupCtx context.Context,
-	clientset kubernetes.Interface,
+func applyCaddyServices(
+	ctx context.Context,
+	opts DeployOptions,
 	instance *Instance,
-	useHostNetwork bool,
-	lbMode LoadBalancerMode,
-	deploymentCreated bool,
 	logger zerolog.Logger,
 ) error {
-	if useHostNetwork {
-		logger.Info().Msg("Skipping service creation due to hostNetwork mode")
+	if opts.UseHostNetwork {
+		logger.Debug().Msg("Skipping service creation due to hostNetwork mode")
 		return nil
 	}
-	if _, err := deployService(deployCtx, clientset, instance); err != nil {
-		rollbackCreatedDeployment(cleanupCtx, instance, deploymentCreated)
-		return err
+	if _, err := opts.Clientset.CoreV1().
+		Services(instance.Namespace).
+		Apply(ctx, clusterIPServiceApplyConfig(instance), applyOptions()); err != nil {
+		return fmt.Errorf("failed to apply service %s: %w", instance.ServiceName, err)
 	}
-	if lbMode != LoadBalancerModeCilium {
+	if opts.LoadBalancerMode != LoadBalancerModeCilium {
 		return nil
 	}
-	if _, err := deployLoadBalancerService(deployCtx, clientset, instance); err != nil {
-		rollbackCreatedDeployment(cleanupCtx, instance, deploymentCreated)
-		return err
+	lbName := instance.LoadBalancerServiceName()
+	if _, err := opts.Clientset.CoreV1().
+		Services(instance.Namespace).
+		Apply(ctx, loadBalancerServiceApplyConfig(instance), applyOptions()); err != nil {
+		return fmt.Errorf("failed to apply loadbalancer service %s: %w", lbName, err)
 	}
 	return nil
 }
 
-func waitForDeploymentReadyIfChanged(
-	deployCtx context.Context,
-	cleanupCtx context.Context,
-	clientset kubernetes.Interface,
-	namespace, deploymentName string,
-	deploymentChanged, deploymentCreated bool,
+func prePullBeforeApply(
+	ctx context.Context,
+	opts DeployOptions,
 	instance *Instance,
-) error {
-	if !deploymentChanged {
-		return nil
+	logger zerolog.Logger,
+) {
+	if err := prePullImage(
+		ctx,
+		opts.Clientset,
+		instance.Namespace,
+		instance.NodeName,
+		opts.CaddyImage,
+		opts.imagePullPolicy(),
+		logger,
+	); err != nil {
+		logger.Warn().
+			Err(err).
+			Msg("Image pre-pull did not complete; proceeding (kubelet will pull on rollout)")
 	}
-	err := waitForDeploymentReady(deployCtx, clientset, namespace, deploymentName)
-	if err == nil {
-		return nil
+}
+
+func buildDeploymentApplyConfig(
+	instance *Instance,
+	opts DeployOptions,
+	logger zerolog.Logger,
+) (*appsv1ac.DeploymentApplyConfiguration, error) {
+	container, err := buildCaddyContainer(opts, logger)
+	if err != nil {
+		return nil, err
 	}
-	rollbackCreatedDeployment(cleanupCtx, instance, deploymentCreated)
-	return fmt.Errorf(
-		"deployment %s/%s did not become ready: %w",
-		namespace,
-		deploymentName,
-		err,
+	labels := managedLabels(instance.NodeName)
+	podSpec := corev1ac.PodSpec().
+		WithNodeSelector(map[string]string{constants.HostLabelHostname: instance.NodeName}).
+		WithAutomountServiceAccountToken(false).
+		WithSecurityContext(corev1ac.PodSecurityContext().
+			WithRunAsNonRoot(false).
+			WithSeccompProfile(corev1ac.SeccompProfile().
+				WithType(corev1.SeccompProfileTypeRuntimeDefault))).
+		WithContainers(container).
+		WithVolumes(buildCaddyVolumes(opts, logger)...)
+	if opts.UseHostNetwork {
+		podSpec = podSpec.WithHostNetwork(true).
+			WithDNSPolicy(corev1.DNSClusterFirstWithHostNet)
+		logger.Debug().Msg("Enabled hostNetwork mode")
+	} else {
+		podSpec = podSpec.WithDNSPolicy(corev1.DNSClusterFirst)
+	}
+	return appsv1ac.Deployment(instance.DeploymentName, instance.Namespace).
+		WithLabels(labels).
+		WithSpec(appsv1ac.DeploymentSpec().
+			WithReplicas(1).
+			WithStrategy(deploymentStrategy(opts.UseHostNetwork)).
+			WithSelector(metav1ac.LabelSelector().
+				WithMatchLabels(selectorLabels(instance.NodeName))).
+			WithTemplate(corev1ac.PodTemplateSpec().
+				WithLabels(labels).
+				WithSpec(podSpec))), nil
+}
+
+func buildCaddyContainer(
+	opts DeployOptions,
+	logger zerolog.Logger,
+) (*corev1ac.ContainerApplyConfiguration, error) {
+	trafficPorts, err := buildTrafficPorts(
+		opts.UseHostNetwork, opts.HTTPHostPort, opts.HTTPSHostPort, logger,
+	)
+	if err != nil {
+		return nil, err
+	}
+	ports := append([]*corev1ac.ContainerPortApplyConfiguration{
+		corev1ac.ContainerPort().
+			WithName("admin").
+			WithContainerPort(int32(constants.CaddyAdminPort)).
+			WithProtocol(corev1.ProtocolTCP),
+	}, trafficPorts...)
+	return corev1ac.Container().
+		WithName(caddyContainerName).
+		WithImage(opts.CaddyImage).
+		WithImagePullPolicy(opts.imagePullPolicy()).
+		WithPorts(ports...).
+		WithVolumeMounts(
+			corev1ac.VolumeMount().
+				WithName(constants.VolumeNameCaddyConfig).
+				WithMountPath("/etc/caddy/Caddyfile").
+				WithSubPath(constants.CaddyfileKey),
+			corev1ac.VolumeMount().
+				WithName(constants.VolumeNameData).
+				WithMountPath("/data"),
+			corev1ac.VolumeMount().
+				WithName(constants.VolumeNameConfig).
+				WithMountPath("/config"),
+		).
+		WithEnv(buildCaddyEnvVars(opts.EnvSecretName, opts.EnvSecretKeys, logger)...).
+		WithSecurityContext(corev1ac.SecurityContext().
+			WithAllowPrivilegeEscalation(false).
+			WithRunAsNonRoot(false).
+			WithCapabilities(corev1ac.Capabilities().
+				WithAdd(caddyCapabilityNetAdm, caddyCapabilityBind).
+				WithDrop(caddyCapabilityDrop)).
+			WithSeccompProfile(corev1ac.SeccompProfile().
+				WithType(corev1.SeccompProfileTypeRuntimeDefault))), nil
+}
+
+func buildTrafficPorts(
+	useHostNetwork bool,
+	httpHostPort, httpsHostPort int,
+	logger zerolog.Logger,
+) ([]*corev1ac.ContainerPortApplyConfiguration, error) {
+	port := func(name string, container int32, protocol corev1.Protocol) *corev1ac.ContainerPortApplyConfiguration {
+		return corev1ac.ContainerPort().
+			WithName(name).
+			WithContainerPort(container).
+			WithProtocol(protocol)
+	}
+	ports := []*corev1ac.ContainerPortApplyConfiguration{
+		port(portNameHTTPTCP, caddyHTTPPort, corev1.ProtocolTCP),
+		port(portNameHTTPUDP, caddyHTTPPort, corev1.ProtocolUDP),
+		port(portNameHTTPSTCP, caddyHTTPSPort, corev1.ProtocolTCP),
+		port(portNameHTTPSUDP, caddyHTTPSPort, corev1.ProtocolUDP),
+	}
+	if !useHostNetwork {
+		return ports, nil
+	}
+	httpPort32, err := normalizeHostPort(httpHostPort)
+	if err != nil {
+		return nil, fmt.Errorf("invalid HTTP host port: %w", err)
+	}
+	httpsPort32, err := normalizeHostPort(httpsHostPort)
+	if err != nil {
+		return nil, fmt.Errorf("invalid HTTPS host port: %w", err)
+	}
+	logger.Debug().
+		Int("httpPort", httpHostPort).
+		Int("httpsPort", httpsHostPort).
+		Msg("Configuring hostNetwork with host ports")
+	hostPorts := []int32{httpPort32, httpPort32, httpsPort32, httpsPort32}
+	for idx := range ports {
+		ports[idx] = ports[idx].WithHostPort(hostPorts[idx])
+	}
+	return ports, nil
+}
+
+func buildCaddyEnvVars(
+	envSecretName string,
+	envSecretKeys []string,
+	logger zerolog.Logger,
+) []*corev1ac.EnvVarApplyConfiguration {
+	envVars := make(
+		[]*corev1ac.EnvVarApplyConfiguration,
+		0,
+		len(envSecretKeys)+downwardAPIEnvVarCount,
+	)
+	if envSecretName != "" && len(envSecretKeys) > 0 {
+		logger.Debug().
+			Str("secret", envSecretName).
+			Strs("keys", envSecretKeys).
+			Msg("Configuring environment variables from secret")
+		for _, key := range envSecretKeys {
+			envVars = append(envVars, corev1ac.EnvVar().WithName(key).WithValueFrom(
+				corev1ac.EnvVarSource().WithSecretKeyRef(
+					corev1ac.SecretKeySelector().WithName(envSecretName).WithKey(key),
+				),
+			))
+		}
+	}
+	fieldEnv := func(name, fieldPath string) *corev1ac.EnvVarApplyConfiguration {
+		return corev1ac.EnvVar().WithName(name).WithValueFrom(
+			corev1ac.EnvVarSource().WithFieldRef(
+				corev1ac.ObjectFieldSelector().WithFieldPath(fieldPath),
+			),
+		)
+	}
+	return append(
+		envVars,
+		fieldEnv(constants.PodNameEnvVar, "metadata.name"),
+		fieldEnv(constants.NodeNameEnvVar, "spec.nodeName"),
+		fieldEnv(constants.PodIPEnvVar, "status.podIP"),
 	)
 }
 
-func resolveAndAssignPodName(
-	deployCtx context.Context,
-	cleanupCtx context.Context,
-	clientset kubernetes.Interface,
-	namespace, nodeName string,
-	instance *Instance,
-	deploymentCreated bool,
+func buildCaddyVolumes(
+	opts DeployOptions,
 	logger zerolog.Logger,
-) error {
-	podName, err := resolvePodName(deployCtx, clientset, namespace, nodeName)
-	if err != nil {
-		logger.Error().Err(err).Msg("Failed to resolve Caddy pod name")
-		rollbackCreatedDeployment(cleanupCtx, instance, deploymentCreated)
-		return err
+) []*corev1ac.VolumeApplyConfiguration {
+	return []*corev1ac.VolumeApplyConfiguration{
+		corev1ac.Volume().
+			WithName(constants.VolumeNameCaddyConfig).
+			WithConfigMap(corev1ac.ConfigMapVolumeSource().
+				WithName(opts.ConfigMapName).
+				WithItems(corev1ac.KeyToPath().
+					WithKey(constants.CaddyfileKey).
+					WithPath(constants.CaddyfileKey))),
+		buildStorageVolume(
+			constants.VolumeNameData,
+			opts.DataVolumePVC,
+			"/opt/cmld/caddy/data",
+			logger,
+		),
+		buildStorageVolume(
+			constants.VolumeNameConfig,
+			opts.ConfigVolumePVC,
+			"/opt/cmld/caddy/config",
+			logger,
+		),
 	}
-	instance.PodName = podName
-	return nil
 }
 
-func rollbackCreatedDeployment(
-	ctx context.Context,
-	instance *Instance,
-	deploymentCreated bool,
-) {
-	if deploymentCreated {
-		cleanupDeployment(ctx, instance)
+func buildStorageVolume(
+	name, pvcName, hostPath string,
+	logger zerolog.Logger,
+) *corev1ac.VolumeApplyConfiguration {
+	if pvcName != "" {
+		logger.Debug().Str("pvc", pvcName).Msgf("Using PVC for %s volume", name)
+		return corev1ac.Volume().WithName(name).WithPersistentVolumeClaim(
+			corev1ac.PersistentVolumeClaimVolumeSource().WithClaimName(pvcName),
+		)
 	}
+	logger.Debug().Msgf("Using HostPath for %s volume", name)
+	return corev1ac.Volume().WithName(name).WithHostPath(
+		corev1ac.HostPathVolumeSource().
+			WithPath(hostPath).
+			WithType(corev1.HostPathDirectoryOrCreate),
+	)
+}
+
+func deploymentStrategy(
+	useHostNetwork bool,
+) *appsv1ac.DeploymentStrategyApplyConfiguration {
+	if useHostNetwork {
+		return appsv1ac.DeploymentStrategy().
+			WithType(appsv1.RecreateDeploymentStrategyType)
+	}
+	pct := intstr.FromString("25%")
+	return appsv1ac.DeploymentStrategy().
+		WithType(appsv1.RollingUpdateDeploymentStrategyType).
+		WithRollingUpdate(appsv1ac.RollingUpdateDeployment().
+			WithMaxSurge(pct).
+			WithMaxUnavailable(pct))
+}
+
+func normalizeHostPort(port int) (int32, error) {
+	if port < hostPortMin || port > hostPortMax {
+		return 0, fmt.Errorf(
+			"port %d is out of valid range [%d, %d]", port, hostPortMin, hostPortMax,
+		)
+	}
+	return int32(port), nil
+}
+
+func trafficServicePorts() []*corev1ac.ServicePortApplyConfiguration {
+	port := func(name string, p int32, protocol corev1.Protocol) *corev1ac.ServicePortApplyConfiguration {
+		return corev1ac.ServicePort().
+			WithName(name).
+			WithPort(p).
+			WithTargetPort(intstr.FromInt32(p)).
+			WithProtocol(protocol)
+	}
+	return []*corev1ac.ServicePortApplyConfiguration{
+		port(portNameHTTPTCP, caddyHTTPPort, corev1.ProtocolTCP),
+		port(portNameHTTPUDP, caddyHTTPPort, corev1.ProtocolUDP),
+		port(portNameHTTPSTCP, caddyHTTPSPort, corev1.ProtocolTCP),
+		port(portNameHTTPSUDP, caddyHTTPSPort, corev1.ProtocolUDP),
+	}
+}
+
+func clusterIPServiceApplyConfig(instance *Instance) *corev1ac.ServiceApplyConfiguration {
+	adminPort := corev1ac.ServicePort().
+		WithName("admin").
+		WithPort(int32(constants.CaddyAdminPort)).
+		WithTargetPort(intstr.FromInt32(int32(constants.CaddyAdminPort))).
+		WithProtocol(corev1.ProtocolTCP)
+	return corev1ac.Service(instance.ServiceName, instance.Namespace).
+		WithLabels(managedLabels(instance.NodeName)).
+		WithSpec(
+			corev1ac.ServiceSpec().
+				WithSelector(selectorLabels(instance.NodeName)).
+				WithType(corev1.ServiceTypeClusterIP).
+				WithPorts(append([]*corev1ac.ServicePortApplyConfiguration{adminPort}, trafficServicePorts()...)...),
+		)
+}
+
+func loadBalancerServiceApplyConfig(
+	instance *Instance,
+) *corev1ac.ServiceApplyConfiguration {
+	spec := corev1ac.ServiceSpec().
+		WithSelector(selectorLabels(instance.NodeName)).
+		WithType(corev1.ServiceTypeLoadBalancer).
+		WithLoadBalancerClass(constants.CiliumNodeLoadBalancerClass).
+		WithExternalTrafficPolicy(corev1.ServiceExternalTrafficPolicyTypeLocal).
+		WithPorts(trafficServicePorts()...)
+	if len(instance.ExternalIPs) > 0 {
+		spec = spec.WithExternalIPs(instance.ExternalIPs...)
+	}
+	return corev1ac.Service(instance.LoadBalancerServiceName(), instance.Namespace).
+		WithLabels(managedLabels(instance.NodeName)).
+		WithAnnotations(map[string]string{
+			constants.CiliumNodeIPAMAnnotationKey: constants.HostLabelHostname + "=" + instance.NodeName,
+		}).
+		WithSpec(spec)
 }
 
 func resolvePodName(
@@ -266,6 +465,7 @@ func resolvePodName(
 		maxAttempts    = 6
 		initialBackoff = 250 * time.Millisecond
 		maxBackoff     = 2 * time.Second
+		backoffFactor  = 2
 	)
 	labelSelector := constants.InstanceLabelSelector(nodeName)
 	backoff := initialBackoff
@@ -297,15 +497,11 @@ func resolvePodName(
 			}
 			return "", fmt.Errorf(
 				"context deadline exceeded while resolving pod for node %s: %w",
-				nodeName,
-				ctx.Err(),
+				nodeName, ctx.Err(),
 			)
 		case <-timer.C:
 		}
-		backoff *= 2
-		if backoff > maxBackoff {
-			backoff = maxBackoff
-		}
+		backoff = min(backoff*backoffFactor, maxBackoff)
 	}
 	return "", lastErr
 }
@@ -335,406 +531,6 @@ func SelectNewestActivePodName(pods []corev1.Pod) (string, bool) {
 	return selected.Name, true
 }
 
-func deployDeployment(
-	ctx context.Context,
-	opts DeployOptions,
-	instance *Instance,
-) (bool, bool, error) {
-	logger := log.With().Str("deployment", instance.DeploymentName).Logger()
-	deployment, err := buildDesiredDeployment(instance, opts, logger)
-	if err != nil {
-		return false, false, err
-	}
-	return upsertDeployment(ctx, opts, instance, deployment, logger)
-}
-
-func buildDesiredDeployment(
-	instance *Instance,
-	options DeployOptions,
-	logger zerolog.Logger,
-) (*appsv1.Deployment, error) {
-	replicas := int32(1)
-	labels := managedLabels(instance.NodeName)
-	caddyContainer, err := buildCaddyContainer(options, logger)
-	if err != nil {
-		return nil, err
-	}
-	volumes := buildCaddyVolumes(options, logger)
-	podSpec := corev1.PodSpec{
-		NodeSelector: map[string]string{
-			constants.HostLabelHostname: instance.NodeName,
-		},
-		AutomountServiceAccountToken: new(false),
-		SecurityContext: &corev1.PodSecurityContext{
-			RunAsNonRoot: new(false),
-			SeccompProfile: &corev1.SeccompProfile{
-				Type: corev1.SeccompProfileTypeRuntimeDefault,
-			},
-		},
-		Containers: []corev1.Container{caddyContainer},
-		Volumes:    volumes,
-	}
-	if options.UseHostNetwork {
-		podSpec.HostNetwork = true
-		podSpec.DNSPolicy = corev1.DNSClusterFirstWithHostNet
-		logger.Info().Msg("Enabled hostNetwork mode")
-	} else {
-		podSpec.DNSPolicy = corev1.DNSClusterFirst
-	}
-	return &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      instance.DeploymentName,
-			Namespace: instance.Namespace,
-			Labels:    labels,
-		},
-		Spec: appsv1.DeploymentSpec{
-			Replicas: &replicas,
-			Strategy: deploymentStrategy(options.UseHostNetwork),
-			Selector: &metav1.LabelSelector{
-				MatchLabels: selectorLabels(instance.NodeName),
-			},
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: labels},
-				Spec:       podSpec,
-			},
-		},
-	}, nil
-}
-
-func buildCaddyContainer(
-	options DeployOptions,
-	logger zerolog.Logger,
-) (corev1.Container, error) {
-	trafficPorts, err := buildTrafficPorts(
-		options.UseHostNetwork,
-		options.HTTPHostPort,
-		options.HTTPSHostPort,
-		logger,
-	)
-	if err != nil {
-		return corev1.Container{}, err
-	}
-	container := corev1.Container{
-		Name:  caddyContainerName,
-		Image: options.CaddyImage,
-		Ports: append(
-			[]corev1.ContainerPort{
-				{
-					Name:          "admin",
-					ContainerPort: constants.CaddyAdminPort,
-					Protocol:      corev1.ProtocolTCP,
-				},
-			},
-			trafficPorts...,
-		),
-		VolumeMounts: []corev1.VolumeMount{
-			{
-				Name:      constants.VolumeNameCaddyConfig,
-				MountPath: "/etc/caddy/Caddyfile",
-				SubPath:   constants.CaddyfileKey,
-			},
-			{Name: constants.VolumeNameData, MountPath: "/data"},
-			{Name: constants.VolumeNameConfig, MountPath: "/config"},
-		},
-		Env: buildCaddyEnvVars(
-			options.EnvSecretName,
-			options.EnvSecretKeys,
-			logger,
-		),
-		ImagePullPolicy: options.imagePullPolicy(),
-		SecurityContext: &corev1.SecurityContext{
-			AllowPrivilegeEscalation: new(false),
-			RunAsNonRoot:             new(false),
-			Capabilities: &corev1.Capabilities{
-				Add: []corev1.Capability{
-					caddyCapabilityNetAdm,
-					caddyCapabilityBind,
-				},
-				Drop: []corev1.Capability{caddyCapabilityDrop},
-			},
-			SeccompProfile: &corev1.SeccompProfile{
-				Type: corev1.SeccompProfileTypeRuntimeDefault,
-			},
-		},
-	}
-	return container, nil
-}
-
-func buildTrafficPorts(
-	useHostNetwork bool,
-	httpHostPort, httpsHostPort int,
-	logger zerolog.Logger,
-) ([]corev1.ContainerPort, error) {
-	if !useHostNetwork {
-		return []corev1.ContainerPort{
-			{
-				Name:          portNameHTTPTCP,
-				ContainerPort: caddyHTTPPort,
-				Protocol:      corev1.ProtocolTCP,
-			},
-			{
-				Name:          portNameHTTPUDP,
-				ContainerPort: caddyHTTPPort,
-				Protocol:      corev1.ProtocolUDP,
-			},
-			{
-				Name:          portNameHTTPSTCP,
-				ContainerPort: caddyHTTPSPort,
-				Protocol:      corev1.ProtocolTCP,
-			},
-			{
-				Name:          portNameHTTPSUDP,
-				ContainerPort: caddyHTTPSPort,
-				Protocol:      corev1.ProtocolUDP,
-			},
-		}, nil
-	}
-	httpPort32, err := normalizeHostPort(httpHostPort)
-	if err != nil {
-		return nil, fmt.Errorf("invalid HTTP host port: %w", err)
-	}
-	httpsPort32, err := normalizeHostPort(httpsHostPort)
-	if err != nil {
-		return nil, fmt.Errorf("invalid HTTPS host port: %w", err)
-	}
-	logger.Info().
-		Int("httpPort", httpHostPort).
-		Int("httpsPort", httpsHostPort).
-		Msg("Configuring hostNetwork with host ports")
-	return []corev1.ContainerPort{
-		{
-			Name:          portNameHTTPTCP,
-			ContainerPort: caddyHTTPPort,
-			Protocol:      corev1.ProtocolTCP,
-			HostPort:      httpPort32,
-		},
-		{
-			Name:          portNameHTTPUDP,
-			ContainerPort: caddyHTTPPort,
-			Protocol:      corev1.ProtocolUDP,
-			HostPort:      httpPort32,
-		},
-		{
-			Name:          portNameHTTPSTCP,
-			ContainerPort: caddyHTTPSPort,
-			Protocol:      corev1.ProtocolTCP,
-			HostPort:      httpsPort32,
-		},
-		{
-			Name:          portNameHTTPSUDP,
-			ContainerPort: caddyHTTPSPort,
-			Protocol:      corev1.ProtocolUDP,
-			HostPort:      httpsPort32,
-		},
-	}, nil
-}
-
-func buildCaddyEnvVars(
-	envSecretName string,
-	envSecretKeys []string,
-	logger zerolog.Logger,
-) []corev1.EnvVar {
-	envVars := make([]corev1.EnvVar, 0, len(envSecretKeys)+downwardAPIEnvVarCount)
-	if envSecretName != "" && len(envSecretKeys) > 0 {
-		logger.Info().
-			Str("secret", envSecretName).
-			Strs("keys", envSecretKeys).
-			Msg("Configuring environment variables from secret")
-		for _, key := range envSecretKeys {
-			envVars = append(envVars, corev1.EnvVar{
-				Name: key,
-				ValueFrom: &corev1.EnvVarSource{
-					SecretKeyRef: &corev1.SecretKeySelector{
-						LocalObjectReference: corev1.LocalObjectReference{
-							Name: envSecretName,
-						},
-						Key: key,
-					},
-				},
-			})
-		}
-	}
-	return append(
-		envVars,
-		corev1.EnvVar{
-			Name: constants.PodNameEnvVar,
-			ValueFrom: &corev1.EnvVarSource{
-				FieldRef: &corev1.ObjectFieldSelector{
-					FieldPath: "metadata.name",
-				},
-			},
-		},
-		corev1.EnvVar{
-			Name: constants.NodeNameEnvVar,
-			ValueFrom: &corev1.EnvVarSource{
-				FieldRef: &corev1.ObjectFieldSelector{
-					FieldPath: "spec.nodeName",
-				},
-			},
-		},
-		corev1.EnvVar{
-			Name: constants.PodIPEnvVar,
-			ValueFrom: &corev1.EnvVarSource{
-				FieldRef: &corev1.ObjectFieldSelector{
-					FieldPath: "status.podIP",
-				},
-			},
-		},
-	)
-}
-
-func buildCaddyVolumes(
-	options DeployOptions,
-	logger zerolog.Logger,
-) []corev1.Volume {
-	volumes := []corev1.Volume{
-		{
-			Name: constants.VolumeNameCaddyConfig,
-			VolumeSource: corev1.VolumeSource{
-				ConfigMap: &corev1.ConfigMapVolumeSource{
-					LocalObjectReference: corev1.LocalObjectReference{
-						Name: options.ConfigMapName,
-					},
-					Items: []corev1.KeyToPath{
-						{Key: constants.CaddyfileKey, Path: constants.CaddyfileKey},
-					},
-				},
-			},
-		},
-	}
-	volumes = append(
-		volumes,
-		buildStorageVolume(
-			constants.VolumeNameData,
-			options.DataVolumePVC,
-			"/opt/cmld/caddy/data",
-			logger,
-		),
-		buildStorageVolume(
-			constants.VolumeNameConfig,
-			options.ConfigVolumePVC,
-			"/opt/cmld/caddy/config",
-			logger,
-		),
-	)
-	return volumes
-}
-
-func buildStorageVolume(
-	name, pvcName, hostPath string,
-	logger zerolog.Logger,
-) corev1.Volume {
-	if pvcName != "" {
-		logger.Info().Str("pvc", pvcName).Msgf("Using PVC for %s volume", name)
-		return corev1.Volume{
-			Name: name,
-			VolumeSource: corev1.VolumeSource{
-				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-					ClaimName: pvcName,
-				},
-			},
-		}
-	}
-	logger.Info().Msgf("Using HostPath for %s volume", name)
-	return corev1.Volume{
-		Name: name,
-		VolumeSource: corev1.VolumeSource{
-			HostPath: &corev1.HostPathVolumeSource{
-				Path: hostPath,
-				Type: new(corev1.HostPathDirectoryOrCreate),
-			},
-		},
-	}
-}
-
-func upsertDeployment(
-	ctx context.Context,
-	opts DeployOptions,
-	instance *Instance,
-	deployment *appsv1.Deployment,
-	logger zerolog.Logger,
-) (bool, bool, error) {
-	clientset := opts.Clientset
-	existingDeployment, err := clientset.AppsV1().
-		Deployments(instance.Namespace).
-		Get(ctx, instance.DeploymentName, metav1.GetOptions{})
-	switch {
-	case err == nil:
-		if !deploymentNeedsUpdate(existingDeployment, deployment) {
-			logger.Debug().Msg("Caddy deployment already up-to-date")
-			return false, false, nil
-		}
-		prePullBeforeChange(ctx, opts, instance, deployment, logger)
-		mergeDeploymentForUpdate(existingDeployment, deployment)
-		_, err = clientset.AppsV1().
-			Deployments(instance.Namespace).
-			Update(ctx, existingDeployment, metav1.UpdateOptions{})
-		if err != nil {
-			logger.Error().Err(err).Msg("Failed to update existing Caddy deployment")
-			return false, false, fmt.Errorf(
-				"failed to update deployment %s: %w",
-				instance.DeploymentName,
-				err,
-			)
-		}
-		logger.Info().Msg("Updated existing Caddy deployment")
-		DeleteLegacyPodDisruptionBudget(ctx, clientset, instance, logger)
-		return true, false, nil
-	case apierrors.IsNotFound(err):
-		prePullBeforeChange(ctx, opts, instance, deployment, logger)
-		_, err = clientset.AppsV1().
-			Deployments(instance.Namespace).
-			Create(ctx, deployment, metav1.CreateOptions{})
-		if err != nil {
-			logger.Error().Err(err).Msg("Failed to create Caddy deployment")
-			return false, false, fmt.Errorf(
-				"failed to create deployment %s: %w",
-				instance.DeploymentName,
-				err,
-			)
-		}
-		logger.Info().Msg("Created Caddy deployment")
-		DeleteLegacyPodDisruptionBudget(ctx, clientset, instance, logger)
-		return true, true, nil
-	default:
-		logger.Error().Err(err).Msg("Failed to fetch existing Caddy deployment")
-		return false, false, fmt.Errorf(
-			"failed to get deployment %s: %w",
-			instance.DeploymentName,
-			err,
-		)
-	}
-}
-
-func prePullBeforeChange(
-	ctx context.Context,
-	opts DeployOptions,
-	instance *Instance,
-	deployment *appsv1.Deployment,
-	logger zerolog.Logger,
-) {
-	if !opts.PrePullImage {
-		return
-	}
-	containers := deployment.Spec.Template.Spec.Containers
-	if len(containers) == 0 {
-		return
-	}
-	if err := prePullImage(
-		ctx,
-		opts.Clientset,
-		instance.Namespace,
-		instance.NodeName,
-		containers[0].Image,
-		opts.imagePullPolicy(),
-		logger,
-	); err != nil {
-		logger.Warn().
-			Err(err).
-			Msg("Image pre-pull did not complete; proceeding (kubelet will pull on rollout)")
-	}
-}
-
 func DeleteLegacyPodDisruptionBudget(
 	ctx context.Context,
 	clientset kubernetes.Interface,
@@ -750,456 +546,5 @@ func DeleteLegacyPodDisruptionBudget(
 	case apierrors.IsNotFound(err):
 	default:
 		logger.Warn().Err(err).Msg("Failed to delete legacy PodDisruptionBudget")
-	}
-}
-
-func deploymentNeedsUpdate(existing, desired *appsv1.Deployment) bool {
-	if !equality.Semantic.DeepEqual(existing.Labels, desired.Labels) {
-		return true
-	}
-	if !equality.Semantic.DeepEqual(existing.Spec.Replicas, desired.Spec.Replicas) {
-		return true
-	}
-	if !equality.Semantic.DeepEqual(existing.Spec.Strategy, desired.Spec.Strategy) {
-		return true
-	}
-	if !equality.Semantic.DeepEqual(existing.Spec.Selector, desired.Spec.Selector) {
-		return true
-	}
-	if !equality.Semantic.DeepEqual(
-		existing.Spec.Template.Labels,
-		desired.Spec.Template.Labels,
-	) {
-		return true
-	}
-	if podTemplateNeedsUpdate(existing.Spec.Template.Spec, desired.Spec.Template.Spec) {
-		return true
-	}
-	return false
-}
-
-func mergeDeploymentForUpdate(existing, desired *appsv1.Deployment) {
-	existing.Labels = desired.Labels
-	existing.Spec.Replicas = desired.Spec.Replicas
-	existing.Spec.Strategy = desired.Spec.Strategy
-	existing.Spec.Selector = desired.Spec.Selector
-	existing.Spec.Template.Labels = desired.Spec.Template.Labels
-	existing.Spec.Template.Spec.NodeSelector = desired.Spec.Template.Spec.NodeSelector
-	existing.Spec.Template.Spec.AutomountServiceAccountToken = desired.Spec.Template.Spec.AutomountServiceAccountToken
-	existing.Spec.Template.Spec.SecurityContext = desired.Spec.Template.Spec.SecurityContext
-	existing.Spec.Template.Spec.Volumes = desired.Spec.Template.Spec.Volumes
-	existing.Spec.Template.Spec.Containers = desired.Spec.Template.Spec.Containers
-	existing.Spec.Template.Spec.HostNetwork = desired.Spec.Template.Spec.HostNetwork
-	existing.Spec.Template.Spec.DNSPolicy = desired.Spec.Template.Spec.DNSPolicy
-}
-
-func podTemplateNeedsUpdate(existing, desired corev1.PodSpec) bool {
-	if !equality.Semantic.DeepEqual(existing.NodeSelector, desired.NodeSelector) {
-		return true
-	}
-	if !equality.Semantic.DeepEqual(
-		existing.AutomountServiceAccountToken,
-		desired.AutomountServiceAccountToken,
-	) {
-		return true
-	}
-	if !equality.Semantic.DeepEqual(existing.SecurityContext, desired.SecurityContext) {
-		return true
-	}
-	if volumesNeedUpdate(existing.Volumes, desired.Volumes) {
-		return true
-	}
-	if existing.HostNetwork != desired.HostNetwork {
-		return true
-	}
-	if existing.DNSPolicy != desired.DNSPolicy {
-		return true
-	}
-	if len(existing.Containers) != len(desired.Containers) {
-		return true
-	}
-	for idx := range desired.Containers {
-		if containerNeedsUpdate(existing.Containers[idx], desired.Containers[idx]) {
-			return true
-		}
-	}
-	return false
-}
-
-func volumesNeedUpdate(existing, desired []corev1.Volume) bool {
-	if len(existing) != len(desired) {
-		return true
-	}
-	existingByName := make(map[string]corev1.Volume, len(existing))
-	for _, existingVolume := range existing {
-		existingByName[existingVolume.Name] = normalizeVolumeForComparison(existingVolume)
-	}
-	for _, desiredVolume := range desired {
-		normalizedDesiredVolume := normalizeVolumeForComparison(desiredVolume)
-		normalizedExistingVolume, exists := existingByName[desiredVolume.Name]
-		if !exists {
-			return true
-		}
-		if !equality.Semantic.DeepEqual(
-			normalizedExistingVolume,
-			normalizedDesiredVolume,
-		) {
-			return true
-		}
-	}
-	return false
-}
-
-func normalizeVolumeForComparison(volume corev1.Volume) corev1.Volume {
-	if volume.ConfigMap == nil {
-		return volume
-	}
-	cm := *volume.ConfigMap
-	cm.DefaultMode = normalizeConfigMapDefaultMode(cm.DefaultMode)
-	volume.ConfigMap = &cm
-	return volume
-}
-
-func normalizeConfigMapDefaultMode(defaultMode *int32) *int32 {
-	if defaultMode == nil || *defaultMode == configMapDefaultMode {
-		return nil
-	}
-	normalizedMode := *defaultMode
-	return &normalizedMode
-}
-
-func containerNeedsUpdate(existing, desired corev1.Container) bool {
-	if existing.Name != desired.Name {
-		return true
-	}
-	if existing.Image != desired.Image {
-		return true
-	}
-	if existing.ImagePullPolicy != desired.ImagePullPolicy {
-		return true
-	}
-	if !equality.Semantic.DeepEqual(existing.Ports, desired.Ports) {
-		return true
-	}
-	if !equality.Semantic.DeepEqual(existing.VolumeMounts, desired.VolumeMounts) {
-		return true
-	}
-	if !equality.Semantic.DeepEqual(existing.Env, desired.Env) {
-		return true
-	}
-	if !equality.Semantic.DeepEqual(existing.SecurityContext, desired.SecurityContext) {
-		return true
-	}
-	return false
-}
-
-func deploymentStrategy(useHostNetwork bool) appsv1.DeploymentStrategy {
-	if useHostNetwork {
-		return appsv1.DeploymentStrategy{
-			Type: appsv1.RecreateDeploymentStrategyType,
-		}
-	}
-	maxSurge := intstr.FromString("25%")
-	maxUnavailable := intstr.FromString("25%")
-	return appsv1.DeploymentStrategy{
-		Type: appsv1.RollingUpdateDeploymentStrategyType,
-		RollingUpdate: &appsv1.RollingUpdateDeployment{
-			MaxSurge:       &maxSurge,
-			MaxUnavailable: &maxUnavailable,
-		},
-	}
-}
-
-func normalizeHostPort(port int) (int32, error) {
-	if port < hostPortMin || port > hostPortMax {
-		return 0, fmt.Errorf(
-			"port %d is out of valid range [%d, %d]",
-			port,
-			hostPortMin,
-			hostPortMax,
-		)
-	}
-	return int32(port), nil
-}
-
-func deployService(
-	ctx context.Context,
-	clientset kubernetes.Interface,
-	instance *Instance,
-) (bool, error) {
-	logger := log.With().Str("service", instance.ServiceName).Logger()
-	return upsertService(
-		ctx, clientset, instance.Namespace, instance.DeploymentName,
-		desiredClusterIPService(instance), logger,
-	)
-}
-
-func deployLoadBalancerService(
-	ctx context.Context,
-	clientset kubernetes.Interface,
-	instance *Instance,
-) (bool, error) {
-	serviceName := instance.LoadBalancerServiceName()
-	logger := log.With().Str("service", serviceName).Logger()
-	desired := desiredLoadBalancerService(instance)
-	if len(instance.ExternalIPs) > 0 {
-		logger.Info().
-			Strs("externalIPs", instance.ExternalIPs).
-			Msg("Setting external IPs for LoadBalancer service")
-		desired.Spec.ExternalIPs = instance.ExternalIPs
-	}
-	return upsertService(ctx, clientset, instance.Namespace, serviceName, desired, logger)
-}
-
-func upsertService(
-	ctx context.Context,
-	clientset kubernetes.Interface,
-	namespace, serviceName string,
-	desired *corev1.Service,
-	logger zerolog.Logger,
-) (bool, error) {
-	existing, err := clientset.CoreV1().
-		Services(namespace).
-		Get(ctx, serviceName, metav1.GetOptions{})
-	switch {
-	case err == nil:
-		updated := existing.DeepCopy()
-		mergeServiceForUpdate(updated, desired)
-		if !serviceNeedsUpdate(existing, updated) {
-			logger.Debug().Msg("Service already up-to-date")
-			return false, nil
-		}
-		_, err = clientset.CoreV1().
-			Services(namespace).
-			Update(ctx, updated, metav1.UpdateOptions{})
-		if err != nil {
-			logger.Error().Err(err).Msg("Failed to update service")
-			return false, fmt.Errorf("failed to update service %s: %w", serviceName, err)
-		}
-		logger.Info().Msg("Updated service")
-		return true, nil
-	case apierrors.IsNotFound(err):
-		_, err = clientset.CoreV1().
-			Services(namespace).
-			Create(ctx, desired, metav1.CreateOptions{})
-		if err != nil {
-			logger.Error().Err(err).Msg("Failed to create service")
-			return false, fmt.Errorf("failed to create service %s: %w", serviceName, err)
-		}
-		logger.Info().Msg("Created service")
-		return true, nil
-	default:
-		logger.Error().Err(err).Msg("Failed to fetch existing service")
-		return false, fmt.Errorf("failed to get service %s: %w", serviceName, err)
-	}
-}
-
-func desiredClusterIPService(
-	instance *Instance,
-) *corev1.Service {
-	adminPort := corev1.ServicePort{
-		Name:       "admin",
-		Port:       constants.CaddyAdminPort,
-		TargetPort: intstr.FromInt(constants.CaddyAdminPort),
-		Protocol:   corev1.ProtocolTCP,
-	}
-	return &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      instance.DeploymentName,
-			Namespace: instance.Namespace,
-			Labels:    managedLabels(instance.NodeName),
-		},
-		Spec: corev1.ServiceSpec{
-			Selector: selectorLabels(instance.NodeName),
-			Ports:    append([]corev1.ServicePort{adminPort}, trafficServicePorts()...),
-			Type:     corev1.ServiceTypeClusterIP,
-		},
-	}
-}
-
-func desiredLoadBalancerService(instance *Instance) *corev1.Service {
-	return &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      instance.LoadBalancerServiceName(),
-			Namespace: instance.Namespace,
-			Labels:    managedLabels(instance.NodeName),
-			Annotations: map[string]string{
-				constants.CiliumNodeIPAMAnnotationKey: constants.HostLabelHostname + "=" + instance.NodeName,
-			},
-		},
-		Spec: corev1.ServiceSpec{
-			Selector:              selectorLabels(instance.NodeName),
-			Ports:                 trafficServicePorts(),
-			Type:                  corev1.ServiceTypeLoadBalancer,
-			LoadBalancerClass:     new(constants.CiliumNodeLoadBalancerClass),
-			ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyTypeLocal,
-			InternalTrafficPolicy: new(corev1.ServiceInternalTrafficPolicyLocal),
-		},
-	}
-}
-
-func mergeServiceForUpdate(existing, desired *corev1.Service) {
-	existing.Labels = desired.Labels
-	if existing.Annotations == nil {
-		existing.Annotations = make(map[string]string)
-	}
-	maps.Copy(existing.Annotations, desired.Annotations)
-	existing.Spec.Selector = desired.Spec.Selector
-	existing.Spec.Type = desired.Spec.Type
-	existing.Spec.ExternalIPs = desired.Spec.ExternalIPs
-	existing.Spec.ExternalTrafficPolicy = desired.Spec.ExternalTrafficPolicy
-	existing.Spec.LoadBalancerClass = desired.Spec.LoadBalancerClass
-	if desired.Spec.InternalTrafficPolicy != nil {
-		existing.Spec.InternalTrafficPolicy = desired.Spec.InternalTrafficPolicy
-	}
-	existing.Spec.Ports = mergeServicePortsKeepingNodePorts(
-		existing.Spec.Ports,
-		desired.Spec.Ports,
-	)
-}
-
-func serviceNeedsUpdate(existing, desired *corev1.Service) bool {
-	if !equality.Semantic.DeepEqual(existing.Labels, desired.Labels) {
-		return true
-	}
-	for k, v := range desired.Annotations {
-		if existing.Annotations[k] != v {
-			return true
-		}
-	}
-	if !equality.Semantic.DeepEqual(existing.Spec.Selector, desired.Spec.Selector) {
-		return true
-	}
-	if existing.Spec.Type != desired.Spec.Type {
-		return true
-	}
-	if !equality.Semantic.DeepEqual(existing.Spec.ExternalIPs, desired.Spec.ExternalIPs) {
-		return true
-	}
-	if existing.Spec.ExternalTrafficPolicy != desired.Spec.ExternalTrafficPolicy {
-		return true
-	}
-	if desired.Spec.InternalTrafficPolicy != nil &&
-		!equality.Semantic.DeepEqual(
-			existing.Spec.InternalTrafficPolicy,
-			desired.Spec.InternalTrafficPolicy,
-		) {
-		return true
-	}
-	if !equality.Semantic.DeepEqual(
-		existing.Spec.LoadBalancerClass,
-		desired.Spec.LoadBalancerClass,
-	) {
-		return true
-	}
-	if !equality.Semantic.DeepEqual(existing.Spec.Ports, desired.Spec.Ports) {
-		return true
-	}
-	return false
-}
-
-func mergeServicePortsKeepingNodePorts(
-	existingPorts []corev1.ServicePort,
-	desiredPorts []corev1.ServicePort,
-) []corev1.ServicePort {
-	if len(desiredPorts) == 0 {
-		return nil
-	}
-	byPortKey := make(map[string]corev1.ServicePort, len(existingPorts))
-	for _, port := range existingPorts {
-		byPortKey[servicePortKey(port)] = port
-	}
-	merged := make([]corev1.ServicePort, 0, len(desiredPorts))
-	for _, port := range desiredPorts {
-		if existingPort, exists := byPortKey[servicePortKey(port)]; exists &&
-			existingPort.NodePort > 0 {
-			port.NodePort = existingPort.NodePort
-		}
-		merged = append(merged, port)
-	}
-	return merged
-}
-
-func servicePortKey(port corev1.ServicePort) string {
-	return port.Name + "/" + string(port.Protocol)
-}
-
-func waitForDeploymentReady(
-	ctx context.Context,
-	clientset kubernetes.Interface,
-	namespace, name string,
-) error {
-	logger := log.With().Str("deployment", name).Str("namespace", namespace).Logger()
-	for {
-		deployment, err := clientset.AppsV1().
-			Deployments(namespace).
-			Get(ctx, name, metav1.GetOptions{})
-		if err != nil {
-			return fmt.Errorf("failed to get deployment %s: %w", name, err)
-		}
-		if deploymentRolloutComplete(deployment) {
-			logger.Info().Msg("Deployment is ready")
-			return nil
-		}
-		desiredReplicas := int32(1)
-		if deployment.Spec.Replicas != nil {
-			desiredReplicas = *deployment.Spec.Replicas
-		}
-		logger.Debug().
-			Int64("generation", deployment.Generation).
-			Int64("observedGeneration", deployment.Status.ObservedGeneration).
-			Int32("available", deployment.Status.AvailableReplicas).
-			Int32("ready", deployment.Status.ReadyReplicas).
-			Int32("updated", deployment.Status.UpdatedReplicas).
-			Int32("replicas", deployment.Status.Replicas).
-			Int32("desired", desiredReplicas).
-			Msg("Waiting for deployment to be ready")
-		timer := time.NewTimer(deploymentPollDelay)
-		select {
-		case <-ctx.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
-			return fmt.Errorf(
-				"context deadline exceeded while waiting for deployment: %w",
-				ctx.Err(),
-			)
-		case <-timer.C:
-		}
-	}
-}
-
-func deploymentRolloutComplete(deployment *appsv1.Deployment) bool {
-	if deployment == nil || deployment.Spec.Replicas == nil {
-		return false
-	}
-	desired := *deployment.Spec.Replicas
-	if deployment.Status.ObservedGeneration < deployment.Generation {
-		return false
-	}
-	if deployment.Status.UpdatedReplicas < desired {
-		return false
-	}
-	if deployment.Status.Replicas > deployment.Status.UpdatedReplicas {
-		return false
-	}
-	if deployment.Status.AvailableReplicas < desired {
-		return false
-	}
-	if deployment.Status.ReadyReplicas < desired {
-		return false
-	}
-	return true
-}
-
-func cleanupDeployment(ctx context.Context, instance *Instance) {
-	log.Warn().
-		Str("deployment", instance.DeploymentName).
-		Msg("Cleaning up failed deployment")
-	if err := instance.Delete(ctx); err != nil {
-		log.Debug().
-			Err(err).
-			Str("deployment", instance.DeploymentName).
-			Msg("Failed to clean up deployment resources")
 	}
 }

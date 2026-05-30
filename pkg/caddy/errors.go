@@ -3,9 +3,10 @@ package caddy
 import "fmt"
 
 type ConfigurationFailedError struct {
-	NodeName string
-	Reason   string
-	Err      error
+	NodeName   string
+	Reason     string
+	Err        error
+	StatusCode int
 }
 
 func (e *ConfigurationFailedError) Error() string {
@@ -32,4 +33,8 @@ func (e *ConfigurationFailedError) Unwrap() error {
 		return nil
 	}
 	return e.Err
+}
+
+func (e *ConfigurationFailedError) IsPermanent() bool {
+	return e != nil && e.StatusCode >= 400 && e.StatusCode < 500
 }

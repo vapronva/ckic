@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -30,6 +31,7 @@ const (
 	defaultHTTPSHostPort   = 443
 	probeShutdownTimeout   = 5 * time.Second
 	probeReadHeaderTimeout = 10 * time.Second
+	leaderRunErrTimeout    = 30 * time.Second
 )
 
 const (
@@ -44,8 +46,9 @@ type cliOptions struct {
 	kubeconfigPath               string
 	nodeLabel                    string
 	configMapName                string
-	configMapNamespace           string
+	namespace                    string
 	bootstrapDefaultConfig       bool
+	configResyncInterval         time.Duration
 	healthBindAddress            string
 	communicationMethod          string
 	logLevel                     string
@@ -115,11 +118,16 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to parse external endpoints")
 	}
-	cfg := controller.ControllerConfig{
+	options.namespace, err = resolveNamespace(options.namespace)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Failed to resolve namespace")
+	}
+	cfg := controller.Config{
 		NodeLabel:                    options.nodeLabel,
 		ConfigMapName:                options.configMapName,
-		ConfigMapNamespace:           options.configMapNamespace,
+		Namespace:                    options.namespace,
 		BootstrapDefaultConfig:       options.bootstrapDefaultConfig,
+		ConfigResyncInterval:         options.configResyncInterval,
 		CommunicationMethod:          commMethod,
 		CaddyImage:                   options.caddyImage,
 		ImagePullPolicy:              imagePullPolicy,
@@ -200,16 +208,24 @@ func registerCoreCLIFlags(opts *cliOptions) {
 		"ConfigMap containing Caddy configuration",
 	)
 	pflag.StringVar(
-		&opts.configMapNamespace,
-		"config-namespace",
-		"caddy-system",
-		"Namespace of the ConfigMap and deployments",
+		&opts.namespace,
+		"namespace",
+		"",
+		"Namespace for managed Caddy resources, ConfigMaps and leases "+
+			"(defaults to the pod namespace via CKIC_NAMESPACE or the in-cluster service account)",
 	)
 	pflag.BoolVar(
 		&opts.bootstrapDefaultConfig,
 		"bootstrap-default-config",
 		false,
 		"Create a default ConfigMap on startup only when it is missing",
+	)
+	pflag.DurationVar(
+		&opts.configResyncInterval,
+		"config-resync-interval",
+		0,
+		"Periodically re-push the merged Caddyfile to all instances even when "+
+			"unchanged (0 disables; e.g. 5m)",
 	)
 	pflag.StringVar(
 		&opts.healthBindAddress,
@@ -412,6 +428,7 @@ func setupLogger(level zerolog.Level) {
 			TimeFormat: time.RFC3339,
 		})
 	}
+	//nolint:reassign // zerolog, configuring global logger
 	log.Logger = log.Output(output).
 		With().
 		Str("service", "ckic-manager").
@@ -436,7 +453,7 @@ func resolveCommunicationMethod(
 			"cannot combine hostNetwork with loadbalancer mode %q", lbMode,
 		)
 	}
-	commMethod := caddy.CommunicationMethodClusterIP
+	var commMethod caddy.CommunicationMethod
 	switch method {
 	case commMethodClusterIP:
 		commMethod = caddy.CommunicationMethodClusterIP
@@ -445,8 +462,10 @@ func resolveCommunicationMethod(
 	case commMethodHostNetwork:
 		commMethod = caddy.CommunicationMethodHostNetwork
 	default:
-		log.Warn().
-			Msgf("Unknown communication method %s, defaulting to clusterip", method)
+		return caddy.CommunicationMethodClusterIP, fmt.Errorf(
+			"unknown communication method %q (want clusterip, direct, or hostnetwork)",
+			method,
+		)
 	}
 	if useHostNetwork && commMethod != caddy.CommunicationMethodHostNetwork {
 		log.Info().
@@ -475,7 +494,7 @@ func resolveImagePullPolicy(policy string) (string, error) {
 
 func newControllerOrDie(
 	clientset *kubernetes.Clientset,
-	cfg controller.ControllerConfig,
+	cfg controller.Config,
 ) *controller.Controller {
 	ctrl, err := controller.NewController(clientset, cfg)
 	if err != nil {
@@ -517,9 +536,11 @@ func runControllerWithLeaderElectionWithRunner(
 	leaseNamespace := leaderElectionLeaseNamespace(options)
 	identity := leaderElectionIdentity()
 	logLeaderElectionEnabled(options, leaseNamespace)
-	var led atomic.Bool
+	leCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var leading atomic.Bool
 	runErrCh := make(chan error, 1)
-	runLeaderElection(ctx, leaderelection.LeaderElectionConfig{
+	runLeaderElection(leCtx, leaderelection.LeaderElectionConfig{
 		Lock:            leaderElectionLock(clientset, options, leaseNamespace, identity),
 		ReleaseOnCancel: true,
 		LeaseDuration:   options.leaderElectionLeaseDuration,
@@ -527,16 +548,14 @@ func runControllerWithLeaderElectionWithRunner(
 		RetryPeriod:     options.leaderElectionRetryPeriod,
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(leadCtx context.Context) {
-				led.Store(true)
+				leading.Store(true)
 				log.Info().Str("identity", identity).Msg("Acquired leadership")
 				runErr := ctrl.Run(leadCtx)
 				if errors.Is(runErr, context.Canceled) {
 					runErr = nil
 				}
-				if runErr == nil && ctx.Err() == nil {
-					runErr = errLeaderElectionLost
-				}
 				runErrCh <- runErr
+				cancel()
 			},
 			OnStoppedLeading: func() {
 				log.Info().Str("identity", identity).Msg("Lost leadership")
@@ -549,17 +568,51 @@ func runControllerWithLeaderElectionWithRunner(
 			},
 		},
 	})
-	if !led.Load() {
-		return nil
+	if ctx.Err() != nil {
+		if !leading.Load() {
+			return nil
+		}
+		select {
+		case runErr := <-runErrCh:
+			return runErr
+		case <-time.After(leaderRunErrTimeout):
+			return nil
+		}
 	}
-	return <-runErrCh
+	select {
+	case runErr := <-runErrCh:
+		if runErr != nil {
+			return runErr
+		}
+		return errLeaderElectionLost
+	case <-time.After(leaderRunErrTimeout):
+		return errLeaderElectionLost
+	}
 }
 
 func leaderElectionLeaseNamespace(options cliOptions) string {
 	if options.leaderElectionLeaseNamespace != "" {
 		return options.leaderElectionLeaseNamespace
 	}
-	return options.configMapNamespace
+	return options.namespace
+}
+
+func resolveNamespace(flagValue string) (string, error) {
+	if flagValue != "" {
+		return flagValue, nil
+	}
+	if env := strings.TrimSpace(os.Getenv("CKIC_NAMESPACE")); env != "" {
+		return env, nil
+	}
+	const saNamespacePath = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+	if data, err := os.ReadFile(saNamespacePath); err == nil {
+		if ns := strings.TrimSpace(string(data)); ns != "" {
+			return ns, nil
+		}
+	}
+	return "", errors.New(
+		"namespace not set: provide --namespace, CKIC_NAMESPACE, or run in-cluster",
+	)
 }
 
 func leaderElectionIdentity() string {
