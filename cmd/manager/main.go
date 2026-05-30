@@ -397,7 +397,7 @@ func registerLeaderElectionCLIFlags(opts *cliOptions) {
 		&opts.leaderElectionLeaseNamespace,
 		"leader-election-lease-namespace",
 		"",
-		"Namespace of the Lease resource used for leader election (defaults to --config-namespace)",
+		"Namespace of the Lease resource used for leader election (defaults to --namespace)",
 	)
 	pflag.DurationVar(
 		&opts.leaderElectionLeaseDuration,
