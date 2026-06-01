@@ -10,7 +10,11 @@ metadata:
   annotations:
     helm.sh/resource-policy: keep
     {{- if eq .Values.loadBalancer.clientIP "proxy-protocol" }}
-    loadbalancer.openstack.org/proxy-protocol: "true"
+    {{- $ppv := .Values.loadBalancer.proxyProtocolVersion | default "v1" }}
+    {{- if not (has $ppv (list "v1" "v2")) }}
+    {{- fail (printf "loadBalancer.proxyProtocolVersion must be \"v1\" or \"v2\", got %q" $ppv) }}
+    {{- end }}
+    loadbalancer.openstack.org/proxy-protocol: {{ $ppv | quote }}
     {{- end }}
     {{- with .Values.loadBalancer.annotations }}
     {{- toYaml . | nindent 4 }}

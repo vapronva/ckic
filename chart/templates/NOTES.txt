@@ -1,0 +1,31 @@
+CKIC manager installed.
+
+{{- if not .Values.config.caddyAdminOriginKey }}
+
+WARNING: config.caddyAdminOriginKey is empty, so Caddy's admin API on :2019 is reachable with no Origin check.
+{{- end }}
+
+{{- if and .Values.config.useHostNetwork (ne .Values.loadBalancer.mode "none") }}
+
+config.useHostNetwork is true, so loadBalancer.mode ({{ .Values.loadBalancer.mode }}) is ignored and the manager runs with --loadbalancer-mode=none.
+hostNetwork exposes Caddy directly on host ports; a managed LoadBalancer Service would be redundant and is disabled.
+hostNetwork pods share the node's network namespace, so any :2019 restriction must be a host firewall rule.
+{{- end }}
+
+LoadBalancer mode: {{ if .Values.config.useHostNetwork }}none (hostNetwork){{ else }}{{ .Values.loadBalancer.mode }}{{ end }}
+
+{{- if eq .Values.loadBalancer.mode "shared" }}
+
+A single shared LoadBalancer Service "caddy-loadbalancer" fronts all Caddy pods.
+Client-IP profile: {{ .Values.loadBalancer.clientIP }}
+Watch the external address: kubectl --namespace {{ .Release.Namespace }} get services caddy-loadbalancer --watch=false
+
+{{- if eq .Values.loadBalancer.clientIP "proxy-protocol" }}
+
+externalTrafficPolicy=Cluster and PROXY protocol {{ .Values.loadBalancer.proxyProtocolVersion | default "v2" }}.
+PROXY is TCP-only, so HTTP/3 is off in this profile.
+{{- else }}
+
+externalTrafficPolicy=Local and HTTP/3 (UDP 443).
+{{- end }}
+{{- end }}

@@ -10,7 +10,7 @@ updateStrategy:
 image:
   repository: docker.horse
   image: vapronva/ckic/manager
-  tag: 0.31.1
+  tag: 0.31.2
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -106,6 +106,7 @@ config:
 loadBalancer:
   mode: cilium
   clientIP: proxy-protocol
+  proxyProtocolVersion: v2
   externalTrafficPolicy: ""
   loadBalancerIP: ""
   enableUDP: false
