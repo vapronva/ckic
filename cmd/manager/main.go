@@ -248,7 +248,7 @@ func registerCoreCLIFlags(opts *cliOptions) {
 	pflag.StringVar(
 		&opts.caddyImage,
 		"caddy-image",
-		"docker.horse/oss-images/zerossl-caddy/caddy:2.11.3-alpine",
+		"docker.horse/oss-images/zerossl-caddy/caddy:2.11.4-alpine",
 		"Caddy image (format image:tag)",
 	)
 	pflag.StringVar(

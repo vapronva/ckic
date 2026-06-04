@@ -10,7 +10,7 @@ updateStrategy:
 image:
   repository: docker.horse
   image: vapronva/ckic/manager
-  tag: 0.31.2
+  tag: 0.32.0
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -82,7 +82,7 @@ config:
   configResyncInterval: 0s
   communicationMethod: clusterip
   logLevel: info
-  caddyImage: docker.horse/oss-images/zerossl-caddy/caddy:2.11.3-alpine
+  caddyImage: docker.horse/oss-images/zerossl-caddy/caddy:2.11.4-alpine
   imagePullPolicy: IfNotPresent
   prePullImage: true
   useHostNetwork: false
