@@ -2,6 +2,7 @@ package caddy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/rs/zerolog"
@@ -15,6 +16,7 @@ type Instance struct {
 	NodeName       string
 	Namespace      string
 	PodName        string
+	PodReady       bool
 	DeploymentName string
 	ExternalIPs    []string
 	KubeClient     kubernetes.Interface
@@ -29,37 +31,47 @@ func (i *Instance) Delete(ctx context.Context) error {
 		Str("node", i.NodeName).
 		Str("deployment", i.DeploymentName).
 		Logger()
-	i.deleteService(ctx, i.DeploymentName, "ClusterIP", logger)
-	i.deleteService(ctx, i.LoadBalancerServiceName(), "LoadBalancer", logger)
+	return errors.Join(
+		i.deleteService(ctx, i.DeploymentName, "ClusterIP", logger),
+		i.deleteService(ctx, i.LoadBalancerServiceName(), "LoadBalancer", logger),
+		i.deleteDeployment(ctx, logger),
+	)
+}
+
+func (i *Instance) deleteDeployment(ctx context.Context, logger zerolog.Logger) error {
 	err := i.KubeClient.AppsV1().Deployments(i.Namespace).Delete(
 		ctx, i.DeploymentName, metav1.DeleteOptions{},
 	)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			logger.Debug().Msg("Caddy deployment already deleted")
-			return nil
-		}
+	switch {
+	case err == nil:
+		logger.Info().Msg("Deleted Caddy deployment")
+		return nil
+	case apierrors.IsNotFound(err):
+		logger.Debug().Msg("Caddy deployment already deleted")
+		return nil
+	default:
 		logger.Error().Err(err).Msg("Failed to delete Caddy deployment")
 		return fmt.Errorf("failed to delete deployment %s: %w", i.DeploymentName, err)
 	}
-	logger.Info().Msg("Deleted Caddy deployment")
-	return nil
 }
 
 func (i *Instance) deleteService(
 	ctx context.Context,
 	name, kind string,
 	logger zerolog.Logger,
-) {
+) error {
 	err := i.KubeClient.CoreV1().Services(i.Namespace).Delete(
 		ctx, name, metav1.DeleteOptions{},
 	)
 	switch {
 	case err == nil:
 		logger.Info().Msgf("Deleted %s Caddy service", kind)
+		return nil
 	case apierrors.IsNotFound(err):
 		logger.Debug().Msgf("%s Caddy service already deleted or never created", kind)
+		return nil
 	default:
 		logger.Warn().Err(err).Msgf("Failed to delete %s Caddy service", kind)
+		return fmt.Errorf("failed to delete %s service %s: %w", kind, name, err)
 	}
 }

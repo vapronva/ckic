@@ -10,7 +10,7 @@ updateStrategy:
 image:
   repository: docker.horse
   image: vapronva/ckic/manager
-  tag: 0.32.0
+  tag: 0.33.0
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -60,7 +60,6 @@ affinity: {}
 leaderElection:
   enabled: true
   leaseName: ckic-manager-leader
-  leaseNamespace: ""
   leaseDuration: 15s
   renewDeadline: 10s
   retryPeriod: 2s

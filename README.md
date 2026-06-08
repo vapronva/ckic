@@ -12,7 +12,7 @@ flowchart LR
         subgraph Ctrl["<b><code>pkg/controller</code></b>"]
             direction TB
             Informers["<b>Informers</b><br/>nodes + <code>ConfigMaps</code> + <code>Deployments</code>"]
-            Reconciler["<b>Workqueue</b> + <b>reconciler</b><br/>server-side apply + push dedup + redeploy-on-failure"]
+            Reconciler["<b>Workqueue</b> + <b>reconciler</b><br/>server-side apply + push dedup + retry-with-backoff"]
         end
         Aggregator["<b><code>pkg/aggregator</code></b><br/>merge base + external <code>Caddyfile</code>s"]
         subgraph CaddyPkg["<b><code>pkg/caddy</code></b>"]

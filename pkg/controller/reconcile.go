@@ -87,8 +87,20 @@ func (c *Controller) reconcileNode(ctx context.Context, nodeName string) error {
 	if c.pushUpToDate(nodeName, digest, instance.PodName) {
 		return nil
 	}
+	if !instance.PodReady {
+		c.queue.AddAfter(nodeName, podStartupRequeueInterval)
+		return nil
+	}
 	if pushErr := c.pushFn(ctx, instance, merged); pushErr != nil {
-		c.maybeRedeploy(ctx, nodeName, instance, pushErr)
+		var cfgErr *caddy.ConfigurationFailedError
+		if errors.As(pushErr, &cfgErr) && cfgErr.IsPermanent() {
+			log.Error().
+				Err(pushErr).
+				Str("node", nodeName).
+				Msg("Caddy rejected the configuration; not retrying until it changes")
+			c.recordPush(nodeName, digest, instance.PodName)
+			return nil
+		}
 		return pushErr
 	}
 	c.recordPush(nodeName, digest, instance.PodName)
@@ -125,36 +137,6 @@ func (c *Controller) teardownNode(ctx context.Context, nodeName string) error {
 	}
 	c.clearPushState(nodeName)
 	return nil
-}
-
-func (c *Controller) maybeRedeploy(
-	ctx context.Context,
-	nodeName string,
-	instance *caddy.Instance,
-	pushErr error,
-) {
-	if errors.Is(pushErr, context.Canceled) {
-		return
-	}
-	var cfgErr *caddy.ConfigurationFailedError
-	if errors.As(pushErr, &cfgErr) && cfgErr.IsPermanent() {
-		return
-	}
-	if c.queue.NumRequeues(nodeName) != maxPushFailures {
-		return
-	}
-	log.Warn().
-		Str("node", nodeName).
-		Int("failures", c.queue.NumRequeues(nodeName)).
-		Msg("Config-push failure threshold reached; redeploying Caddy instance once")
-	if err := instance.Delete(ctx); err != nil {
-		log.Error().
-			Err(err).
-			Str("node", nodeName).
-			Msg("Failed to delete instance for redeploy")
-		return
-	}
-	c.clearPushState(nodeName)
 }
 
 func (c *Controller) pushUpToDate(nodeName, digest, podName string) bool {

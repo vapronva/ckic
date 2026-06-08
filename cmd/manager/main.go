@@ -27,11 +27,12 @@ import (
 )
 
 const (
-	defaultHTTPHostPort    = 80
-	defaultHTTPSHostPort   = 443
-	probeShutdownTimeout   = 5 * time.Second
-	probeReadHeaderTimeout = 10 * time.Second
-	leaderRunErrTimeout    = 30 * time.Second
+	defaultHTTPHostPort        = 80
+	defaultHTTPSHostPort       = 443
+	probeShutdownTimeout       = 5 * time.Second
+	probeReadHeaderTimeout     = 10 * time.Second
+	leaderRunErrTimeout        = 30 * time.Second
+	leaderElectionJitterFactor = 1.2
 )
 
 const (
@@ -75,7 +76,6 @@ type cliOptions struct {
 	externalAggregatedConfigName string
 	leaderElectionEnabled        bool
 	leaderElectionLeaseName      string
-	leaderElectionLeaseNamespace string
 	leaderElectionLeaseDuration  time.Duration
 	leaderElectionRenewDeadline  time.Duration
 	leaderElectionRetryPeriod    time.Duration
@@ -89,8 +89,7 @@ type leaderElectionRunFunc func(context.Context, leaderelection.LeaderElectionCo
 
 func main() {
 	options := parseCLIOptions()
-	level := parseLogLevel(options.logLevel)
-	setupLogger(level)
+	setupLogger(options.logLevel)
 	lbMode, err := caddy.ParseLoadBalancerMode(options.loadBalancerMode)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Invalid loadbalancer mode")
@@ -107,6 +106,16 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("Invalid image pull policy")
 	}
+	if options.useHostNetwork {
+		if portErr := caddy.ValidateHostPorts(
+			options.httpHostPort, options.httpsHostPort,
+		); portErr != nil {
+			log.Fatal().Err(portErr).Msg("Invalid host port configuration")
+		}
+	}
+	if leErr := validateLeaderElectionTimings(options); leErr != nil {
+		log.Fatal().Err(leErr).Msg("Invalid leader election configuration")
+	}
 	clientset, err := utils.GetKubernetesClient(options.kubeconfigPath)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to build Kubernetes client")
@@ -122,34 +131,7 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to resolve namespace")
 	}
-	cfg := controller.Config{
-		NodeLabel:                    options.nodeLabel,
-		ConfigMapName:                options.configMapName,
-		Namespace:                    options.namespace,
-		BootstrapDefaultConfig:       options.bootstrapDefaultConfig,
-		ConfigResyncInterval:         options.configResyncInterval,
-		CommunicationMethod:          commMethod,
-		CaddyImage:                   options.caddyImage,
-		ImagePullPolicy:              imagePullPolicy,
-		PrePullImage:                 options.prePullImage,
-		LoadBalancerMode:             lbMode,
-		EnvSecretName:                options.secretName,
-		EnvSecretKeys:                options.secretEnvKeys,
-		DataVolumePVC:                options.dataVolumePVC,
-		ConfigVolumePVC:              options.configVolumePVC,
-		ExternalEndpoints:            extEndpointsMap,
-		UseHostNetwork:               options.useHostNetwork,
-		CaddyAdminOriginKey:          options.caddyAdminOriginKey,
-		HTTPHostPort:                 options.httpHostPort,
-		HTTPSHostPort:                options.httpsHostPort,
-		ExternalEnable:               options.externalEnable,
-		ExternalLabel:                options.externalLabel,
-		ExternalNsMode:               options.externalNsMode,
-		ExternalAllowNamespaces:      options.externalAllowNamespaces,
-		ExternalDenyNamespaces:       options.externalDenyNamespaces,
-		ExternalPublishAggregated:    options.externalPublishAggregated,
-		ExternalAggregatedConfigName: options.externalAggregatedConfigName,
-	}
+	cfg := buildControllerConfig(options, commMethod, imagePullPolicy, lbMode, extEndpointsMap)
 	ctrl := newControllerOrDie(clientset, cfg)
 	ctx, cancel := context.WithCancel(context.Background())
 	readiness := &atomic.Bool{}
@@ -172,9 +154,13 @@ func main() {
 	select {
 	case runErr = <-runErrCh:
 	case probeErr := <-probeErrCh:
-		runErr = probeErr
 		cancel()
-		<-runErrCh
+		ctrlErr := <-runErrCh
+		if probeErr != nil {
+			runErr = probeErr
+		} else {
+			runErr = ctrlErr
+		}
 	}
 	signal.Stop(sigCh)
 	cancel()
@@ -393,12 +379,6 @@ func registerLeaderElectionCLIFlags(opts *cliOptions) {
 		"ckic-manager-leader",
 		"Name of the Lease resource used for leader election",
 	)
-	pflag.StringVar(
-		&opts.leaderElectionLeaseNamespace,
-		"leader-election-lease-namespace",
-		"",
-		"Namespace of the Lease resource used for leader election (defaults to --namespace)",
-	)
 	pflag.DurationVar(
 		&opts.leaderElectionLeaseDuration,
 		"leader-election-lease-duration",
@@ -419,8 +399,12 @@ func registerLeaderElectionCLIFlags(opts *cliOptions) {
 	)
 }
 
-func setupLogger(level zerolog.Level) {
-	zerolog.SetGlobalLevel(level)
+func setupLogger(level string) {
+	parsedLevel, err := zerolog.ParseLevel(level)
+	if err != nil {
+		parsedLevel = zerolog.InfoLevel
+	}
+	zerolog.SetGlobalLevel(parsedLevel)
 	var output io.Writer = os.Stdout
 	if os.Getenv("LOG_FORMAT") != "json" {
 		output = zerolog.SyncWriter(zerolog.ConsoleWriter{
@@ -433,14 +417,6 @@ func setupLogger(level zerolog.Level) {
 		With().
 		Str("service", "ckic-manager").
 		Logger()
-}
-
-func parseLogLevel(level string) zerolog.Level {
-	parsedLevel, err := zerolog.ParseLevel(level)
-	if err != nil {
-		return zerolog.InfoLevel
-	}
-	return parsedLevel
 }
 
 func resolveCommunicationMethod(
@@ -492,6 +468,70 @@ func resolveImagePullPolicy(policy string) (string, error) {
 	}
 }
 
+func validateLeaderElectionTimings(options cliOptions) error {
+	if !options.leaderElectionEnabled {
+		return nil
+	}
+	lease := options.leaderElectionLeaseDuration
+	renew := options.leaderElectionRenewDeadline
+	retry := options.leaderElectionRetryPeriod
+	if lease <= 0 || renew <= 0 || retry <= 0 {
+		return errors.New("leader election durations must all be positive")
+	}
+	if lease <= renew {
+		return fmt.Errorf(
+			"leader-election-lease-duration (%s) must be greater than "+
+				"leader-election-renew-deadline (%s)",
+			lease, renew,
+		)
+	}
+	if minRenew := time.Duration(leaderElectionJitterFactor * float64(retry)); renew <= minRenew {
+		return fmt.Errorf(
+			"leader-election-renew-deadline (%s) must be greater than %s "+
+				"(%.1f × leader-election-retry-period)",
+			renew, minRenew, leaderElectionJitterFactor,
+		)
+	}
+	return nil
+}
+
+func buildControllerConfig(
+	options cliOptions,
+	commMethod caddy.CommunicationMethod,
+	imagePullPolicy string,
+	lbMode caddy.LoadBalancerMode,
+	extEndpoints utils.ExternalEndpointsMap,
+) controller.Config {
+	return controller.Config{
+		NodeLabel:                    options.nodeLabel,
+		ConfigMapName:                options.configMapName,
+		Namespace:                    options.namespace,
+		BootstrapDefaultConfig:       options.bootstrapDefaultConfig,
+		ConfigResyncInterval:         options.configResyncInterval,
+		CommunicationMethod:          commMethod,
+		CaddyImage:                   options.caddyImage,
+		ImagePullPolicy:              imagePullPolicy,
+		PrePullImage:                 options.prePullImage,
+		LoadBalancerMode:             lbMode,
+		EnvSecretName:                options.secretName,
+		EnvSecretKeys:                options.secretEnvKeys,
+		DataVolumePVC:                options.dataVolumePVC,
+		ConfigVolumePVC:              options.configVolumePVC,
+		ExternalEndpoints:            extEndpoints,
+		UseHostNetwork:               options.useHostNetwork,
+		CaddyAdminOriginKey:          options.caddyAdminOriginKey,
+		HTTPHostPort:                 options.httpHostPort,
+		HTTPSHostPort:                options.httpsHostPort,
+		ExternalEnable:               options.externalEnable,
+		ExternalLabel:                options.externalLabel,
+		ExternalNsMode:               options.externalNsMode,
+		ExternalAllowNamespaces:      options.externalAllowNamespaces,
+		ExternalDenyNamespaces:       options.externalDenyNamespaces,
+		ExternalPublishAggregated:    options.externalPublishAggregated,
+		ExternalAggregatedConfigName: options.externalAggregatedConfigName,
+	}
+}
+
 func newControllerOrDie(
 	clientset *kubernetes.Clientset,
 	cfg controller.Config,
@@ -533,7 +573,7 @@ func runControllerWithLeaderElectionWithRunner(
 	if !options.leaderElectionEnabled {
 		return ctrl.Run(ctx)
 	}
-	leaseNamespace := leaderElectionLeaseNamespace(options)
+	leaseNamespace := options.namespace
 	identity := leaderElectionIdentity()
 	logLeaderElectionEnabled(options, leaseNamespace)
 	leCtx, cancel := context.WithCancel(ctx)
@@ -588,13 +628,6 @@ func runControllerWithLeaderElectionWithRunner(
 	case <-time.After(leaderRunErrTimeout):
 		return errLeaderElectionLost
 	}
-}
-
-func leaderElectionLeaseNamespace(options cliOptions) string {
-	if options.leaderElectionLeaseNamespace != "" {
-		return options.leaderElectionLeaseNamespace
-	}
-	return options.namespace
 }
 
 func resolveNamespace(flagValue string) (string, error) {

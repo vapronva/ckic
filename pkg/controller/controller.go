@@ -59,14 +59,14 @@ type Config struct {
 }
 
 const (
-	configReconcileKey = "\x00config-reconcile"
-	workerCount        = 4
-	reconcileTimeout   = 2 * time.Minute
-	informerResync     = 10 * time.Minute
-	maxPushFailures    = 5
-	nsModeAll          = "all"
-	nsModeAllow        = "allow"
-	nsModeDeny         = "deny"
+	configReconcileKey        = "\x00config-reconcile"
+	workerCount               = 4
+	reconcileTimeout          = 5 * time.Minute
+	informerResync            = 10 * time.Minute
+	podStartupRequeueInterval = 5 * time.Second
+	nsModeAll                 = "all"
+	nsModeAllow               = "allow"
+	nsModeDeny                = "deny"
 )
 
 type pushRecord struct {
@@ -78,7 +78,6 @@ type Controller struct {
 	clientset         kubernetes.Interface
 	config            Config
 	deployOpts        caddy.DeployOptions
-	comm              caddy.CommunicationMethod
 	adminConfig       *caddy.AdminAPIConfig
 	aggregator        *aggregator.Aggregator
 	nodeSelector      labels.Selector
@@ -115,27 +114,37 @@ func NewController(
 				config.ExternalNsMode,
 			)
 		}
+		externalLabel, _, labelErr := utils.NormalizeNodeLabelSelector(config.ExternalLabel)
+		if labelErr != nil {
+			return nil, fmt.Errorf("invalid external label selector: %w", labelErr)
+		}
+		config.ExternalLabel = externalLabel
+	}
+	if config.ExternalPublishAggregated && config.ExternalAggregatedConfigName == "" {
+		return nil, errors.New(
+			"external aggregated config name must be set when publishing the aggregated config",
+		)
 	}
 	c := &Controller{
 		clientset: clientset,
 		config:    config,
 		deployOpts: caddy.DeployOptions{
-			Clientset:        clientset,
-			Namespace:        config.Namespace,
-			CaddyImage:       config.CaddyImage,
-			ImagePullPolicy:  corev1.PullPolicy(config.ImagePullPolicy),
-			PrePullImage:     config.PrePullImage,
-			LoadBalancerMode: config.LoadBalancerMode,
-			EnvSecretName:    config.EnvSecretName,
-			EnvSecretKeys:    config.EnvSecretKeys,
-			DataVolumePVC:    config.DataVolumePVC,
-			ConfigVolumePVC:  config.ConfigVolumePVC,
-			ConfigMapName:    bootConfigMapName(config),
-			UseHostNetwork:   config.UseHostNetwork,
-			HTTPHostPort:     config.HTTPHostPort,
-			HTTPSHostPort:    config.HTTPSHostPort,
+			Clientset:           clientset,
+			Namespace:           config.Namespace,
+			CaddyImage:          config.CaddyImage,
+			ImagePullPolicy:     corev1.PullPolicy(config.ImagePullPolicy),
+			PrePullImage:        config.PrePullImage,
+			LoadBalancerMode:    config.LoadBalancerMode,
+			EnvSecretName:       config.EnvSecretName,
+			EnvSecretKeys:       config.EnvSecretKeys,
+			DataVolumePVC:       config.DataVolumePVC,
+			ConfigVolumePVC:     config.ConfigVolumePVC,
+			ConfigMapName:       bootConfigMapName(config),
+			CaddyAdminOriginKey: config.CaddyAdminOriginKey,
+			UseHostNetwork:      config.UseHostNetwork,
+			HTTPHostPort:        config.HTTPHostPort,
+			HTTPSHostPort:       config.HTTPSHostPort,
 		},
-		comm:              config.CommunicationMethod,
 		adminConfig:       caddy.NewAdminAPIConfig(config.CaddyAdminOriginKey),
 		nodeSelector:      selector,
 		allowedNamespaces: parseNamespaceSet(config.ExternalAllowNamespaces),
@@ -144,7 +153,7 @@ func NewController(
 		deployFn:          caddy.EnsureCaddy,
 	}
 	c.pushFn = func(ctx context.Context, instance *caddy.Instance, merged string) error {
-		return instance.UpdateConfig(ctx, merged, c.comm, c.adminConfig)
+		return instance.UpdateConfig(ctx, merged, c.config.CommunicationMethod, c.adminConfig)
 	}
 	c.queue = workqueue.NewTypedRateLimitingQueue(
 		workqueue.DefaultTypedControllerRateLimiter[string](),
@@ -210,16 +219,17 @@ func (c *Controller) setupInformers() {
 	c.cacheSyncs = append(c.cacheSyncs, extInformer.Informer().HasSynced)
 }
 
-func (c *Controller) addNodeHandler(informer cache.SharedIndexInformer) {
-	enqueueIfManaged := func(node *corev1.Node) {
-		if c.nodeSelector.Matches(labels.Set(node.Labels)) {
-			c.queue.Add(node.Name)
-		}
+func (c *Controller) enqueueNodeIfManaged(node *corev1.Node) {
+	if c.nodeSelector.Matches(labels.Set(node.Labels)) {
+		c.queue.Add(node.Name)
 	}
+}
+
+func (c *Controller) addNodeHandler(informer cache.SharedIndexInformer) {
 	_, _ = informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj any) {
 			if node, ok := obj.(*corev1.Node); ok {
-				enqueueIfManaged(node)
+				c.enqueueNodeIfManaged(node)
 			}
 		},
 		UpdateFunc: func(oldObj, newObj any) {
@@ -235,7 +245,7 @@ func (c *Controller) addNodeHandler(informer cache.SharedIndexInformer) {
 		},
 		DeleteFunc: func(obj any) {
 			if node, ok := tombstone[*corev1.Node](obj); ok {
-				c.queue.Add(node.Name)
+				c.enqueueNodeIfManaged(node)
 			}
 		},
 	})
@@ -338,7 +348,9 @@ func (c *Controller) Run(ctx context.Context) error {
 		return errors.New("failed to sync informer caches")
 	}
 	logger.Info().Msg("Caches synced; starting reconcile workers")
-	c.publishInitialMirror(ctx, logger)
+	if err := c.publishInitialMirror(ctx); err != nil {
+		return err
+	}
 	c.enqueueExistingDeployments(logger)
 	c.queue.Add(configReconcileKey)
 	var wg sync.WaitGroup
@@ -375,9 +387,9 @@ func (c *Controller) runConfigResync(stopCh <-chan struct{}) {
 	}
 }
 
-func (c *Controller) publishInitialMirror(ctx context.Context, logger zerolog.Logger) {
+func (c *Controller) publishInitialMirror(ctx context.Context) error {
 	if !c.config.ExternalPublishAggregated {
-		return
+		return nil
 	}
 	cm, err := c.clientset.CoreV1().
 		ConfigMaps(c.config.Namespace).
@@ -389,11 +401,12 @@ func (c *Controller) publishInitialMirror(ctx context.Context, logger zerolog.Lo
 		}
 	case apierrors.IsNotFound(err):
 	default:
-		logger.Warn().Err(err).Msg("Failed to read base ConfigMap for initial mirror")
+		return fmt.Errorf("failed to read base ConfigMap for initial mirror: %w", err)
 	}
 	if pubErr := c.aggregator.PublishMirror(ctx); pubErr != nil {
-		logger.Warn().Err(pubErr).Msg("Failed to publish initial mirror ConfigMap")
+		return fmt.Errorf("failed to publish initial mirror ConfigMap: %w", pubErr)
 	}
+	return nil
 }
 
 func (c *Controller) enqueueExistingDeployments(logger zerolog.Logger) {
@@ -434,7 +447,7 @@ func (c *Controller) bootstrapBaseConfig(
 	}
 	apply := corev1ac.ConfigMap(c.config.ConfigMapName, c.config.Namespace).
 		WithData(map[string]string{
-			constants.CaddyfileKey: ":80 {\n    respond \"Hello, world!\"\n}\n",
+			constants.CaddyfileKey: defaultBootstrapCaddyfile(c.config.CaddyAdminOriginKey),
 		})
 	if _, err = c.clientset.CoreV1().ConfigMaps(c.config.Namespace).Apply(
 		ctx, apply, metav1.ApplyOptions{FieldManager: "ckic", Force: true},
@@ -443,6 +456,17 @@ func (c *Controller) bootstrapBaseConfig(
 	}
 	logger.Info().Msg("Bootstrapped default base ConfigMap")
 	return nil
+}
+
+func defaultBootstrapCaddyfile(originKey string) string {
+	admin := "\tadmin :2019\n"
+	if originKey != "" {
+		admin = fmt.Sprintf(
+			"\tadmin :2019 {\n\t\torigins http://%s.caddy-admin-api.ckic.cmld.ru\n\t\tenforce_origin\n\t}\n",
+			originKey,
+		)
+	}
+	return fmt.Sprintf("{\n%s}\n\n:80 {\n\trespond \"Hello, world!\"\n}\n", admin)
 }
 
 func tombstone[T any](obj any) (T, bool) {

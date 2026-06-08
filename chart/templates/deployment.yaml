@@ -54,9 +54,6 @@ spec:
             - "--config-resync-interval={{ .Values.config.configResyncInterval }}"
             - "--leader-elect={{ .Values.leaderElection.enabled }}"
             - "--leader-election-lease-name={{ .Values.leaderElection.leaseName }}"
-            {{- if .Values.leaderElection.leaseNamespace }}
-            - "--leader-election-lease-namespace={{ .Values.leaderElection.leaseNamespace }}"
-            {{- end }}
             - "--leader-election-lease-duration={{ .Values.leaderElection.leaseDuration }}"
             - "--leader-election-renew-deadline={{ .Values.leaderElection.renewDeadline }}"
             - "--leader-election-retry-period={{ .Values.leaderElection.retryPeriod }}"

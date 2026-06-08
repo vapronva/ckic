@@ -19,6 +19,7 @@ import (
 const (
 	imagePrePullTimeout   = 3 * time.Minute
 	imagePrePullPollDelay = 2 * time.Second
+	prePullCleanupTimeout = 30 * time.Second
 	prePullContainerName  = "prepull"
 )
 
@@ -34,7 +35,10 @@ func prePullImage(
 		Str("prepullPod", podName).
 		Str("image", image).
 		Logger()
-	cleanupCtx := context.WithoutCancel(ctx)
+	cleanupCtx, cancelCleanup := context.WithTimeout(
+		context.WithoutCancel(ctx), prePullCleanupTimeout,
+	)
+	defer cancelCleanup()
 	deletePrePullPod(cleanupCtx, clientset, namespace, podName)
 	pod := prePullPodSpec(podName, namespace, nodeName, image, pullPolicy)
 	if _, err := clientset.CoreV1().

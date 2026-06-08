@@ -102,11 +102,7 @@ func appendUniqueValidatedIPs(
 ) ([]string, error) {
 	seen := make(map[string]struct{}, len(existing))
 	for _, ip := range existing {
-		if parsed := net.ParseIP(ip); parsed != nil {
-			seen[parsed.String()] = struct{}{}
-		} else {
-			seen[ip] = struct{}{}
-		}
+		seen[net.ParseIP(ip).String()] = struct{}{}
 	}
 	result := existing
 	for _, rawIP := range rawIPs {
