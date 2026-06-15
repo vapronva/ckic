@@ -35,18 +35,21 @@ func prePullImage(
 		Str("prepullPod", podName).
 		Str("image", image).
 		Logger()
-	cleanupCtx, cancelCleanup := context.WithTimeout(
-		context.WithoutCancel(ctx), prePullCleanupTimeout,
-	)
-	defer cancelCleanup()
-	deletePrePullPod(cleanupCtx, clientset, namespace, podName)
+	cleanup := func() {
+		cleanupCtx, cancel := context.WithTimeout(
+			context.WithoutCancel(ctx), prePullCleanupTimeout,
+		)
+		defer cancel()
+		deletePrePullPod(cleanupCtx, clientset, namespace, podName)
+	}
+	cleanup()
 	pod := prePullPodSpec(podName, namespace, nodeName, image, pullPolicy)
 	if _, err := clientset.CoreV1().
 		Pods(namespace).
 		Create(ctx, pod, metav1.CreateOptions{}); err != nil {
 		return fmt.Errorf("failed to create pre-pull pod: %w", err)
 	}
-	defer deletePrePullPod(cleanupCtx, clientset, namespace, podName)
+	defer cleanup()
 	logger.Info().Msg("Pre-pulling Caddy image on node")
 	if err := waitForImagePulled(ctx, clientset, namespace, podName); err != nil {
 		return err

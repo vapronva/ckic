@@ -62,7 +62,6 @@ type cliOptions struct {
 	dataVolumePVC                string
 	configVolumePVC              string
 	externalEndpoints            []string
-	externalEndpointsFile        string
 	useHostNetwork               bool
 	caddyAdminOriginKey          string
 	httpHostPort                 int
@@ -120,10 +119,7 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to build Kubernetes client")
 	}
-	extEndpointsMap, err := utils.ParseExternalEndpoints(
-		options.externalEndpoints,
-		options.externalEndpointsFile,
-	)
+	extEndpointsMap, err := utils.ParseExternalEndpoints(options.externalEndpoints)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to parse external endpoints")
 	}
@@ -288,12 +284,6 @@ func registerCoreNetworkingCLIFlags(opts *cliOptions) {
 		"external-endpoints",
 		[]string{},
 		"External endpoints for nodes (format: nodeName=ip1,ip2,...)",
-	)
-	pflag.StringVar(
-		&opts.externalEndpointsFile,
-		"external-endpoints-file",
-		"",
-		"Path to JSON file containing external endpoints mapping",
 	)
 	pflag.BoolVar(
 		&opts.useHostNetwork,
@@ -512,7 +502,7 @@ func buildControllerConfig(
 		CaddyImage:                   options.caddyImage,
 		ImagePullPolicy:              imagePullPolicy,
 		PrePullImage:                 options.prePullImage,
-		LoadBalancerMode:             lbMode,
+		EnableCiliumLB:               lbMode == caddy.LoadBalancerModeCilium,
 		EnvSecretName:                options.secretName,
 		EnvSecretKeys:                options.secretEnvKeys,
 		DataVolumePVC:                options.dataVolumePVC,

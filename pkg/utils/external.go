@@ -1,12 +1,9 @@
 package utils
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
-	"os"
-	"path/filepath"
 	"strings"
 )
 
@@ -14,16 +11,8 @@ type ExternalEndpointsMap map[string][]string
 
 const endpointKVParts = 2
 
-func ParseExternalEndpoints(
-	endpoints []string,
-	endpointsFile string,
-) (ExternalEndpointsMap, error) {
+func ParseExternalEndpoints(endpoints []string) (ExternalEndpointsMap, error) {
 	result := make(ExternalEndpointsMap)
-	if endpointsFile != "" {
-		if err := mergeExternalEndpointsFile(result, endpointsFile); err != nil {
-			return nil, err
-		}
-	}
 	for _, endpoint := range endpoints {
 		parts := strings.SplitN(endpoint, "=", endpointKVParts)
 		if len(parts) != endpointKVParts {
@@ -53,46 +42,6 @@ func ParseExternalEndpoints(
 		result[nodeName] = updatedIPs
 	}
 	return result, nil
-}
-
-func mergeExternalEndpointsFile(result ExternalEndpointsMap, endpointsFile string) error {
-	cleanPath := filepath.Clean(endpointsFile)
-	if !filepath.IsAbs(cleanPath) {
-		return fmt.Errorf(
-			"external endpoints file must be an absolute path: %s",
-			endpointsFile,
-		)
-	}
-	fileData, err := os.ReadFile(cleanPath)
-	if err != nil {
-		return fmt.Errorf("failed to read external endpoints file: %w", err)
-	}
-	var rawResult map[string][]string
-	if unmarshalErr := json.Unmarshal(fileData, &rawResult); unmarshalErr != nil {
-		return fmt.Errorf("failed to parse external endpoints JSON: %w", unmarshalErr)
-	}
-	for nodeName, ips := range rawResult {
-		trimmedNodeName := strings.TrimSpace(nodeName)
-		if trimmedNodeName == "" {
-			return errors.New("node name cannot be empty in external endpoints file")
-		}
-		updatedIPs, appendErr := appendUniqueValidatedIPs(
-			result[trimmedNodeName],
-			ips,
-			func(ip string) error {
-				return fmt.Errorf(
-					"invalid IP address in file for node %s: %s",
-					trimmedNodeName,
-					ip,
-				)
-			},
-		)
-		if appendErr != nil {
-			return appendErr
-		}
-		result[trimmedNodeName] = updatedIPs
-	}
-	return nil
 }
 
 func appendUniqueValidatedIPs(

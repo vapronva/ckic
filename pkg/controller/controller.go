@@ -38,7 +38,7 @@ type Config struct {
 	CaddyImage                   string
 	ImagePullPolicy              string
 	PrePullImage                 bool
-	LoadBalancerMode             caddy.LoadBalancerMode
+	EnableCiliumLB               bool
 	EnvSecretName                string
 	EnvSecretKeys                []string
 	DataVolumePVC                string
@@ -134,7 +134,7 @@ func NewController(
 			CaddyImage:          config.CaddyImage,
 			ImagePullPolicy:     corev1.PullPolicy(config.ImagePullPolicy),
 			PrePullImage:        config.PrePullImage,
-			LoadBalancerMode:    config.LoadBalancerMode,
+			EnableCiliumLB:      config.EnableCiliumLB,
 			EnvSecretName:       config.EnvSecretName,
 			EnvSecretKeys:       config.EnvSecretKeys,
 			DataVolumePVC:       config.DataVolumePVC,

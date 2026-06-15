@@ -71,7 +71,7 @@ type DeployOptions struct {
 	Clientset           kubernetes.Interface
 	Namespace           string
 	CaddyImage          string
-	LoadBalancerMode    LoadBalancerMode
+	EnableCiliumLB      bool
 	EnvSecretName       string
 	EnvSecretKeys       []string
 	DataVolumePVC       string
@@ -158,7 +158,7 @@ func applyCaddyServices(
 		Apply(ctx, clusterIPServiceApplyConfig(instance), applyOptions()); err != nil {
 		return fmt.Errorf("failed to apply service %s: %w", instance.DeploymentName, err)
 	}
-	if opts.LoadBalancerMode != LoadBalancerModeCilium {
+	if !opts.EnableCiliumLB {
 		return nil
 	}
 	lbName := instance.LoadBalancerServiceName()
