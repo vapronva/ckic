@@ -249,7 +249,7 @@ func registerCoreCLIFlags(opts *cliOptions) {
 		&opts.loadBalancerMode,
 		"loadbalancer-mode",
 		"none",
-		"LoadBalancer strategy: none, cilium (one LB per node), or shared (one chart-managed LB for all Caddy pods)",
+		"LoadBalancer strategy: none, or cilium (one LB per node)",
 	)
 	pflag.StringVar(
 		&opts.secretName,
