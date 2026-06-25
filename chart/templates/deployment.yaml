@@ -1,3 +1,6 @@
+{{- if not (has .Values.loadBalancer.mode (list "none" "cilium" "shared")) }}
+{{- fail (printf "loadBalancer.mode must be one of \"none\", \"cilium\", or \"shared\"; got %q" .Values.loadBalancer.mode) }}
+{{- end }}
 ---
 kind: Deployment
 apiVersion: apps/v1
@@ -67,7 +70,7 @@ spec:
             - "--caddy-image={{ .Values.config.caddyImage }}"
             - "--image-pull-policy={{ .Values.config.imagePullPolicy }}"
             - "--prepull-image={{ .Values.config.prePullImage }}"
-            - "--loadbalancer-mode={{ if .Values.config.useHostNetwork }}none{{ else }}{{ .Values.loadBalancer.mode }}{{ end }}"
+            - "--loadbalancer-mode={{ if and (not .Values.config.useHostNetwork) (eq .Values.loadBalancer.mode "cilium") }}cilium{{ else }}none{{ end }}"
             - "--env-secret={{ .Values.config.secretName }}"
             {{- range .Values.config.secretEnvKeys }}
             - "--env-keys={{ . }}"

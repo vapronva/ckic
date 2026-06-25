@@ -7,13 +7,11 @@ type LoadBalancerMode int
 const (
 	LoadBalancerModeNone LoadBalancerMode = iota
 	LoadBalancerModeCilium
-	LoadBalancerModeShared
 )
 
 const (
 	loadBalancerModeNoneName   = "none"
 	loadBalancerModeCiliumName = "cilium"
-	loadBalancerModeSharedName = "shared"
 )
 
 func (m LoadBalancerMode) String() string {
@@ -22,8 +20,6 @@ func (m LoadBalancerMode) String() string {
 		return loadBalancerModeNoneName
 	case LoadBalancerModeCilium:
 		return loadBalancerModeCiliumName
-	case LoadBalancerModeShared:
-		return loadBalancerModeSharedName
 	default:
 		return fmt.Sprintf("unknown(%d)", int(m))
 	}
@@ -35,11 +31,9 @@ func ParseLoadBalancerMode(s string) (LoadBalancerMode, error) {
 		return LoadBalancerModeNone, nil
 	case loadBalancerModeCiliumName:
 		return LoadBalancerModeCilium, nil
-	case loadBalancerModeSharedName:
-		return LoadBalancerModeShared, nil
 	default:
 		return LoadBalancerModeNone, fmt.Errorf(
-			"invalid loadbalancer mode %q (want none, cilium, or shared)", s,
+			"invalid loadbalancer mode %q (want none or cilium)", s,
 		)
 	}
 }

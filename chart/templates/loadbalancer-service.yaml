@@ -1,4 +1,4 @@
-{{- if eq .Values.loadBalancer.mode "shared" }}
+{{- if and (eq .Values.loadBalancer.mode "shared") (not .Values.config.useHostNetwork) }}
 ---
 kind: Service
 apiVersion: v1

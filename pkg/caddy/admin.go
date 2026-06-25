@@ -92,15 +92,13 @@ func waitForCaddyAPIReady(
 	delay := initialDelay
 	readyURL := readinessURL(adminURL)
 	first := true
+	var lastErr error
 	for {
 		if first {
 			first = false
 			select {
 			case <-ctx.Done():
-				return fmt.Errorf(
-					"context deadline exceeded while waiting for Caddy API: %w",
-					ctx.Err(),
-				)
+				return caddyNotReadyError(ctx.Err(), lastErr)
 			default:
 			}
 		} else {
@@ -110,10 +108,7 @@ func waitForCaddyAPIReady(
 				if !timer.Stop() {
 					<-timer.C
 				}
-				return fmt.Errorf(
-					"context deadline exceeded while waiting for Caddy API: %w",
-					ctx.Err(),
-				)
+				return caddyNotReadyError(ctx.Err(), lastErr)
 			case <-timer.C:
 			}
 			delay = min(time.Duration(float64(delay)*multiplier), caddyAPIMaxDelay)
@@ -122,12 +117,23 @@ func waitForCaddyAPIReady(
 		if ready {
 			return nil
 		}
+		lastErr = err
 		log.Debug().
 			Err(err).
 			Str("adminURL", adminURL).
 			Str("readyURL", readyURL).
 			Msgf("Caddy Admin API not ready, retrying in %v", delay)
 	}
+}
+
+func caddyNotReadyError(ctxErr, lastErr error) error {
+	if lastErr != nil {
+		return fmt.Errorf(
+			"gave up waiting for Caddy admin API readiness (last probe error: %w): %w",
+			lastErr, ctxErr,
+		)
+	}
+	return fmt.Errorf("gave up waiting for Caddy admin API readiness: %w", ctxErr)
 }
 
 func readinessURL(adminURL string) string {
