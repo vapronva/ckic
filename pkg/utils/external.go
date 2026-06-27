@@ -13,6 +13,7 @@ const endpointKVParts = 2
 
 func ParseExternalEndpoints(endpoints []string) (ExternalEndpointsMap, error) {
 	result := make(ExternalEndpointsMap)
+	seen := make(map[string]map[string]struct{})
 	for _, endpoint := range endpoints {
 		parts := strings.SplitN(endpoint, "=", endpointKVParts)
 		if len(parts) != endpointKVParts {
@@ -25,47 +26,22 @@ func ParseExternalEndpoints(endpoints []string) (ExternalEndpointsMap, error) {
 		if nodeName == "" {
 			return nil, errors.New("node name cannot be empty")
 		}
-		updatedIPs, appendErr := appendUniqueValidatedIPs(
-			result[nodeName],
-			strings.Split(parts[1], ","),
-			func(ip string) error {
-				return fmt.Errorf(
-					"invalid IP address format for node %s: %s",
-					nodeName,
-					ip,
-				)
-			},
-		)
-		if appendErr != nil {
-			return nil, appendErr
+		if seen[nodeName] == nil {
+			seen[nodeName] = make(map[string]struct{})
 		}
-		result[nodeName] = updatedIPs
-	}
-	return result, nil
-}
-
-func appendUniqueValidatedIPs(
-	existing []string,
-	rawIPs []string,
-	invalidIPError func(string) error,
-) ([]string, error) {
-	seen := make(map[string]struct{}, len(existing))
-	for _, ip := range existing {
-		seen[net.ParseIP(ip).String()] = struct{}{}
-	}
-	result := existing
-	for _, rawIP := range rawIPs {
-		ip := strings.TrimSpace(rawIP)
-		parsed := net.ParseIP(ip)
-		if parsed == nil {
-			return nil, invalidIPError(ip)
+		for rawIP := range strings.SplitSeq(parts[1], ",") {
+			ip := strings.TrimSpace(rawIP)
+			parsed := net.ParseIP(ip)
+			if parsed == nil {
+				return nil, fmt.Errorf("invalid IP address format for node %s: %s", nodeName, ip)
+			}
+			canonical := parsed.String()
+			if _, ok := seen[nodeName][canonical]; ok {
+				continue
+			}
+			seen[nodeName][canonical] = struct{}{}
+			result[nodeName] = append(result[nodeName], canonical)
 		}
-		canonical := parsed.String()
-		if _, ok := seen[canonical]; ok {
-			continue
-		}
-		seen[canonical] = struct{}{}
-		result = append(result, canonical)
 	}
 	return result, nil
 }

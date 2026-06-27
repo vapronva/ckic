@@ -46,8 +46,6 @@ type Config struct {
 	ExternalEndpoints            utils.ExternalEndpointsMap
 	UseHostNetwork               bool
 	CaddyAdminOriginKey          string
-	HTTPHostPort                 int
-	HTTPSHostPort                int
 	ExternalEnable               bool
 	ExternalLabel                string
 	ExternalNsMode               string
@@ -125,6 +123,10 @@ func NewController(
 			"external aggregated config name must be set when publishing the aggregated config",
 		)
 	}
+	if config.ExternalPublishAggregated &&
+		config.ExternalAggregatedConfigName == config.ConfigMapName {
+		return nil, errors.New("external aggregated config name must differ from the base config-map name")
+	}
 	c := &Controller{
 		clientset: clientset,
 		config:    config,
@@ -142,8 +144,6 @@ func NewController(
 			ConfigMapName:       bootConfigMapName(config),
 			CaddyAdminOriginKey: config.CaddyAdminOriginKey,
 			UseHostNetwork:      config.UseHostNetwork,
-			HTTPHostPort:        config.HTTPHostPort,
-			HTTPSHostPort:       config.HTTPSHostPort,
 		},
 		adminConfig:       caddy.NewAdminAPIConfig(config.CaddyAdminOriginKey),
 		nodeSelector:      selector,
@@ -345,13 +345,14 @@ func (c *Controller) Run(ctx context.Context) error {
 	}
 	logger.Info().Msg("Waiting for informer caches to sync")
 	if !cache.WaitForCacheSync(stopCh, c.cacheSyncs...) {
-		return errors.New("failed to sync informer caches")
+		return fmt.Errorf("shutting down before informer caches synced: %w", ctx.Err())
 	}
 	logger.Info().Msg("Caches synced; starting reconcile workers")
 	if err := c.publishInitialMirror(ctx); err != nil {
 		return err
 	}
 	c.enqueueExistingDeployments(logger)
+	caddy.ReapPrePullPods(ctx, c.clientset, c.config.Namespace, logger)
 	c.queue.Add(configReconcileKey)
 	var wg sync.WaitGroup
 	for range workerCount {

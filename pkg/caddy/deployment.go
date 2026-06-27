@@ -2,6 +2,7 @@ package caddy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -23,8 +24,6 @@ import (
 const (
 	caddyHTTPPort                  int32 = 80
 	caddyHTTPSPort                 int32 = 443
-	hostPortMin                          = 1
-	hostPortMax                          = 65535
 	caddyBinary                          = "caddy"
 	caddyContainerName                   = caddyBinary
 	defaultImagePullPolicy               = corev1.PullIfNotPresent
@@ -79,8 +78,6 @@ type DeployOptions struct {
 	ConfigMapName       string
 	CaddyAdminOriginKey string
 	UseHostNetwork      bool
-	HTTPHostPort        int
-	HTTPSHostPort       int
 	ImagePullPolicy     corev1.PullPolicy
 	PrePullImage        bool
 }
@@ -114,20 +111,17 @@ func EnsureCaddy(
 		ExternalIPs:    externalIPs,
 		KubeClient:     opts.Clientset,
 	}
-	deployment, err := buildDeploymentApplyConfig(instance, opts, logger)
-	if err != nil {
-		return nil, err
-	}
+	deployment := buildDeploymentApplyConfig(instance, opts, logger)
 	if opts.PrePullImage {
 		prePullBeforeApply(ctx, opts, instance, logger)
 	}
-	if _, err = opts.Clientset.AppsV1().
+	if _, err := opts.Clientset.AppsV1().
 		Deployments(instance.Namespace).
 		Apply(ctx, deployment, applyOptions()); err != nil {
 		return nil, fmt.Errorf("failed to apply deployment %s: %w", deploymentName, err)
 	}
 	logger.Debug().Msg("Applied Caddy deployment")
-	if err = applyCaddyServices(ctx, opts, instance, logger); err != nil {
+	if err := applyCaddyServices(ctx, opts, instance, logger); err != nil {
 		return nil, err
 	}
 	if pod, resolveErr := resolveActivePod(
@@ -150,18 +144,21 @@ func applyCaddyServices(
 	logger zerolog.Logger,
 ) error {
 	if opts.UseHostNetwork {
-		logger.Debug().Msg("Skipping service creation due to hostNetwork mode")
-		return nil
+		logger.Debug().Msg("hostNetwork mode: ensuring no Caddy Services remain")
+		return errors.Join(
+			instance.deleteService(ctx, instance.DeploymentName, "ClusterIP", logger),
+			instance.deleteService(ctx, instance.LoadBalancerServiceName(), "LoadBalancer", logger),
+		)
 	}
 	if _, err := opts.Clientset.CoreV1().
 		Services(instance.Namespace).
 		Apply(ctx, clusterIPServiceApplyConfig(instance), applyOptions()); err != nil {
 		return fmt.Errorf("failed to apply service %s: %w", instance.DeploymentName, err)
 	}
-	if !opts.EnableCiliumLB {
-		return nil
-	}
 	lbName := instance.LoadBalancerServiceName()
+	if !opts.EnableCiliumLB {
+		return instance.deleteService(ctx, lbName, "LoadBalancer", logger)
+	}
 	if _, err := opts.Clientset.CoreV1().
 		Services(instance.Namespace).
 		Apply(ctx, loadBalancerServiceApplyConfig(instance), applyOptions()); err != nil {
@@ -195,11 +192,8 @@ func buildDeploymentApplyConfig(
 	instance *Instance,
 	opts DeployOptions,
 	logger zerolog.Logger,
-) (*appsv1ac.DeploymentApplyConfiguration, error) {
-	container, err := buildCaddyContainer(opts, logger)
-	if err != nil {
-		return nil, err
-	}
+) *appsv1ac.DeploymentApplyConfiguration {
+	container := buildCaddyContainer(opts, logger)
 	labels := managedLabels(instance.NodeName)
 	podSpec := corev1ac.PodSpec().
 		WithNodeSelector(map[string]string{constants.HostLabelHostname: instance.NodeName}).
@@ -226,25 +220,19 @@ func buildDeploymentApplyConfig(
 				WithMatchLabels(selectorLabels(instance.NodeName))).
 			WithTemplate(corev1ac.PodTemplateSpec().
 				WithLabels(labels).
-				WithSpec(podSpec))), nil
+				WithSpec(podSpec)))
 }
 
 func buildCaddyContainer(
 	opts DeployOptions,
 	logger zerolog.Logger,
-) (*corev1ac.ContainerApplyConfiguration, error) {
-	trafficPorts, err := buildTrafficPorts(
-		opts.UseHostNetwork, opts.HTTPHostPort, opts.HTTPSHostPort, logger,
-	)
-	if err != nil {
-		return nil, err
-	}
+) *corev1ac.ContainerApplyConfiguration {
 	ports := append([]*corev1ac.ContainerPortApplyConfiguration{
 		corev1ac.ContainerPort().
 			WithName("admin").
 			WithContainerPort(int32(constants.CaddyAdminPort)).
 			WithProtocol(corev1.ProtocolTCP),
-	}, trafficPorts...)
+	}, buildTrafficPorts(opts.UseHostNetwork)...)
 	return corev1ac.Container().
 		WithName(caddyContainerName).
 		WithImage(opts.CaddyImage).
@@ -279,7 +267,7 @@ func buildCaddyContainer(
 				WithAdd(caddyCapabilityNetAdm, caddyCapabilityBind).
 				WithDrop(caddyCapabilityDrop)).
 			WithSeccompProfile(corev1ac.SeccompProfile().
-				WithType(corev1.SeccompProfileTypeRuntimeDefault))), nil
+				WithType(corev1.SeccompProfileTypeRuntimeDefault)))
 }
 
 func caddyAdminProbe(
@@ -302,46 +290,23 @@ func caddyAdminProbe(
 		WithFailureThreshold(failureThreshold)
 }
 
-func buildTrafficPorts(
-	useHostNetwork bool,
-	httpHostPort, httpsHostPort int,
-	logger zerolog.Logger,
-) ([]*corev1ac.ContainerPortApplyConfiguration, error) {
+func buildTrafficPorts(useHostNetwork bool) []*corev1ac.ContainerPortApplyConfiguration {
 	port := func(name string, container int32, protocol corev1.Protocol) *corev1ac.ContainerPortApplyConfiguration {
-		return corev1ac.ContainerPort().
+		p := corev1ac.ContainerPort().
 			WithName(name).
 			WithContainerPort(container).
 			WithProtocol(protocol)
+		if useHostNetwork {
+			p = p.WithHostPort(container)
+		}
+		return p
 	}
-	ports := []*corev1ac.ContainerPortApplyConfiguration{
+	return []*corev1ac.ContainerPortApplyConfiguration{
 		port(portNameHTTPTCP, caddyHTTPPort, corev1.ProtocolTCP),
 		port(portNameHTTPUDP, caddyHTTPPort, corev1.ProtocolUDP),
 		port(portNameHTTPSTCP, caddyHTTPSPort, corev1.ProtocolTCP),
 		port(portNameHTTPSUDP, caddyHTTPSPort, corev1.ProtocolUDP),
 	}
-	if !useHostNetwork {
-		return ports, nil
-	}
-	if err := ValidateHostPorts(httpHostPort, httpsHostPort); err != nil {
-		return nil, err
-	}
-	httpPort32, err := normalizeHostPort(httpHostPort)
-	if err != nil {
-		return nil, err
-	}
-	httpsPort32, err := normalizeHostPort(httpsHostPort)
-	if err != nil {
-		return nil, err
-	}
-	logger.Debug().
-		Int("httpPort", httpHostPort).
-		Int("httpsPort", httpsHostPort).
-		Msg("Configuring hostNetwork with host ports")
-	ports[0] = ports[0].WithHostPort(httpPort32)
-	ports[1] = ports[1].WithHostPort(httpPort32)
-	ports[2] = ports[2].WithHostPort(httpsPort32)
-	ports[3] = ports[3].WithHostPort(httpsPort32)
-	return ports, nil
 }
 
 func buildCaddyEnvVars(
@@ -442,32 +407,6 @@ func deploymentStrategy(
 			WithMaxUnavailable(pct))
 }
 
-func ValidateHostPorts(httpPort, httpsPort int) error {
-	if _, err := normalizeHostPort(httpPort); err != nil {
-		return fmt.Errorf("invalid HTTP host port: %w", err)
-	}
-	if _, err := normalizeHostPort(httpsPort); err != nil {
-		return fmt.Errorf("invalid HTTPS host port: %w", err)
-	}
-	if httpPort == httpsPort {
-		return fmt.Errorf(
-			"HTTP and HTTPS host ports must differ (both %d): "+
-				"a hostNetwork pod cannot bind the same host port twice",
-			httpPort,
-		)
-	}
-	return nil
-}
-
-func normalizeHostPort(port int) (int32, error) {
-	if port < hostPortMin || port > hostPortMax {
-		return 0, fmt.Errorf(
-			"port %d is out of valid range [%d, %d]", port, hostPortMin, hostPortMax,
-		)
-	}
-	return int32(port), nil
-}
-
 func trafficServicePorts() []*corev1ac.ServicePortApplyConfiguration {
 	port := func(name string, p int32, protocol corev1.Protocol) *corev1ac.ServicePortApplyConfiguration {
 		return corev1ac.ServicePort().
@@ -508,6 +447,7 @@ func loadBalancerServiceApplyConfig(
 		WithType(corev1.ServiceTypeLoadBalancer).
 		WithLoadBalancerClass(constants.CiliumNodeLoadBalancerClass).
 		WithExternalTrafficPolicy(corev1.ServiceExternalTrafficPolicyTypeLocal).
+		WithAllocateLoadBalancerNodePorts(false).
 		WithPorts(trafficServicePorts()...)
 	if len(instance.ExternalIPs) > 0 {
 		spec = spec.WithExternalIPs(instance.ExternalIPs...)

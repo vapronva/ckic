@@ -31,10 +31,17 @@ func (i *Instance) Delete(ctx context.Context) error {
 		Str("node", i.NodeName).
 		Str("deployment", i.DeploymentName).
 		Logger()
+	prePullPod := prePullPodName(i.NodeName)
+	prePullErr := deletePrePullPod(ctx, i.KubeClient, i.Namespace, prePullPod)
+	if prePullErr != nil {
+		logger.Warn().Err(prePullErr).Str("prepullPod", prePullPod).Msg("Failed to delete leftover pre-pull pod")
+		prePullErr = fmt.Errorf("failed to delete pre-pull pod %s: %w", prePullPod, prePullErr)
+	}
 	return errors.Join(
 		i.deleteService(ctx, i.DeploymentName, "ClusterIP", logger),
 		i.deleteService(ctx, i.LoadBalancerServiceName(), "LoadBalancer", logger),
 		i.deleteDeployment(ctx, logger),
+		prePullErr,
 	)
 }
 

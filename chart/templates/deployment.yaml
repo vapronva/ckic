@@ -66,7 +66,7 @@ spec:
             - "--health-bind-address="
             {{- end }}
             - "--comm-method={{ .Values.config.communicationMethod }}"
-            - "--log-level={{ .Values.config.logLevel }}"
+            - "--log-level={{ .Values.config.logLevel | default "info" }}"
             - "--caddy-image={{ .Values.config.caddyImage }}"
             - "--image-pull-policy={{ .Values.config.imagePullPolicy }}"
             - "--prepull-image={{ .Values.config.prePullImage }}"
@@ -88,8 +88,6 @@ spec:
             {{- if .Values.config.caddyAdminOriginKey }}
             - "--caddy-admin-origin-key={{ .Values.config.caddyAdminOriginKey }}"
             {{- end }}
-            - "--http-host-port={{ .Values.config.httpHostPort }}"
-            - "--https-host-port={{ .Values.config.httpsHostPort }}"
             - "--external-enable={{ .Values.config.external.enable }}"
             {{- if .Values.config.external.enable }}
             - "--external-label={{ .Values.config.external.label }}"

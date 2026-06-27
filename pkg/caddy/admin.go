@@ -162,7 +162,10 @@ func readinessProbe(
 		return false, doErr
 	}
 	drainAndCloseReadinessBody(resp, adminURL, readyURL)
-	return resp.StatusCode >= 200 && resp.StatusCode < 300, nil
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return true, nil
+	}
+	return false, fmt.Errorf("caddy admin API readiness returned status %d", resp.StatusCode)
 }
 
 func adminOrigin(originKey string) string {

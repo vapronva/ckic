@@ -27,8 +27,6 @@ import (
 )
 
 const (
-	defaultHTTPHostPort        = 80
-	defaultHTTPSHostPort       = 443
 	probeShutdownTimeout       = 5 * time.Second
 	probeReadHeaderTimeout     = 10 * time.Second
 	leaderRunErrTimeout        = 30 * time.Second
@@ -36,9 +34,10 @@ const (
 )
 
 const (
-	commMethodClusterIP   = "clusterip"
-	commMethodDirect      = "direct"
-	commMethodHostNetwork = "hostnetwork"
+	commMethodClusterIP    = "clusterip"
+	commMethodDirect       = "direct"
+	loadBalancerModeNone   = "none"
+	loadBalancerModeCilium = "cilium"
 )
 
 var errLeaderElectionLost = errors.New("leader election lost")
@@ -64,8 +63,6 @@ type cliOptions struct {
 	externalEndpoints            []string
 	useHostNetwork               bool
 	caddyAdminOriginKey          string
-	httpHostPort                 int
-	httpsHostPort                int
 	externalEnable               bool
 	externalLabel                string
 	externalNsMode               string
@@ -89,14 +86,14 @@ type leaderElectionRunFunc func(context.Context, leaderelection.LeaderElectionCo
 func main() {
 	options := parseCLIOptions()
 	setupLogger(options.logLevel)
-	lbMode, err := caddy.ParseLoadBalancerMode(options.loadBalancerMode)
+	enableCiliumLB, err := resolveEnableCiliumLB(options.loadBalancerMode)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Invalid loadbalancer mode")
 	}
 	commMethod, err := resolveCommunicationMethod(
 		options.communicationMethod,
 		options.useHostNetwork,
-		lbMode,
+		enableCiliumLB,
 	)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Invalid communication mode configuration")
@@ -104,13 +101,6 @@ func main() {
 	imagePullPolicy, err := resolveImagePullPolicy(options.imagePullPolicy)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Invalid image pull policy")
-	}
-	if options.useHostNetwork {
-		if portErr := caddy.ValidateHostPorts(
-			options.httpHostPort, options.httpsHostPort,
-		); portErr != nil {
-			log.Fatal().Err(portErr).Msg("Invalid host port configuration")
-		}
 	}
 	if leErr := validateLeaderElectionTimings(options); leErr != nil {
 		log.Fatal().Err(leErr).Msg("Invalid leader election configuration")
@@ -127,7 +117,7 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to resolve namespace")
 	}
-	cfg := buildControllerConfig(options, commMethod, imagePullPolicy, lbMode, extEndpointsMap)
+	cfg := buildControllerConfig(options, commMethod, imagePullPolicy, enableCiliumLB, extEndpointsMap)
 	ctrl := newControllerOrDie(clientset, cfg)
 	ctx, cancel := context.WithCancel(context.Background())
 	readiness := &atomic.Bool{}
@@ -160,7 +150,7 @@ func main() {
 	}
 	signal.Stop(sigCh)
 	cancel()
-	if runErr != nil {
+	if runErr != nil && !errors.Is(runErr, context.Canceled) {
 		log.Error().Err(runErr).Msg("Controller exited with error")
 		os.Exit(1)
 	}
@@ -219,7 +209,7 @@ func registerCoreCLIFlags(opts *cliOptions) {
 		&opts.communicationMethod,
 		"comm-method",
 		commMethodClusterIP,
-		"Communication method (clusterip, direct, hostnetwork)",
+		"Communication method (clusterip or direct; hostNetwork uses --use-host-network)",
 	)
 	pflag.StringVar(
 		&opts.logLevel,
@@ -248,7 +238,7 @@ func registerCoreCLIFlags(opts *cliOptions) {
 	pflag.StringVar(
 		&opts.loadBalancerMode,
 		"loadbalancer-mode",
-		"none",
+		loadBalancerModeNone,
 		"LoadBalancer strategy: none, or cilium (one LB per node)",
 	)
 	pflag.StringVar(
@@ -296,18 +286,6 @@ func registerCoreNetworkingCLIFlags(opts *cliOptions) {
 		"caddy-admin-origin-key",
 		"",
 		"Origin key for Caddy admin API security",
-	)
-	pflag.IntVar(
-		&opts.httpHostPort,
-		"http-host-port",
-		defaultHTTPHostPort,
-		"Host port for HTTP when using hostNetwork",
-	)
-	pflag.IntVar(
-		&opts.httpsHostPort,
-		"https-host-port",
-		defaultHTTPSHostPort,
-		"Host port for HTTPS when using hostNetwork",
 	)
 }
 
@@ -391,7 +369,7 @@ func registerLeaderElectionCLIFlags(opts *cliOptions) {
 
 func setupLogger(level string) {
 	parsedLevel, err := zerolog.ParseLevel(level)
-	if err != nil {
+	if err != nil || parsedLevel == zerolog.NoLevel {
 		parsedLevel = zerolog.InfoLevel
 	}
 	zerolog.SetGlobalLevel(parsedLevel)
@@ -409,41 +387,44 @@ func setupLogger(level string) {
 		Logger()
 }
 
+func resolveEnableCiliumLB(mode string) (bool, error) {
+	switch mode {
+	case loadBalancerModeNone:
+		return false, nil
+	case loadBalancerModeCilium:
+		return true, nil
+	default:
+		return false, fmt.Errorf(
+			"invalid loadbalancer mode %q (want none or cilium)", mode,
+		)
+	}
+}
+
 func resolveCommunicationMethod(
 	method string,
 	useHostNetwork bool,
-	lbMode caddy.LoadBalancerMode,
+	enableCiliumLB bool,
 ) (caddy.CommunicationMethod, error) {
-	if useHostNetwork && lbMode != caddy.LoadBalancerModeNone {
-		return caddy.CommunicationMethodClusterIP, fmt.Errorf(
-			"cannot combine hostNetwork with loadbalancer mode %q", lbMode,
-		)
-	}
-	var commMethod caddy.CommunicationMethod
+	var base caddy.CommunicationMethod
 	switch method {
 	case commMethodClusterIP:
-		commMethod = caddy.CommunicationMethodClusterIP
+		base = caddy.CommunicationMethodClusterIP
 	case commMethodDirect:
-		commMethod = caddy.CommunicationMethodDirect
-	case commMethodHostNetwork:
-		commMethod = caddy.CommunicationMethodHostNetwork
+		base = caddy.CommunicationMethodDirect
 	default:
 		return caddy.CommunicationMethodClusterIP, fmt.Errorf(
-			"unknown communication method %q (want clusterip, direct, or hostnetwork)",
-			method,
+			"unknown communication method %q (want clusterip or direct)", method,
 		)
 	}
-	if useHostNetwork && commMethod != caddy.CommunicationMethodHostNetwork {
-		log.Info().
-			Msg("Automatically setting communication method to \"hostnetwork\" when using hostNetwork")
-		commMethod = caddy.CommunicationMethodHostNetwork
+	if useHostNetwork {
+		if enableCiliumLB {
+			return caddy.CommunicationMethodClusterIP, errors.New(
+				"cannot combine --use-host-network with the cilium loadbalancer",
+			)
+		}
+		return caddy.CommunicationMethodHostNetwork, nil
 	}
-	if commMethod == caddy.CommunicationMethodHostNetwork && !useHostNetwork {
-		return commMethod, errors.New(
-			"communication method 'hostnetwork' requires --use-host-network=true",
-		)
-	}
-	return commMethod, nil
+	return base, nil
 }
 
 func resolveImagePullPolicy(policy string) (string, error) {
@@ -489,7 +470,7 @@ func buildControllerConfig(
 	options cliOptions,
 	commMethod caddy.CommunicationMethod,
 	imagePullPolicy string,
-	lbMode caddy.LoadBalancerMode,
+	enableCiliumLB bool,
 	extEndpoints utils.ExternalEndpointsMap,
 ) controller.Config {
 	return controller.Config{
@@ -502,7 +483,7 @@ func buildControllerConfig(
 		CaddyImage:                   options.caddyImage,
 		ImagePullPolicy:              imagePullPolicy,
 		PrePullImage:                 options.prePullImage,
-		EnableCiliumLB:               lbMode == caddy.LoadBalancerModeCilium,
+		EnableCiliumLB:               enableCiliumLB,
 		EnvSecretName:                options.secretName,
 		EnvSecretKeys:                options.secretEnvKeys,
 		DataVolumePVC:                options.dataVolumePVC,
@@ -510,8 +491,6 @@ func buildControllerConfig(
 		ExternalEndpoints:            extEndpoints,
 		UseHostNetwork:               options.useHostNetwork,
 		CaddyAdminOriginKey:          options.caddyAdminOriginKey,
-		HTTPHostPort:                 options.httpHostPort,
-		HTTPSHostPort:                options.httpsHostPort,
 		ExternalEnable:               options.externalEnable,
 		ExternalLabel:                options.externalLabel,
 		ExternalNsMode:               options.externalNsMode,
@@ -588,7 +567,9 @@ func runControllerWithLeaderElectionWithRunner(
 				cancel()
 			},
 			OnStoppedLeading: func() {
-				log.Info().Str("identity", identity).Msg("Lost leadership")
+				if leading.Load() {
+					log.Info().Str("identity", identity).Msg("Lost leadership")
+				}
 			},
 			OnNewLeader: func(leader string) {
 				log.Info().

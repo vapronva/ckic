@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -40,7 +39,9 @@ func prePullImage(
 			context.WithoutCancel(ctx), prePullCleanupTimeout,
 		)
 		defer cancel()
-		deletePrePullPod(cleanupCtx, clientset, namespace, podName)
+		if err := deletePrePullPod(cleanupCtx, clientset, namespace, podName); err != nil {
+			logger.Warn().Err(err).Msg("Failed to delete pre-pull pod")
+		}
 	}
 	cleanup()
 	pod := prePullPodSpec(podName, namespace, nodeName, image, pullPolicy)
@@ -186,15 +187,37 @@ func deletePrePullPod(
 	ctx context.Context,
 	clientset kubernetes.Interface,
 	namespace, podName string,
-) {
+) error {
 	gracePeriod := int64(0)
 	err := clientset.CoreV1().Pods(namespace).Delete(ctx, podName, metav1.DeleteOptions{
 		GracePeriodSeconds: &gracePeriod,
 	})
-	if err != nil && !apierrors.IsNotFound(err) {
-		log.Warn().
-			Err(err).
-			Str("prepullPod", podName).
-			Msg("Failed to delete pre-pull pod")
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	return err
+}
+
+func ReapPrePullPods(
+	ctx context.Context,
+	clientset kubernetes.Interface,
+	namespace string,
+	logger zerolog.Logger,
+) {
+	ctx, cancel := context.WithTimeout(ctx, prePullCleanupTimeout)
+	defer cancel()
+	pods, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: constants.LabelCaddyManaged + "=" + constants.LabelManagedValue +
+			"," + constants.LabelType + "=" + constants.LabelTypeImagePrePull,
+	})
+	if err != nil {
+		logger.Warn().Err(err).Msg("Failed to list leftover pre-pull pods for cleanup")
+		return
+	}
+	for i := range pods.Items {
+		name := pods.Items[i].Name
+		if delErr := deletePrePullPod(ctx, clientset, namespace, name); delErr != nil {
+			logger.Warn().Err(delErr).Str("prepullPod", name).Msg("Failed to delete leftover pre-pull pod")
+		}
 	}
 }
