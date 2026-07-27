@@ -1,4 +1,13 @@
-chart/
+.git
+.gitignore
 .gitlab-ci.yml
+chart/
 CODEOWNERS
-README.md
+*.md
+/manager
+/build/
+/dist/
+coverage.txt
+coverage.html
+*.test
+*.out
