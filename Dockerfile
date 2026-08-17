@@ -2,7 +2,7 @@ ARG TOOLS_IMAGE=docker.horse/ci/on-alpine/tools:1
 
 FROM $TOOLS_IMAGE AS tools
 
-FROM docker.io/library/golang:1.26.5-alpine AS build
+FROM docker.io/library/golang:1.26.6-alpine AS build
 
 WORKDIR /usr/src/app/ckic
 
