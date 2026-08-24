@@ -68,14 +68,12 @@ func prePullPodSpec(
 	pullPolicy corev1.PullPolicy,
 ) *corev1.Pod {
 	return &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      podName,
-			Namespace: namespace,
-			Labels: map[string]string{
-				constants.LabelCaddyManaged: constants.LabelManagedValue,
-				constants.LabelType:         constants.LabelTypeImagePrePull,
-				constants.LabelInstance:     nodeName,
-			},
+		Name:      podName,
+		Namespace: namespace,
+		Labels: map[string]string{
+			constants.LabelCaddyManaged: constants.LabelManagedValue,
+			constants.LabelType:         constants.LabelTypeImagePrePull,
+			constants.LabelInstance:     nodeName,
 		},
 		Spec: corev1.PodSpec{
 			NodeSelector: map[string]string{
