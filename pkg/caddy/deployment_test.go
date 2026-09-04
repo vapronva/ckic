@@ -9,6 +9,8 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
+	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
 	"git.horse/vapronva/ckic/pkg/constants"
@@ -39,7 +41,11 @@ func TestEnsureCaddyModeTransitions(t *testing.T) {
 	unrelated.Name = "unrelated-newer-pod"
 	unrelated.CreationTimestamp = metav1.NewTime(time.Now().Add(time.Hour))
 	delete(unrelated.Labels, constants.LabelCaddyManaged)
-	client := fake.NewClientset(runningCaddyPod(), unrelated)
+	client := fake.NewClientset(runningCaddyPod(), unrelated,
+		&corev1.Service{Name: "caddy-node1", Namespace: testNS, Labels: managedLabels(testNode)},
+		&corev1.Service{Name: "caddy-node1-lb", Namespace: testNS, Labels: managedLabels(testNode)},
+		&corev1.Service{Name: "caddy-loadbalancer", Namespace: testNS},
+	)
 	opts := DeployOptions{Clientset: client, Namespace: testNS, CaddyImage: testImage, ImagePullPolicy: corev1.PullIfNotPresent, ConfigMapName: "caddy-config"}
 	for _, mode := range []struct {
 		name                string
@@ -48,7 +54,7 @@ func TestEnsureCaddyModeTransitions(t *testing.T) {
 	}{
 		{"cilium", true, false, 1},
 		{"none", false, false, 0},
-		{"hostnetwork", false, true, 0},
+		{"hostnetwork", true, true, 0},
 	} {
 		t.Run(mode.name, func(t *testing.T) {
 			opts.EnableCiliumLB = mode.cilium
@@ -88,11 +94,14 @@ func TestEnsureCaddyModeTransitions(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(services.Items) != mode.services {
-				t.Fatalf("services = %d, want %d", len(services.Items), mode.services)
+			if len(services.Items) != mode.services+1 {
+				t.Fatalf("services = %d, want %d", len(services.Items), mode.services+1)
 			}
 			for _, service := range services.Items {
-				if service.Name != "caddy-node1-lb" || !reflect.DeepEqual(service.Spec.Selector, deployment.Spec.Template.Labels) {
+				if service.Name == "caddy-loadbalancer" {
+					continue
+				}
+				if service.Name != "caddy-node1-loadbalancer" || !reflect.DeepEqual(service.Spec.Selector, deployment.Spec.Template.Labels) {
 					t.Fatalf("unexpected service %s selecting %+v", service.Name, service.Spec.Selector)
 				}
 				if service.Spec.ExternalTrafficPolicy != corev1.ServiceExternalTrafficPolicyLocal || !reflect.DeepEqual(service.Spec.ExternalIPs, []string{"203.0.113.5"}) {
@@ -105,15 +114,53 @@ func TestEnsureCaddyModeTransitions(t *testing.T) {
 
 func TestNodeDerivedNames(t *testing.T) {
 	t.Parallel()
-	if got := loadBalancerServiceName("worker.example.com"); got != "caddy-worker-example-com-lb" {
-		t.Fatalf("dotted node name mapped to %q", got)
+	const dotted = "worker.example.com"
+	if DeploymentName(dotted) != "caddy-"+dotted || prePullPodName(dotted) != "caddy-prepull-"+dotted {
+		t.Fatal("Deployment and pre-pull identities must preserve the node name")
+	}
+	if loadBalancerServiceName(dotted) == loadBalancerServiceName("worker-example-com") {
+		t.Fatal("dotted and hyphenated node names collide")
+	}
+	for _, node := range []string{dotted, strings.Repeat("n", 63)} {
+		if errs := validation.IsDNS1035Label(loadBalancerServiceName(node)); len(errs) != 0 {
+			t.Fatalf("invalid Service name for %q: %v", node, errs)
+		}
 	}
 	opts := DeployOptions{Clientset: fake.NewClientset(), Namespace: testNS}
-	if _, err := EnsureCaddy(t.Context(), opts, strings.Repeat("n", 54), nil); err != nil {
-		t.Fatalf("54-char node name must fit the Service name: %v", err)
+	if _, err := EnsureCaddy(t.Context(), opts, strings.Repeat("n", 63), nil); err != nil {
+		t.Fatalf("63-char node name must be accepted: %v", err)
 	}
-	if _, err := EnsureCaddy(t.Context(), opts, strings.Repeat("n", 55), nil); err == nil {
-		t.Fatal("55-char node name must be rejected")
+	if _, err := EnsureCaddy(t.Context(), opts, strings.Repeat("n", 64), nil); err == nil {
+		t.Fatal("node names exceeding the instance label limit must be rejected")
+	}
+}
+
+func TestEnsureCaddyPreservesFileMountOnUpgrade(t *testing.T) {
+	t.Parallel()
+	client := fake.NewClientset()
+	opts := DeployOptions{Clientset: client, Namespace: testNS, CaddyImage: testImage, ConfigMapName: "caddy-config"}
+	instance := &Instance{NodeName: testNode, Namespace: testNS, DeploymentName: DeploymentName(testNode)}
+	legacy := deploymentApplyConfig(instance, opts)
+	legacy.Spec.Template.Spec.Containers[0].VolumeMounts[0] = *corev1ac.VolumeMount().
+		WithName(constants.VolumeNameCaddyConfig).WithMountPath("/etc/caddy/Caddyfile")
+	deployments := client.AppsV1().Deployments(testNS)
+	if _, err := deployments.Apply(t.Context(), legacy, metav1.ApplyOptions{FieldManager: "legacy"}); err != nil {
+		t.Fatal(err)
+	}
+	legacy.Spec.Template.Spec.Containers[0].VolumeMounts[0].WithSubPath("Caddyfile")
+	if _, err := deployments.Apply(t.Context(), legacy, applyOptions()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := EnsureCaddy(t.Context(), opts, testNode, nil); err != nil {
+		t.Fatal(err)
+	}
+	deployment, err := deployments.Get(t.Context(), instance.DeploymentName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mounts := deployment.Spec.Template.Spec.Containers[0].VolumeMounts
+	if len(mounts) != 3 || mounts[0].MountPath != "/etc/caddy/Caddyfile" || mounts[0].SubPath != "Caddyfile" {
+		t.Fatalf("upgrade changed the config file mount: %+v", mounts)
 	}
 }
 

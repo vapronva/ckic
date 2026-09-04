@@ -79,7 +79,9 @@ func TestReconcileNodePushesOnlyWhenNeeded(t *testing.T) {
 
 func TestReconcileNodeTearsDownUnmanagedNode(t *testing.T) {
 	t.Parallel()
-	client := fake.NewClientset(&appsv1.Deployment{Name: "caddy-gone", Namespace: "caddy-system"})
+	client := fake.NewClientset(&appsv1.Deployment{Name: "caddy-gone", Namespace: "caddy-system", Labels: map[string]string{
+		constants.LabelApp: constants.LabelAppValue, constants.LabelCaddyManaged: constants.LabelManagedValue, constants.LabelInstance: "gone",
+	}})
 	c := newTestController(t, client)
 	c.deployFn = func(context.Context, caddy.DeployOptions, string, []string) (*caddy.Instance, error) {
 		t.Fatal("deployFn must not be called for an unmanaged node")

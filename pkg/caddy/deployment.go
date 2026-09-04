@@ -82,16 +82,15 @@ func managedLabels(nodeName string) map[string]string {
 }
 
 func EnsureCaddy(ctx context.Context, opts DeployOptions, nodeName string, externalIPs []string) (*Instance, error) {
+	if errs := validation.IsValidLabelValue(nodeName); len(errs) > 0 {
+		return nil, fmt.Errorf("node %q cannot be used as an instance label: %s", nodeName, strings.Join(errs, "; "))
+	}
 	instance := &Instance{
 		NodeName:       nodeName,
 		Namespace:      opts.Namespace,
 		DeploymentName: DeploymentName(nodeName),
 		ExternalIPs:    externalIPs,
 		KubeClient:     opts.Clientset,
-	}
-	serviceName := instance.LoadBalancerServiceName()
-	if errs := validation.IsDNS1035Label(serviceName); len(errs) > 0 {
-		return nil, fmt.Errorf("node %q does not fit the Service name %q: %s", nodeName, serviceName, strings.Join(errs, "; "))
 	}
 	logger := log.With().Str("node", nodeName).Logger()
 	if opts.PrePullImage {
@@ -104,6 +103,9 @@ func EnsureCaddy(ctx context.Context, opts DeployOptions, nodeName string, exter
 		return nil, fmt.Errorf("failed to apply deployment %s: %w", instance.DeploymentName, err)
 	}
 	if err := applyLoadBalancerService(ctx, opts, instance, logger); err != nil {
+		return nil, err
+	}
+	if err := instance.deleteDeploymentsExcept(ctx, instance.DeploymentName, logger); err != nil {
 		return nil, err
 	}
 	pod, err := resolveActivePod(ctx, opts.Clientset, opts.Namespace, nodeName)
@@ -119,14 +121,15 @@ func EnsureCaddy(ctx context.Context, opts DeployOptions, nodeName string, exter
 }
 
 func applyLoadBalancerService(ctx context.Context, opts DeployOptions, instance *Instance, logger zerolog.Logger) error {
-	if !opts.EnableCiliumLB {
-		return instance.deleteLoadBalancerService(ctx, logger)
+	if !opts.EnableCiliumLB || opts.UseHostNetwork {
+		return instance.deleteServicesExcept(ctx, "", logger)
 	}
+	serviceName := instance.LoadBalancerServiceName()
 	if _, err := opts.Clientset.CoreV1().Services(instance.Namespace).
 		Apply(ctx, loadBalancerServiceApplyConfig(instance), applyOptions()); err != nil {
-		return fmt.Errorf("failed to apply loadbalancer service %s: %w", instance.LoadBalancerServiceName(), err)
+		return fmt.Errorf("failed to apply loadbalancer service %s: %w", serviceName, err)
 	}
-	return nil
+	return instance.deleteServicesExcept(ctx, serviceName, logger)
 }
 
 func deploymentApplyConfig(instance *Instance, opts DeployOptions) *appsv1ac.DeploymentApplyConfiguration {
@@ -179,7 +182,8 @@ func caddyContainer(opts DeployOptions) *corev1ac.ContainerApplyConfiguration {
 		WithImagePullPolicy(opts.ImagePullPolicy).
 		WithPorts(ports...).
 		WithVolumeMounts(
-			corev1ac.VolumeMount().WithName(constants.VolumeNameCaddyConfig).WithMountPath("/etc/caddy").WithReadOnly(true),
+			corev1ac.VolumeMount().WithName(constants.VolumeNameCaddyConfig).
+				WithMountPath("/etc/caddy/Caddyfile").WithSubPath(constants.CaddyfileKey).WithReadOnly(true),
 			corev1ac.VolumeMount().WithName(constants.VolumeNameData).WithMountPath("/data"),
 			corev1ac.VolumeMount().WithName(constants.VolumeNameConfig).WithMountPath("/config"),
 		).
