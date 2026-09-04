@@ -24,10 +24,10 @@ spec:
       {{- include "ckic-manager.selectorLabels" . | nindent 6 }}
   template:
     metadata:
+      {{- with .Values.podAnnotations }}
       annotations:
-        {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
-        {{- end }}
+      {{- end }}
       labels:
         {{- include "ckic-manager.selectorLabels" . | nindent 8 }}
     spec:
@@ -36,7 +36,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "ckic-manager.serviceAccountName" . }}
-      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | default 60 }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
@@ -51,56 +51,54 @@ spec:
                 fieldRef:
                   fieldPath: metadata.namespace
           args:
-            - "--node-label={{ .Values.config.nodeLabel }}"
-            - "--config-map={{ .Values.config.configMapName }}"
-            - "--bootstrap-default-config={{ .Values.config.bootstrapDefaultConfig }}"
-            - "--config-resync-interval={{ .Values.config.configResyncInterval }}"
-            - "--leader-elect={{ .Values.leaderElection.enabled }}"
-            - "--leader-election-lease-name={{ .Values.leaderElection.leaseName }}"
-            - "--leader-election-lease-duration={{ .Values.leaderElection.leaseDuration }}"
-            - "--leader-election-renew-deadline={{ .Values.leaderElection.renewDeadline }}"
-            - "--leader-election-retry-period={{ .Values.leaderElection.retryPeriod }}"
+            - {{ printf "--node-label=%s" .Values.config.nodeLabel | quote }}
+            - {{ printf "--config-map=%s" .Values.config.configMapName | quote }}
+            - {{ printf "--bootstrap-default-config=%v" .Values.config.bootstrapDefaultConfig | quote }}
+            - {{ printf "--config-resync-interval=%v" .Values.config.configResyncInterval | quote }}
+            - {{ printf "--leader-elect=%v" .Values.leaderElection.enabled | quote }}
+            - {{ printf "--leader-election-lease-name=%v" .Values.leaderElection.leaseName | quote }}
+            - {{ printf "--leader-election-lease-duration=%v" .Values.leaderElection.leaseDuration | quote }}
+            - {{ printf "--leader-election-renew-deadline=%v" .Values.leaderElection.renewDeadline | quote }}
+            - {{ printf "--leader-election-retry-period=%v" .Values.leaderElection.retryPeriod | quote }}
             {{- if .Values.probes.enabled }}
-            - "--health-bind-address=:{{ .Values.probes.port }}"
+            - {{ printf "--health-bind-address=:%v" .Values.probes.port | quote }}
             {{- else }}
             - "--health-bind-address="
             {{- end }}
-            - "--comm-method={{ .Values.config.communicationMethod }}"
-            - "--log-level={{ .Values.config.logLevel | default "info" }}"
-            - "--caddy-image={{ .Values.config.caddyImage }}"
-            - "--image-pull-policy={{ .Values.config.imagePullPolicy }}"
-            - "--prepull-image={{ .Values.config.prePullImage }}"
-            - "--loadbalancer-mode={{ if and (not .Values.config.useHostNetwork) (eq .Values.loadBalancer.mode "cilium") }}cilium{{ else }}none{{ end }}"
-            - "--env-secret={{ .Values.config.secretName }}"
+            - {{ printf "--log-level=%s" .Values.config.logLevel | quote }}
+            - {{ printf "--caddy-image=%v" .Values.config.caddyImage | quote }}
+            - {{ printf "--image-pull-policy=%v" .Values.config.imagePullPolicy | quote }}
+            - {{ printf "--prepull-image=%v" .Values.config.prePullImage | quote }}
+            - {{ printf "--loadbalancer-mode=%s" (ternary "cilium" "none" (and (not .Values.config.useHostNetwork) (eq .Values.loadBalancer.mode "cilium"))) | quote }}
+            - {{ printf "--env-secret=%v" .Values.config.secretName | quote }}
             {{- range .Values.config.secretEnvKeys }}
-            - "--env-keys={{ . }}"
+            - {{ printf "--env-keys=%v" . | quote }}
             {{- end }}
             {{- if .Values.config.dataVolumePVC }}
-            - "--data-pvc={{ .Values.config.dataVolumePVC }}"
+            - {{ printf "--data-pvc=%v" .Values.config.dataVolumePVC | quote }}
             {{- end }}
             {{- if .Values.config.configVolumePVC }}
-            - "--config-pvc={{ .Values.config.configVolumePVC }}"
+            - {{ printf "--config-pvc=%v" .Values.config.configVolumePVC | quote }}
             {{- end }}
             {{- range .Values.config.externalEndpoints }}
-            - "--external-endpoints={{ . }}"
+            - {{ printf "--external-endpoints=%v" . | quote }}
             {{- end }}
-            - "--use-host-network={{ .Values.config.useHostNetwork }}"
+            - {{ printf "--use-host-network=%v" .Values.config.useHostNetwork | quote }}
             {{- if .Values.config.caddyAdminOriginKey }}
-            - "--caddy-admin-origin-key={{ .Values.config.caddyAdminOriginKey }}"
+            - {{ printf "--caddy-admin-origin-key=%v" .Values.config.caddyAdminOriginKey | quote }}
             {{- end }}
-            - "--external-enable={{ .Values.config.external.enable }}"
+            - {{ printf "--external-enable=%v" .Values.config.external.enable | quote }}
             {{- if .Values.config.external.enable }}
-            - "--external-label={{ .Values.config.external.label }}"
-            - "--external-ns-mode={{ .Values.config.external.nsMode }}"
+            - {{ printf "--external-label=%v" .Values.config.external.label | quote }}
             {{- if .Values.config.external.allowNamespaces }}
-            - "--external-allow-namespaces={{ join "," .Values.config.external.allowNamespaces }}"
+            - {{ printf "--external-allow-namespaces=%s" (join "," .Values.config.external.allowNamespaces) | quote }}
             {{- end }}
             {{- if .Values.config.external.denyNamespaces }}
-            - "--external-deny-namespaces={{ join "," .Values.config.external.denyNamespaces }}"
+            - {{ printf "--external-deny-namespaces=%s" (join "," .Values.config.external.denyNamespaces) | quote }}
             {{- end }}
-            - "--external-publish-aggregated={{ .Values.config.external.publishAggregated }}"
-            - "--external-aggregated-config-name={{ .Values.config.external.aggregatedConfigName }}"
             {{- end }}
+            - {{ printf "--external-publish-aggregated=%v" .Values.config.external.publishAggregated | quote }}
+            - {{ printf "--external-aggregated-config-name=%v" .Values.config.external.aggregatedConfigName | quote }}
           {{- if .Values.probes.enabled }}
           ports:
             - name: health
@@ -108,13 +106,13 @@ spec:
               protocol: TCP
           livenessProbe:
             httpGet:
-              path: {{ .Values.probes.livenessPath }}
+              path: /healthz
               port: health
             initialDelaySeconds: {{ .Values.probes.livenessInitialDelaySeconds }}
             periodSeconds: {{ .Values.probes.livenessPeriodSeconds }}
           readinessProbe:
             httpGet:
-              path: {{ .Values.probes.readinessPath }}
+              path: /readyz
               port: health
             initialDelaySeconds: {{ .Values.probes.readinessInitialDelaySeconds }}
             periodSeconds: {{ .Values.probes.readinessPeriodSeconds }}

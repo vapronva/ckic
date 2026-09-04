@@ -1,9 +1,11 @@
+{{- $shared := and (not .Values.config.useHostNetwork) (eq .Values.loadBalancer.mode "shared") }}
+{{- $proxyProtocol := and $shared (eq .Values.loadBalancer.clientIP "proxy-protocol") }}
 ---
 kind: ConfigMap
 apiVersion: v1
 
 metadata:
-  name: {{ .Values.config.configMapName }}
+  name: {{ .Values.config.configMapName | quote }}
   labels:
     {{- include "ckic-manager.labels" . | nindent 4 }}
 
@@ -33,16 +35,18 @@ data:
         max_header_size 5MB
         enable_full_duplex
         keepalive_interval 30s
-        {{- if and (eq $.Values.loadBalancer.mode "shared") (eq $.Values.loadBalancer.clientIP "proxy-protocol") }}
+        {{- if and $shared (or $proxyProtocol (not $.Values.loadBalancer.enableUDP)) }}
         protocols h1 h2 h2c
+        {{- else }}
+        protocols h1 h2 h2c h3
+        {{- end }}
+        {{- if $proxyProtocol }}
         listener_wrappers {
           proxy_protocol {
             allow {{ $.Values.loadBalancer.trustedProxyCIDRs }}
           }
           tls
         }
-        {{- else }}
-        protocols h1 h2 h2c h3
         {{- end }}
         {{- with .servers }}
         {{ . | nindent 8 }}

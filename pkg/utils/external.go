@@ -1,10 +1,11 @@
 package utils
 
 import (
-	"errors"
 	"fmt"
 	"net"
 	"strings"
+
+	"k8s.io/apimachinery/pkg/api/validate/content"
 )
 
 type ExternalEndpointsMap map[string][]string
@@ -23,8 +24,8 @@ func ParseExternalEndpoints(endpoints []string) (ExternalEndpointsMap, error) {
 			)
 		}
 		nodeName := strings.TrimSpace(parts[0])
-		if nodeName == "" {
-			return nil, errors.New("node name cannot be empty")
+		if errs := content.IsDNS1123Subdomain(nodeName); len(errs) > 0 {
+			return nil, fmt.Errorf("invalid Kubernetes node name %q: %s", nodeName, strings.Join(errs, "; "))
 		}
 		if seen[nodeName] == nil {
 			seen[nodeName] = make(map[string]struct{})

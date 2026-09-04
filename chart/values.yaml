@@ -10,7 +10,7 @@ updateStrategy:
 image:
   repository: docker.horse
   image: vapronva/ckic/manager
-  tag: 0.35.8
+  tag: 0.36.0
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -67,8 +67,6 @@ leaderElection:
 probes:
   enabled: true
   port: 8081
-  livenessPath: /healthz
-  readinessPath: /readyz
   livenessInitialDelaySeconds: 15
   livenessPeriodSeconds: 20
   readinessInitialDelaySeconds: 5
@@ -79,7 +77,6 @@ config:
   configMapName: caddy-config
   bootstrapDefaultConfig: false
   configResyncInterval: 0s
-  communicationMethod: clusterip
   logLevel: info
   caddyImage: docker.horse/oss-images/zerossl-caddy/caddy:2.11.4-alpine
   imagePullPolicy: IfNotPresent
@@ -94,7 +91,6 @@ config:
   external:
     enable: true
     label: ckic.cmld.ru/aggregate=true
-    nsMode: all
     allowNamespaces: []
     denyNamespaces: []
     publishAggregated: true

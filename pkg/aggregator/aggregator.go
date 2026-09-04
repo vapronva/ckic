@@ -2,12 +2,15 @@ package aggregator
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"sort"
+	"maps"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	"k8s.io/client-go/kubernetes"
@@ -23,6 +26,7 @@ const (
 type Aggregator struct {
 	mu                sync.RWMutex
 	base              string
+	hasBase           bool
 	externals         map[string]string
 	clientset         kubernetes.Interface
 	namespace         string
@@ -56,8 +60,9 @@ func (a *Aggregator) notifyIfChanged(changed bool) {
 
 func (a *Aggregator) UpdateBase(base string) {
 	a.mu.Lock()
-	changed := a.base != base
+	changed := !a.hasBase || a.base != base
 	a.base = base
+	a.hasBase = true
 	a.mu.Unlock()
 	a.notifyIfChanged(changed)
 }
@@ -78,20 +83,18 @@ func (a *Aggregator) RemoveExternal(source string) {
 	a.notifyIfChanged(changed)
 }
 
-func (a *Aggregator) CurrentMerged() string {
+func (a *Aggregator) CurrentMerged() (string, error) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	sources := make([]string, 0, len(a.externals))
-	for source := range a.externals {
-		sources = append(sources, source)
+	if !a.hasBase {
+		return "", errors.New("base ConfigMap has not supplied a Caddyfile")
 	}
-	sort.Strings(sources)
 	var sb strings.Builder
 	sb.WriteString(a.base)
 	if !strings.HasSuffix(a.base, "\n") {
 		sb.WriteByte('\n')
 	}
-	for _, source := range sources {
+	for _, source := range slices.Sorted(maps.Keys(a.externals)) {
 		fragment := strings.TrimSpace(a.externals[source])
 		if fragment == "" {
 			continue
@@ -100,7 +103,10 @@ func (a *Aggregator) CurrentMerged() string {
 		sb.WriteString(fragment)
 		fmt.Fprintf(&sb, "\n# ---- End external from %s ----\n", source)
 	}
-	return sb.String()
+	if a.publishAggregated && sb.Len() > corev1.MaxSecretSize {
+		return "", fmt.Errorf("merged Caddyfile is %d bytes, exceeding the ConfigMap limit of %d", sb.Len(), corev1.MaxSecretSize)
+	}
+	return sb.String(), nil
 }
 
 func (a *Aggregator) PublishMirror(ctx context.Context) error {
@@ -109,7 +115,10 @@ func (a *Aggregator) PublishMirror(ctx context.Context) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, mirrorPublishTimeout)
 	defer cancel()
-	merged := a.CurrentMerged()
+	merged, err := a.CurrentMerged()
+	if err != nil {
+		return err
+	}
 	apply := corev1ac.ConfigMap(a.mirrorName, a.namespace).
 		WithLabels(constants.AggregatedConfigLabels()).
 		WithData(map[string]string{constants.CaddyfileKey: merged})

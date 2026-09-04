@@ -8,6 +8,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 	appsv1 "k8s.io/api/apps/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
 
 	"git.horse/vapronva/ckic/pkg/caddy"
@@ -69,9 +70,16 @@ func (c *Controller) reconcileConfig(ctx context.Context) error {
 
 func (c *Controller) reconcileNode(ctx context.Context, nodeName string) error {
 	node, err := c.nodeLister.Get(nodeName)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
 	managed := err == nil && c.nodeSelector.Matches(labels.Set(node.Labels))
 	if !managed {
 		return c.teardownNode(ctx, nodeName)
+	}
+	merged, err := c.aggregator.CurrentMerged()
+	if err != nil {
+		return err
 	}
 	instance, err := c.deployFn(
 		ctx,
@@ -82,9 +90,8 @@ func (c *Controller) reconcileNode(ctx context.Context, nodeName string) error {
 	if err != nil {
 		return err
 	}
-	merged := c.aggregator.CurrentMerged()
 	digest := configDigest(merged)
-	if c.pushUpToDate(nodeName, digest, instance.PodName) {
+	if c.pushUpToDate(nodeName, digest, instance.ContainerID) {
 		return nil
 	}
 	if !instance.PodReady {
@@ -92,28 +99,17 @@ func (c *Controller) reconcileNode(ctx context.Context, nodeName string) error {
 		return nil
 	}
 	if pushErr := c.pushFn(ctx, instance, merged); pushErr != nil {
-		var cfgErr *caddy.ConfigurationFailedError
-		if errors.As(pushErr, &cfgErr) && cfgErr.IsPermanent() {
-			log.Error().
-				Err(pushErr).
-				Str("node", nodeName).
-				Msg("Caddy rejected the configuration; not retrying until it changes")
-			c.recordPush(nodeName, digest, instance.PodName)
-			return nil
-		}
 		return pushErr
 	}
-	c.recordPush(nodeName, digest, instance.PodName)
+	c.recordPush(nodeName, digest, instance.ContainerID)
 	return nil
 }
 
 func (c *Controller) deployOptionsForNode(nodeName string) caddy.DeployOptions {
 	opts := c.deployOpts
-	if c.config.PrePullImage {
-		existing, err := c.deployLister.
-			Deployments(c.config.Namespace).
-			Get("caddy-" + nodeName)
-		opts.PrePullImage = err != nil || caddyImageOf(existing) != c.config.CaddyImage
+	if opts.PrePullImage {
+		existing, err := c.deployLister.Deployments(c.config.Namespace).Get(caddy.DeploymentName(nodeName))
+		opts.PrePullImage = err != nil || caddyImageOf(existing) != opts.CaddyImage
 	}
 	return opts
 }
@@ -129,7 +125,7 @@ func (c *Controller) teardownNode(ctx context.Context, nodeName string) error {
 	instance := &caddy.Instance{
 		NodeName:       nodeName,
 		Namespace:      c.config.Namespace,
-		DeploymentName: "caddy-" + nodeName,
+		DeploymentName: caddy.DeploymentName(nodeName),
 		KubeClient:     c.clientset,
 	}
 	if err := instance.Delete(ctx); err != nil {
@@ -139,20 +135,20 @@ func (c *Controller) teardownNode(ctx context.Context, nodeName string) error {
 	return nil
 }
 
-func (c *Controller) pushUpToDate(nodeName, digest, podName string) bool {
-	if podName == "" {
+func (c *Controller) pushUpToDate(nodeName, digest, containerID string) bool {
+	if containerID == "" {
 		return false
 	}
 	c.pushMu.Lock()
 	defer c.pushMu.Unlock()
 	record, ok := c.pushState[nodeName]
-	return ok && record.digest == digest && record.podName == podName
+	return ok && record.digest == digest && record.containerID == containerID
 }
 
-func (c *Controller) recordPush(nodeName, digest, podName string) {
+func (c *Controller) recordPush(nodeName, digest, containerID string) {
 	c.pushMu.Lock()
 	defer c.pushMu.Unlock()
-	c.pushState[nodeName] = pushRecord{digest: digest, podName: podName}
+	c.pushState[nodeName] = pushRecord{digest: digest, containerID: containerID}
 }
 
 func (c *Controller) clearPushState(nodeName string) {

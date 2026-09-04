@@ -1,4 +1,26 @@
 {{- if and (eq .Values.loadBalancer.mode "shared") (not .Values.config.useHostNetwork) }}
+{{- if not (has .Values.loadBalancer.clientIP (list "local" "proxy-protocol")) }}
+{{- fail (printf "loadBalancer.clientIP must be \"local\" or \"proxy-protocol\", got %q" .Values.loadBalancer.clientIP) }}
+{{- end }}
+{{- $trafficPolicy := .Values.loadBalancer.externalTrafficPolicy | default (ternary "Cluster" "Local" (eq .Values.loadBalancer.clientIP "proxy-protocol")) }}
+{{- if not (has $trafficPolicy (list "Local" "Cluster")) }}
+{{- fail (printf "loadBalancer.externalTrafficPolicy must be \"Local\" or \"Cluster\", got %q" $trafficPolicy) }}
+{{- end }}
+{{- $annotations := deepCopy (.Values.loadBalancer.annotations | default dict) }}
+{{- $proxyAnnotation := "loadbalancer.openstack.org/proxy-protocol" }}
+{{- if and (eq .Values.loadBalancer.clientIP "local") (hasKey $annotations $proxyAnnotation) }}
+{{- fail "configure PROXY protocol with loadBalancer.clientIP and loadBalancer.proxyProtocolVersion, not loadBalancer.annotations" }}
+{{- end }}
+{{- if eq .Values.loadBalancer.clientIP "proxy-protocol" }}
+{{- $ppv := .Values.loadBalancer.proxyProtocolVersion }}
+{{- if not (has $ppv (list "v1" "v2")) }}
+{{- fail (printf "loadBalancer.proxyProtocolVersion must be \"v1\" or \"v2\", got %q" $ppv) }}
+{{- end }}
+{{- if and (hasKey $annotations $proxyAnnotation) (ne (toString (get $annotations $proxyAnnotation)) $ppv) }}
+{{- fail "loadBalancer.annotations proxy-protocol conflicts with loadBalancer.proxyProtocolVersion" }}
+{{- end }}
+{{- $_ := set $annotations $proxyAnnotation $ppv }}
+{{- end }}
 ---
 kind: Service
 apiVersion: v1
@@ -7,25 +29,17 @@ metadata:
   name: caddy-loadbalancer
   labels:
     {{- include "ckic-manager.labels" . | nindent 4 }}
+  {{- with $annotations }}
   annotations:
-    helm.sh/resource-policy: keep
-    {{- if eq .Values.loadBalancer.clientIP "proxy-protocol" }}
-    {{- $ppv := .Values.loadBalancer.proxyProtocolVersion | default "v1" }}
-    {{- if not (has $ppv (list "v1" "v2")) }}
-    {{- fail (printf "loadBalancer.proxyProtocolVersion must be \"v1\" or \"v2\", got %q" $ppv) }}
-    {{- end }}
-    loadbalancer.openstack.org/proxy-protocol: {{ $ppv | quote }}
-    {{- end }}
-    {{- with .Values.loadBalancer.annotations }}
     {{- toYaml . | nindent 4 }}
-    {{- end }}
+  {{- end }}
 
 spec:
   type: LoadBalancer
   selector:
     app: caddy
     ckic.cmld.ru/caddy-managed: "true"
-  externalTrafficPolicy: {{ .Values.loadBalancer.externalTrafficPolicy | default (ternary "Cluster" "Local" (eq .Values.loadBalancer.clientIP "proxy-protocol")) }}
+  externalTrafficPolicy: {{ $trafficPolicy }}
   {{- with .Values.loadBalancer.loadBalancerIP }}
   loadBalancerIP: {{ . | quote }}
   {{- end }}

@@ -2,7 +2,7 @@ ARG TOOLS_IMAGE=docker.horse/ci/on-alpine/tools:1
 
 FROM $TOOLS_IMAGE AS tools
 
-FROM docker.io/library/golang:1.27.0-alpine AS build
+FROM docker.io/library/golang:1.27.1-alpine AS build
 
 WORKDIR /usr/src/app/ckic
 
@@ -25,8 +25,7 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -a -o ckic-manager ./cmd/manager && \
-    chmod +x ckic-manager
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o ckic-manager ./cmd/manager
 
 FROM docker.io/library/alpine:3
 

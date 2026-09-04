@@ -11,7 +11,7 @@ flowchart LR
         Entry["<b><code>cmd/manager</code></b><br/>CLI flags + leader election + health probes"]
         subgraph Ctrl["<b><code>pkg/controller</code></b>"]
             direction TB
-            Informers["<b>Informers</b><br/>nodes + <code>ConfigMaps</code> + <code>Deployments</code>"]
+            Informers["<b>Informers</b><br/>nodes + <code>ConfigMap</code>s + <code>Deployment</code>s + <code>Pod</code>s + <code>Service</code>s"]
             Reconciler["<b>Workqueue</b> + <b>reconciler</b><br/>server-side apply + push dedup + retry-with-backoff"]
         end
         Aggregator["<b><code>pkg/aggregator</code></b><br/>merge base + external <code>Caddyfile</code>s"]
@@ -32,16 +32,16 @@ flowchart LR
         K8s["<b>Kubernetes API</b>"]
         ConfigMaps[("<b>base</b> + <b>external</b><br/><code>ConfigMap</code>s")]
         MirrorCM[("<b>merged mirror</b><br/><code>ConfigMap</code>")]
-        Instances["<b>Caddy instances</b><br/>one <code>Deployment</code> and <code>Service</code> per labelled node"]
+        Instances["<b>Caddy instances</b><br/>one <code>Deployment</code> per labelled node"]
         LB["<b>LoadBalancer</b><br/><code>none</code> / <code>cilium</code> / <code>shared</code>"]
     end
-    Informers <-->|"watch nodes and <code>Deployment</code>s"| K8s
+    Informers <-->|"watch nodes and managed objects"| K8s
     ConfigMaps -->|"watched"| Informers
     Aggregator -->|"publish (SSA)"| MirrorCM
     Deployer -->|"apply objects (SSA)"| K8s
     K8s -->|"schedules"| Instances
     MirrorCM -.->|"mounted at boot"| Instances
-    Admin -->|"push via admin API"| Instances
+    Admin -->|"push via pod IP"| Instances
     Deployer -.-> LB
     LB -->|"traffic"| Instances
 ```

@@ -17,14 +17,8 @@ const (
 	VolumeNameCaddyConfig       = "caddy-config"
 	VolumeNameData              = "opt-data"
 	VolumeNameConfig            = "opt-config"
-	HostLabelHostname           = "kubernetes.io/hostname"
 	CiliumNodeLoadBalancerClass = "io.cilium/node"
-	CiliumNodeIPAMAnnotationKey = "io.cilium.nodeipam/match-node-labels"
 )
-
-func InstanceLabelSelector(nodeName string) string {
-	return LabelApp + "=" + LabelAppValue + "," + LabelInstance + "=" + nodeName
-}
 
 func AggregatedConfigLabels() map[string]string {
 	return map[string]string{
