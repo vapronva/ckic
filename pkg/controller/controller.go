@@ -14,7 +14,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	appsv1listers "k8s.io/client-go/listers/apps/v1"
@@ -183,7 +182,7 @@ func (c *Controller) setupInformers() error {
 		podInformer.Informer().HasSynced,
 		serviceInformer.Informer().HasSynced,
 	}
-	if err := c.addBaseConfigMapHandler(cmInformer.Informer()); err != nil {
+	if err := c.addConfigMapHandler(cmInformer.Informer()); err != nil {
 		return err
 	}
 	if !c.config.ExternalEnable {
@@ -231,10 +230,17 @@ func (c *Controller) addNodeHandler(informer cache.SharedIndexInformer) {
 	})
 }
 
-func (c *Controller) addBaseConfigMapHandler(informer cache.SharedIndexInformer) error {
+func (c *Controller) addConfigMapHandler(informer cache.SharedIndexInformer) error {
 	handle := func(obj any) {
 		cm, ok := obj.(*corev1.ConfigMap)
-		if !ok || cm.Name != c.config.ConfigMapName {
+		if !ok {
+			return
+		}
+		if c.config.ExternalPublishAggregated && cm.Name == c.config.ExternalAggregatedConfigName {
+			c.enqueueChangedMirror(cm)
+			return
+		}
+		if cm.Name != c.config.ConfigMapName {
 			return
 		}
 		data, exists := cm.Data[constants.CaddyfileKey]
@@ -248,8 +254,15 @@ func (c *Controller) addBaseConfigMapHandler(informer cache.SharedIndexInformer)
 		AddFunc:    handle,
 		UpdateFunc: func(_, newObj any) { handle(newObj) },
 		DeleteFunc: func(obj any) {
-			if cm, ok := tombstone[*corev1.ConfigMap](obj); ok && cm.Name == c.config.ConfigMapName {
+			cm, ok := tombstone[*corev1.ConfigMap](obj)
+			if !ok {
+				return
+			}
+			if cm.Name == c.config.ConfigMapName {
 				log.Warn().Str("configmap", cm.Name).Msg("Base ConfigMap deleted; keeping last known configuration")
+			}
+			if c.config.ExternalPublishAggregated && cm.Name == c.config.ExternalAggregatedConfigName {
+				c.queue.Add(configReconcileKey)
 			}
 		},
 	})
@@ -258,6 +271,23 @@ func (c *Controller) addBaseConfigMapHandler(informer cache.SharedIndexInformer)
 	}
 	c.cacheSyncs = append(c.cacheSyncs, handler.HasSynced)
 	return nil
+}
+
+func (c *Controller) enqueueChangedMirror(cm *corev1.ConfigMap) {
+	merged, err := c.aggregator.CurrentMerged()
+	if err != nil {
+		return
+	}
+	if cm.Data[constants.CaddyfileKey] != merged {
+		c.queue.Add(configReconcileKey)
+		return
+	}
+	for key, value := range constants.AggregatedConfigLabels() {
+		if cm.Labels[key] != value {
+			c.queue.Add(configReconcileKey)
+			return
+		}
+	}
 }
 
 func (c *Controller) addExternalConfigMapHandler(informer cache.SharedIndexInformer) error {
@@ -379,10 +409,8 @@ func (c *Controller) Run(ctx context.Context) error {
 		return fmt.Errorf("shutting down before informer caches synced: %w", ctx.Err())
 	}
 	logger.Info().Msg("Caches synced; starting reconcile workers")
-	if c.config.ExternalPublishAggregated {
-		if err := c.aggregator.PublishMirror(ctx); err != nil {
-			return fmt.Errorf("failed to publish initial mirror ConfigMap: %w", err)
-		}
+	if err := c.aggregator.PublishMirror(ctx); err != nil {
+		logger.Warn().Err(err).Msg("Initial mirror ConfigMap publish failed; reconciliation will retry")
 	}
 	c.enqueueExistingDeployments(logger)
 	caddy.ReapPrePullPods(ctx, c.clientset, c.config.Namespace, logger)
@@ -445,11 +473,17 @@ func (c *Controller) bootstrapBaseConfig(ctx context.Context, logger zerolog.Log
 			Msg("Base ConfigMap not found and bootstrap disabled; waiting for it to be created")
 		return nil
 	}
-	apply := corev1ac.ConfigMap(c.config.ConfigMapName, c.config.Namespace).
-		WithData(map[string]string{
+	base := &corev1.ConfigMap{
+		Name: c.config.ConfigMapName, Namespace: c.config.Namespace,
+		Data: map[string]string{
 			constants.CaddyfileKey: defaultBootstrapCaddyfile(c.config.Deploy.CaddyAdminOriginKey),
-		})
-	if _, err := configMaps.Apply(ctx, apply, metav1.ApplyOptions{FieldManager: "ckic", Force: true}); err != nil {
+		},
+	}
+	_, err = configMaps.Create(ctx, base, metav1.CreateOptions{})
+	if apierrors.IsAlreadyExists(err) {
+		return nil
+	}
+	if err != nil {
 		return fmt.Errorf("failed to bootstrap default ConfigMap: %w", err)
 	}
 	logger.Info().Msg("Bootstrapped default base ConfigMap")

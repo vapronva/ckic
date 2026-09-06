@@ -2,7 +2,9 @@ package caddy
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -10,6 +12,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apimachinery/pkg/util/wait"
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	"k8s.io/client-go/kubernetes"
@@ -28,19 +31,20 @@ const (
 func prePullImage(ctx context.Context, opts DeployOptions, nodeName string, logger zerolog.Logger) error {
 	podName := prePullPodName(nodeName)
 	logger = logger.With().Str("prepullPod", podName).Str("image", opts.CaddyImage).Logger()
-	cleanup := func() {
+	if err := deletePrePullPod(ctx, opts.Clientset, opts.Namespace, podName); err != nil {
+		return err
+	}
+	if _, err := opts.Clientset.CoreV1().Pods(opts.Namespace).
+		Apply(ctx, prePullPodApplyConfig(opts, nodeName), applyOptions()); err != nil {
+		return fmt.Errorf("failed to create pre-pull pod: %w", err)
+	}
+	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), prePullCleanupTimeout)
 		defer cancel()
 		if err := deletePrePullPod(cleanupCtx, opts.Clientset, opts.Namespace, podName); err != nil {
 			logger.Warn().Err(err).Msg("Failed to delete pre-pull pod")
 		}
-	}
-	cleanup()
-	if _, err := opts.Clientset.CoreV1().Pods(opts.Namespace).
-		Apply(ctx, prePullPodApplyConfig(opts, nodeName), applyOptions()); err != nil {
-		return fmt.Errorf("failed to create pre-pull pod: %w", err)
-	}
-	defer cleanup()
+	}()
 	logger.Info().Msg("Pre-pulling Caddy image on node")
 	if err := waitForImagePulled(ctx, opts.Clientset, opts.Namespace, podName); err != nil {
 		return err
@@ -82,7 +86,13 @@ func prePullPodApplyConfig(opts DeployOptions, nodeName string) *corev1ac.PodApp
 func waitForImagePulled(ctx context.Context, clientset kubernetes.Interface, namespace, podName string) error {
 	return wait.PollUntilContextTimeout(ctx, imagePrePullPollDelay, imagePrePullTimeout, true,
 		func(ctx context.Context) (bool, error) {
+			if err := ctx.Err(); err != nil {
+				return false, err
+			}
 			pod, err := clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
+			if isTransientPrePullError(err) {
+				return false, nil
+			}
 			if err != nil {
 				return false, fmt.Errorf("failed to get pre-pull pod: %w", err)
 			}
@@ -90,7 +100,19 @@ func waitForImagePulled(ctx context.Context, clientset kubernetes.Interface, nam
 		})
 }
 
+func isTransientPrePullError(err error) bool {
+	if status, ok := errors.AsType[*apierrors.StatusError](err); ok {
+		code := status.Status().Code
+		return code == http.StatusTooManyRequests || code >= http.StatusInternalServerError && code < 600
+	}
+	return utilnet.IsTimeout(err) || utilnet.IsProbableEOF(err) || utilnet.IsHTTP2ConnectionLost(err) ||
+		utilnet.IsConnectionReset(err) || utilnet.IsConnectionRefused(err)
+}
+
 func prePullImagePresent(pod *corev1.Pod) (bool, error) {
+	if pod.DeletionTimestamp != nil {
+		return false, fmt.Errorf("pre-pull pod %s is being deleted", pod.Name)
+	}
 	for _, status := range pod.Status.ContainerStatuses {
 		if status.Name != prePullContainerName {
 			continue

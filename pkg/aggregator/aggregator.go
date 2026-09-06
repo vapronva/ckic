@@ -103,9 +103,6 @@ func (a *Aggregator) CurrentMerged() (string, error) {
 		sb.WriteString(fragment)
 		fmt.Fprintf(&sb, "\n# ---- End external from %s ----\n", source)
 	}
-	if a.publishAggregated && sb.Len() > corev1.MaxSecretSize {
-		return "", fmt.Errorf("merged Caddyfile is %d bytes, exceeding the ConfigMap limit of %d", sb.Len(), corev1.MaxSecretSize)
-	}
 	return sb.String(), nil
 }
 
@@ -113,15 +110,18 @@ func (a *Aggregator) PublishMirror(ctx context.Context) error {
 	if !a.publishAggregated {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, mirrorPublishTimeout)
-	defer cancel()
 	merged, err := a.CurrentMerged()
 	if err != nil {
 		return err
 	}
+	if len(merged) > corev1.MaxSecretSize {
+		return fmt.Errorf("merged Caddyfile is %d bytes, exceeding the ConfigMap limit of %d", len(merged), corev1.MaxSecretSize)
+	}
 	apply := corev1ac.ConfigMap(a.mirrorName, a.namespace).
 		WithLabels(constants.AggregatedConfigLabels()).
 		WithData(map[string]string{constants.CaddyfileKey: merged})
+	ctx, cancel := context.WithTimeout(ctx, mirrorPublishTimeout)
+	defer cancel()
 	if _, err := a.clientset.CoreV1().ConfigMaps(a.namespace).Apply(
 		ctx, apply, metav1.ApplyOptions{FieldManager: mirrorFieldManager, Force: true},
 	); err != nil {

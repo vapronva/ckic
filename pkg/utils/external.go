@@ -3,44 +3,45 @@ package utils
 import (
 	"fmt"
 	"net"
+	"slices"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/api/validate/content"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 type ExternalEndpointsMap map[string][]string
 
-const endpointKVParts = 2
-
 func ParseExternalEndpoints(endpoints []string) (ExternalEndpointsMap, error) {
 	result := make(ExternalEndpointsMap)
-	seen := make(map[string]map[string]struct{})
 	for _, endpoint := range endpoints {
-		parts := strings.SplitN(endpoint, "=", endpointKVParts)
-		if len(parts) != endpointKVParts {
+		nodeName, addresses, ok := strings.Cut(endpoint, "=")
+		if !ok {
 			return nil, fmt.Errorf(
-				"invalid external endpoint format: %s; expected format 'nodeName=ip1,ip2,...'",
+				"--external-endpoints: invalid endpoint %q; expected format 'nodeName=ip1,ip2,...'",
 				endpoint,
 			)
 		}
-		nodeName := strings.TrimSpace(parts[0])
+		nodeName = strings.TrimSpace(nodeName)
 		if errs := content.IsDNS1123Subdomain(nodeName); len(errs) > 0 {
-			return nil, fmt.Errorf("invalid Kubernetes node name %q: %s", nodeName, strings.Join(errs, "; "))
+			return nil, fmt.Errorf("--external-endpoints: invalid Kubernetes node name %q: %s", nodeName, strings.Join(errs, "; "))
 		}
-		if seen[nodeName] == nil {
-			seen[nodeName] = make(map[string]struct{})
+		if errs := validation.IsValidLabelValue(nodeName); len(errs) > 0 {
+			return nil, fmt.Errorf("--external-endpoints: node %q cannot be used as an instance label: %s", nodeName, strings.Join(errs, "; "))
 		}
-		for rawIP := range strings.SplitSeq(parts[1], ",") {
+		for rawIP := range strings.SplitSeq(addresses, ",") {
 			ip := strings.TrimSpace(rawIP)
 			parsed := net.ParseIP(ip)
 			if parsed == nil {
-				return nil, fmt.Errorf("invalid IP address format for node %s: %s", nodeName, ip)
+				return nil, fmt.Errorf("--external-endpoints: invalid IP address %q for node %q", ip, nodeName)
+			}
+			if !parsed.IsGlobalUnicast() {
+				return nil, fmt.Errorf("--external-endpoints: IP address %q for node %q must be unicast and cannot be unspecified, loopback or link-local", ip, nodeName)
 			}
 			canonical := parsed.String()
-			if _, ok := seen[nodeName][canonical]; ok {
+			if slices.Contains(result[nodeName], canonical) {
 				continue
 			}
-			seen[nodeName][canonical] = struct{}{}
 			result[nodeName] = append(result[nodeName], canonical)
 		}
 	}

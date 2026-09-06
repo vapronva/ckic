@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -14,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	clienttesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 	cachetesting "k8s.io/client-go/tools/cache/testing"
 
@@ -37,7 +39,15 @@ func addNode(c *Controller, name string) {
 
 func TestReconcileNodePushesOnlyWhenNeeded(t *testing.T) {
 	t.Parallel()
-	c := newTestController(t, fake.NewClientset())
+	client := fake.NewClientset()
+	c, err := NewController(client, Config{
+		Namespace: "system", ConfigMapName: "base",
+		ExternalPublishAggregated: true, ExternalAggregatedConfigName: "merged",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(c.queue.ShutDown)
 	addNode(c, "node1")
 	instance := &caddy.Instance{PodReady: true, ContainerID: "container-1"}
 	c.deployFn = func(context.Context, caddy.DeployOptions, string, []string) (*caddy.Instance, error) {
@@ -75,6 +85,25 @@ func TestReconcileNodePushesOnlyWhenNeeded(t *testing.T) {
 	if pushes[3] != "changed\n" {
 		t.Fatalf("pushed %q", pushes[3])
 	}
+	if err := c.aggregator.PublishMirror(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	oversized := strings.Repeat("x", corev1.MaxSecretSize)
+	c.aggregator.SetExternal("team/large", oversized)
+	if err := c.aggregator.PublishMirror(t.Context()); err == nil {
+		t.Fatal("oversized mirror was accepted")
+	}
+	reconcile("oversized config", 5)
+	if !strings.Contains(pushes[4], oversized) {
+		t.Fatal("oversized fragment was not pushed in full")
+	}
+	mirror, err := client.CoreV1().ConfigMaps("system").Get(t.Context(), "merged", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mirror.Data[constants.CaddyfileKey] != pushes[3] {
+		t.Fatal("oversized config replaced the last fitting boot snapshot")
+	}
 }
 
 func TestReconcileNodeTearsDownUnmanagedNode(t *testing.T) {
@@ -95,11 +124,10 @@ func TestReconcileNodeTearsDownUnmanagedNode(t *testing.T) {
 	}
 }
 
-func TestRunStartsWithAllConfigFragments(t *testing.T) {
+func TestRunWaitsForBaseAndPushesAllConfigFragments(t *testing.T) {
 	t.Parallel()
 	client := fake.NewClientset(
 		&corev1.Node{Name: "node1"},
-		&corev1.ConfigMap{Name: "base", Namespace: "system", Data: map[string]string{constants.CaddyfileKey: "base"}},
 		&corev1.ConfigMap{Name: "external", Namespace: "team", Labels: map[string]string{"aggregate": "true"}, Data: map[string]string{constants.CaddyfileKey: "external"}},
 	)
 	c, err := NewController(client, Config{
@@ -120,10 +148,26 @@ func TestRunStartsWithAllConfigFragments(t *testing.T) {
 		}
 		return nil
 	}
-	ctx, cancel := context.WithCancel(t.Context())
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- c.Run(ctx) }()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for c.queue.NumRequeues(configReconcileKey) == 0 {
+		select {
+		case err := <-done:
+			t.Fatalf("Run exited while the base ConfigMap was missing: %v", err)
+		case <-ctx.Done():
+			t.Fatal("missing base ConfigMap was not retried")
+		case <-ticker.C:
+		}
+	}
+	if _, err := client.CoreV1().ConfigMaps("system").Create(ctx, &corev1.ConfigMap{
+		Name: "base", Namespace: "system", Data: map[string]string{constants.CaddyfileKey: "base"},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
 	select {
 	case config := <-pushed:
 		if !strings.HasPrefix(config, "base\n") || !strings.Contains(config, "external") {
@@ -142,6 +186,34 @@ func TestRunStartsWithAllConfigFragments(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("controller did not stop")
+	}
+}
+
+func TestBootstrapPreservesConcurrentCreate(t *testing.T) {
+	t.Parallel()
+	client := fake.NewClientset()
+	c := newTestController(t, client)
+	c.config.BootstrapDefaultConfig = true
+	resource := corev1.SchemeGroupVersion.WithResource("configmaps")
+	client.PrependReactor("get", "configmaps", func(clienttesting.Action) (bool, runtime.Object, error) {
+		base := &corev1.ConfigMap{
+			Name: c.config.ConfigMapName, Namespace: c.config.Namespace,
+			Data: map[string]string{constants.CaddyfileKey: "existing"},
+		}
+		if err := client.Tracker().Create(resource, base, c.config.Namespace); err != nil {
+			return true, nil, err
+		}
+		return true, nil, apierrors.NewNotFound(corev1.Resource("configmaps"), base.Name)
+	})
+	if err := c.bootstrapBaseConfig(t.Context(), zerolog.Nop()); err != nil {
+		t.Fatal(err)
+	}
+	base, err := client.Tracker().Get(resource, c.config.Namespace, c.config.ConfigMapName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if base.(*corev1.ConfigMap).Data[constants.CaddyfileKey] != "existing" {
+		t.Fatal("bootstrap overwrote a concurrently created ConfigMap")
 	}
 }
 
