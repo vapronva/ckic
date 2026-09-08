@@ -11,6 +11,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	"k8s.io/client-go/kubernetes"
@@ -24,31 +25,31 @@ const (
 )
 
 type Aggregator struct {
-	mu                sync.RWMutex
-	base              string
-	hasBase           bool
-	externals         map[string]string
-	clientset         kubernetes.Interface
-	namespace         string
-	publishAggregated bool
-	mirrorName        string
-	enqueue           func()
+	mu          sync.RWMutex
+	publishMu   sync.Mutex
+	base        string
+	hasBase     bool
+	accepted    string
+	hasAccepted bool
+	externals   map[string]string
+	clientset   kubernetes.Interface
+	namespace   string
+	mirrorName  string
+	enqueue     func()
 }
 
 func New(
 	clientset kubernetes.Interface,
 	namespace string,
-	publishAggregated bool,
 	mirrorName string,
 	enqueue func(),
 ) *Aggregator {
 	return &Aggregator{
-		externals:         make(map[string]string),
-		clientset:         clientset,
-		namespace:         namespace,
-		publishAggregated: publishAggregated,
-		mirrorName:        mirrorName,
-		enqueue:           enqueue,
+		externals:  make(map[string]string),
+		clientset:  clientset,
+		namespace:  namespace,
+		mirrorName: mirrorName,
+		enqueue:    enqueue,
 	}
 }
 
@@ -103,23 +104,88 @@ func (a *Aggregator) CurrentMerged() (string, error) {
 		sb.WriteString(fragment)
 		fmt.Fprintf(&sb, "\n# ---- End external from %s ----\n", source)
 	}
-	return sb.String(), nil
+	merged := sb.String()
+	if len(merged) > corev1.MaxSecretSize {
+		return "", fmt.Errorf("merged Caddyfile is %d bytes, exceeding the ConfigMap limit of %d", len(merged), corev1.MaxSecretSize)
+	}
+	return merged, nil
 }
 
-func (a *Aggregator) PublishMirror(ctx context.Context) error {
-	if !a.publishAggregated {
+func (a *Aggregator) InitializeMirror(ctx context.Context, bootstrap string) error {
+	ctx, cancel := context.WithTimeout(ctx, mirrorPublishTimeout)
+	defer cancel()
+	configMaps := a.clientset.CoreV1().ConfigMaps(a.namespace)
+	mirror, err := configMaps.Get(ctx, a.mirrorName, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		mirror, err = configMaps.Create(ctx, &corev1.ConfigMap{
+			Name: a.mirrorName, Namespace: a.namespace,
+			Labels: constants.AggregatedConfigLabels(),
+			Data:   map[string]string{constants.CaddyfileKey: bootstrap},
+		}, metav1.CreateOptions{})
+		if apierrors.IsAlreadyExists(err) {
+			mirror, err = configMaps.Get(ctx, a.mirrorName, metav1.GetOptions{})
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("failed to initialize boot ConfigMap: %w", err)
+	}
+	accepted := mirror.Data[constants.CaddyfileKey]
+	if strings.TrimSpace(accepted) == "" {
+		accepted = bootstrap
+		if err := a.publishMirror(ctx, accepted); err != nil {
+			return err
+		}
+	}
+	a.mu.Lock()
+	a.accepted = accepted
+	a.hasAccepted = true
+	a.mu.Unlock()
+	return nil
+}
+
+func (a *Aggregator) CurrentAccepted() (string, error) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if !a.hasAccepted {
+		return "", errors.New("boot ConfigMap has not been initialized")
+	}
+	return a.accepted, nil
+}
+
+func (a *Aggregator) PublishAccepted(ctx context.Context, accepted string) error {
+	a.publishMu.Lock()
+	defer a.publishMu.Unlock()
+	if current, err := a.CurrentAccepted(); err == nil && current == accepted {
 		return nil
 	}
 	merged, err := a.CurrentMerged()
 	if err != nil {
 		return err
 	}
-	if len(merged) > corev1.MaxSecretSize {
-		return fmt.Errorf("merged Caddyfile is %d bytes, exceeding the ConfigMap limit of %d", len(merged), corev1.MaxSecretSize)
+	if merged != accepted {
+		return nil
 	}
+	a.mu.Lock()
+	a.accepted = accepted
+	a.hasAccepted = true
+	a.mu.Unlock()
+	return a.publishMirror(ctx, accepted)
+}
+
+func (a *Aggregator) PublishMirror(ctx context.Context) error {
+	a.publishMu.Lock()
+	defer a.publishMu.Unlock()
+	accepted, err := a.CurrentAccepted()
+	if err != nil {
+		return err
+	}
+	return a.publishMirror(ctx, accepted)
+}
+
+func (a *Aggregator) publishMirror(ctx context.Context, accepted string) error {
 	apply := corev1ac.ConfigMap(a.mirrorName, a.namespace).
 		WithLabels(constants.AggregatedConfigLabels()).
-		WithData(map[string]string{constants.CaddyfileKey: merged})
+		WithData(map[string]string{constants.CaddyfileKey: accepted})
 	ctx, cancel := context.WithTimeout(ctx, mirrorPublishTimeout)
 	defer cancel()
 	if _, err := a.clientset.CoreV1().ConfigMaps(a.namespace).Apply(

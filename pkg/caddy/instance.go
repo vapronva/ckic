@@ -20,7 +20,6 @@ type Instance struct {
 	PodName        string
 	PodIP          string
 	ContainerID    string
-	PodReady       bool
 	ExternalIPs    []string
 	KubeClient     kubernetes.Interface
 }
@@ -34,7 +33,7 @@ func (i *Instance) Delete(ctx context.Context) error {
 	return errors.Join(
 		i.deleteServicesExcept(ctx, "", logger),
 		i.deleteDeploymentsExcept(ctx, "", logger),
-		deletePrePullPod(ctx, i.KubeClient, i.Namespace, prePullPodName(i.NodeName)),
+		deletePrePullPod(ctx, i.KubeClient, i.Namespace, prePullPodName(i.NodeName), nil),
 	)
 }
 

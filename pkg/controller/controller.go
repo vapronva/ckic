@@ -39,7 +39,6 @@ type Config struct {
 	ExternalLabel                string
 	ExternalAllowNamespaces      []string
 	ExternalDenyNamespaces       []string
-	ExternalPublishAggregated    bool
 	ExternalAggregatedConfigName string
 }
 
@@ -105,16 +104,16 @@ func NewController(clientset kubernetes.Interface, config Config) (*Controller, 
 		}
 		config.ExternalLabel = externalLabel
 	}
-	if config.ExternalPublishAggregated && config.ExternalAggregatedConfigName == "" {
-		return nil, errors.New("external aggregated config name must be set when publishing the aggregated config")
+	if config.ExternalAggregatedConfigName == "" {
+		return nil, errors.New("external aggregated config name must be set for accepted boot snapshots")
 	}
-	if config.ExternalPublishAggregated && config.ExternalAggregatedConfigName == config.ConfigMapName {
+	if config.ExternalAggregatedConfigName == config.ConfigMapName {
 		return nil, errors.New("external aggregated config name must differ from the base config-map name")
 	}
 	deployOpts := config.Deploy
 	deployOpts.Clientset = clientset
 	deployOpts.Namespace = config.Namespace
-	deployOpts.ConfigMapName = bootConfigMapName(config)
+	deployOpts.ConfigMapName = config.ExternalAggregatedConfigName
 	c := &Controller{
 		clientset:         clientset,
 		config:            config,
@@ -133,7 +132,6 @@ func NewController(clientset kubernetes.Interface, config Config) (*Controller, 
 	c.aggregator = aggregator.New(
 		clientset,
 		config.Namespace,
-		config.ExternalPublishAggregated,
 		config.ExternalAggregatedConfigName,
 		func() { c.queue.Add(configReconcileKey) },
 	)
@@ -142,13 +140,6 @@ func NewController(clientset kubernetes.Interface, config Config) (*Controller, 
 		return nil, err
 	}
 	return c, nil
-}
-
-func bootConfigMapName(config Config) string {
-	if config.ExternalPublishAggregated {
-		return config.ExternalAggregatedConfigName
-	}
-	return config.ConfigMapName
 }
 
 func namespaceSet(namespaces []string) map[string]struct{} {
@@ -236,7 +227,7 @@ func (c *Controller) addConfigMapHandler(informer cache.SharedIndexInformer) err
 		if !ok {
 			return
 		}
-		if c.config.ExternalPublishAggregated && cm.Name == c.config.ExternalAggregatedConfigName {
+		if cm.Name == c.config.ExternalAggregatedConfigName {
 			c.enqueueChangedMirror(cm)
 			return
 		}
@@ -261,7 +252,7 @@ func (c *Controller) addConfigMapHandler(informer cache.SharedIndexInformer) err
 			if cm.Name == c.config.ConfigMapName {
 				log.Warn().Str("configmap", cm.Name).Msg("Base ConfigMap deleted; keeping last known configuration")
 			}
-			if c.config.ExternalPublishAggregated && cm.Name == c.config.ExternalAggregatedConfigName {
+			if cm.Name == c.config.ExternalAggregatedConfigName {
 				c.queue.Add(configReconcileKey)
 			}
 		},
@@ -274,11 +265,11 @@ func (c *Controller) addConfigMapHandler(informer cache.SharedIndexInformer) err
 }
 
 func (c *Controller) enqueueChangedMirror(cm *corev1.ConfigMap) {
-	merged, err := c.aggregator.CurrentMerged()
+	accepted, err := c.aggregator.CurrentAccepted()
 	if err != nil {
 		return
 	}
-	if cm.Data[constants.CaddyfileKey] != merged {
+	if cm.Data[constants.CaddyfileKey] != accepted {
 		c.queue.Add(configReconcileKey)
 		return
 	}
@@ -409,8 +400,8 @@ func (c *Controller) Run(ctx context.Context) error {
 		return fmt.Errorf("shutting down before informer caches synced: %w", ctx.Err())
 	}
 	logger.Info().Msg("Caches synced; starting reconcile workers")
-	if err := c.aggregator.PublishMirror(ctx); err != nil {
-		logger.Warn().Err(err).Msg("Initial mirror ConfigMap publish failed; reconciliation will retry")
+	if err := c.aggregator.InitializeMirror(ctx, bootstrapAdminCaddyfile(c.config.Deploy.CaddyAdminOriginKey)); err != nil {
+		return err
 	}
 	c.enqueueExistingDeployments(logger)
 	caddy.ReapPrePullPods(ctx, c.clientset, c.config.Namespace, logger)
@@ -491,6 +482,10 @@ func (c *Controller) bootstrapBaseConfig(ctx context.Context, logger zerolog.Log
 }
 
 func defaultBootstrapCaddyfile(originKey string) string {
+	return bootstrapAdminCaddyfile(originKey) + "\n:80 {\n\trespond \"Hello, world!\"\n}\n"
+}
+
+func bootstrapAdminCaddyfile(originKey string) string {
 	admin := "\tadmin :2019\n"
 	if originKey != "" {
 		admin = fmt.Sprintf(
@@ -498,7 +493,7 @@ func defaultBootstrapCaddyfile(originKey string) string {
 			originKey,
 		)
 	}
-	return fmt.Sprintf("{\n%s}\n\n:80 {\n\trespond \"Hello, world!\"\n}\n", admin)
+	return fmt.Sprintf("{\n%s}\n", admin)
 }
 
 func tombstone[T any](obj any) (T, bool) {

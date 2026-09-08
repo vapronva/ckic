@@ -5,12 +5,17 @@ import (
 	"sync/atomic"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
+
 	"git.horse/vapronva/ckic/pkg/aggregator"
+	"git.horse/vapronva/ckic/pkg/constants"
 )
 
 func TestCurrentMergedSortsExternalsAfterBase(t *testing.T) {
 	t.Parallel()
-	agg := aggregator.New(nil, "caddy-system", false, "", nil)
+	agg := aggregator.New(nil, "caddy-system", "", nil)
 	if _, err := agg.CurrentMerged(); err == nil {
 		t.Fatal("missing base was accepted")
 	}
@@ -35,10 +40,90 @@ func TestCurrentMergedSortsExternalsAfterBase(t *testing.T) {
 	}
 }
 
+func TestBootMirrorKeepsAcceptedSnapshot(t *testing.T) {
+	t.Parallel()
+	client := fake.NewClientset()
+	agg := aggregator.New(client, "system", "accepted", nil)
+	const bootstrap = "{\n\tadmin :2019\n}\n"
+	if err := agg.InitializeMirror(t.Context(), bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	checkMirror := func(want string) {
+		t.Helper()
+		mirror, err := client.CoreV1().ConfigMaps("system").Get(t.Context(), "accepted", metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := mirror.Data[constants.CaddyfileKey]; got != want {
+			t.Fatalf("boot snapshot = %q, want %q", got, want)
+		}
+	}
+	checkMirror(bootstrap)
+	agg.UpdateBase("candidate\n")
+	if err := agg.PublishMirror(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	checkMirror(bootstrap)
+	if err := agg.PublishAccepted(t.Context(), "candidate\n"); err != nil {
+		t.Fatal(err)
+	}
+	checkMirror("candidate\n")
+	actions := len(client.Actions())
+	if err := agg.PublishAccepted(t.Context(), "candidate\n"); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.Actions()) != actions {
+		t.Fatal("unchanged accepted snapshot was republished")
+	}
+	agg.UpdateBase("newer\n")
+	if err := agg.PublishAccepted(t.Context(), "newer\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := agg.PublishAccepted(t.Context(), "candidate\n"); err != nil {
+		t.Fatal(err)
+	}
+	checkMirror("newer\n")
+	restarted := aggregator.New(client, "system", "accepted", nil)
+	if err := restarted.InitializeMirror(t.Context(), bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	restarted.UpdateBase("invalid\n")
+	if err := restarted.PublishMirror(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	checkMirror("newer\n")
+	if err := client.CoreV1().ConfigMaps("system").Delete(t.Context(), "accepted", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.PublishMirror(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	checkMirror("newer\n")
+}
+
+func TestBootMirrorRepairsMissingCaddyfile(t *testing.T) {
+	t.Parallel()
+	for _, data := range []map[string]string{nil, {constants.CaddyfileKey: ""}, {constants.CaddyfileKey: " \n"}} {
+		client := fake.NewClientset(&corev1.ConfigMap{Name: "accepted", Namespace: "system", Data: data})
+		agg := aggregator.New(client, "system", "accepted", nil)
+		const bootstrap = "{\n\tadmin :2019\n}\n"
+		if err := agg.InitializeMirror(t.Context(), bootstrap); err != nil {
+			t.Fatal(err)
+		}
+		mirror, err := client.CoreV1().ConfigMaps("system").Get(t.Context(), "accepted", metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := mirror.Data[constants.CaddyfileKey]; got != bootstrap {
+			t.Fatalf("boot snapshot = %q, want %q", got, bootstrap)
+		}
+	}
+}
+
 func TestEnqueueFiresOnlyOnChange(t *testing.T) {
 	t.Parallel()
 	var enqueues atomic.Int32
-	agg := aggregator.New(nil, "caddy-system", false, "", func() { enqueues.Add(1) })
+	agg := aggregator.New(nil, "caddy-system", "", func() { enqueues.Add(1) })
 	steps := []struct {
 		name string
 		do   func()

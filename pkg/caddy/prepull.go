@@ -12,6 +12,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apimachinery/pkg/util/wait"
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
@@ -31,17 +32,18 @@ const (
 func prePullImage(ctx context.Context, opts DeployOptions, nodeName string, logger zerolog.Logger) error {
 	podName := prePullPodName(nodeName)
 	logger = logger.With().Str("prepullPod", podName).Str("image", opts.CaddyImage).Logger()
-	if err := deletePrePullPod(ctx, opts.Clientset, opts.Namespace, podName); err != nil {
+	if err := deletePrePullPod(ctx, opts.Clientset, opts.Namespace, podName, nil); err != nil {
 		return err
 	}
-	if _, err := opts.Clientset.CoreV1().Pods(opts.Namespace).
-		Apply(ctx, prePullPodApplyConfig(opts, nodeName), applyOptions()); err != nil {
+	pod, err := opts.Clientset.CoreV1().Pods(opts.Namespace).
+		Apply(ctx, prePullPodApplyConfig(opts, nodeName), applyOptions())
+	if err != nil {
 		return fmt.Errorf("failed to create pre-pull pod: %w", err)
 	}
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), prePullCleanupTimeout)
 		defer cancel()
-		if err := deletePrePullPod(cleanupCtx, opts.Clientset, opts.Namespace, podName); err != nil {
+		if err := deletePrePullPod(cleanupCtx, opts.Clientset, opts.Namespace, podName, &pod.UID); err != nil {
 			logger.Warn().Err(err).Msg("Failed to delete pre-pull pod")
 		}
 	}()
@@ -110,9 +112,6 @@ func isTransientPrePullError(err error) bool {
 }
 
 func prePullImagePresent(pod *corev1.Pod) (bool, error) {
-	if pod.DeletionTimestamp != nil {
-		return false, fmt.Errorf("pre-pull pod %s is being deleted", pod.Name)
-	}
 	for _, status := range pod.Status.ContainerStatuses {
 		if status.Name != prePullContainerName {
 			continue
@@ -150,13 +149,19 @@ func prePullImagePresent(pod *corev1.Pod) (bool, error) {
 		return false, fmt.Errorf("pre-pull pod failed before image pull (reason=%s): %s", pod.Status.Reason, pod.Status.Message)
 	case corev1.PodPending, corev1.PodUnknown:
 	}
+	if pod.DeletionTimestamp != nil {
+		return false, fmt.Errorf("pre-pull pod %s is being deleted", pod.Name)
+	}
 	return false, nil
 }
 
-func deletePrePullPod(ctx context.Context, clientset kubernetes.Interface, namespace, podName string) error {
+func deletePrePullPod(ctx context.Context, clientset kubernetes.Interface, namespace, podName string, uid *types.UID) error {
 	gracePeriod := int64(0)
-	err := clientset.CoreV1().Pods(namespace).Delete(ctx, podName, metav1.DeleteOptions{GracePeriodSeconds: &gracePeriod})
-	if err == nil || apierrors.IsNotFound(err) {
+	err := clientset.CoreV1().Pods(namespace).Delete(ctx, podName, metav1.DeleteOptions{
+		GracePeriodSeconds: &gracePeriod,
+		Preconditions:      &metav1.Preconditions{UID: uid},
+	})
+	if err == nil || apierrors.IsNotFound(err) || uid != nil && apierrors.IsConflict(err) {
 		return nil
 	}
 	return fmt.Errorf("failed to delete pre-pull pod %s: %w", podName, err)
@@ -176,7 +181,7 @@ func ReapPrePullPods(ctx context.Context, clientset kubernetes.Interface, namesp
 		return
 	}
 	for i := range pods.Items {
-		if err := deletePrePullPod(ctx, clientset, namespace, pods.Items[i].Name); err != nil {
+		if err := deletePrePullPod(ctx, clientset, namespace, pods.Items[i].Name, &pods.Items[i].UID); err != nil {
 			logger.Warn().Err(err).Msg("Failed to delete leftover pre-pull pod")
 		}
 	}

@@ -25,7 +25,7 @@ import (
 
 func newTestController(t *testing.T, client kubernetes.Interface) *Controller {
 	t.Helper()
-	c, err := NewController(client, Config{ConfigMapName: "caddy-config", Namespace: "caddy-system"})
+	c, err := NewController(client, Config{ConfigMapName: "caddy-config", Namespace: "caddy-system", ExternalAggregatedConfigName: "merged"})
 	if err != nil {
 		t.Fatalf("NewController: %v", err)
 	}
@@ -42,14 +42,14 @@ func TestReconcileNodePushesOnlyWhenNeeded(t *testing.T) {
 	client := fake.NewClientset()
 	c, err := NewController(client, Config{
 		Namespace: "system", ConfigMapName: "base",
-		ExternalPublishAggregated: true, ExternalAggregatedConfigName: "merged",
+		ExternalAggregatedConfigName: "merged",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(c.queue.ShutDown)
 	addNode(c, "node1")
-	instance := &caddy.Instance{PodReady: true, ContainerID: "container-1"}
+	instance := &caddy.Instance{PodIP: "192.0.2.1", ContainerID: "container-1"}
 	c.deployFn = func(context.Context, caddy.DeployOptions, string, []string) (*caddy.Instance, error) {
 		return instance, nil
 	}
@@ -76,9 +76,9 @@ func TestReconcileNodePushesOnlyWhenNeeded(t *testing.T) {
 	c.aggregator.UpdateBase("changed\n")
 	reconcile("config change", 2)
 	instance.ContainerID = "container-2"
-	instance.PodReady = false
+	instance.PodIP = ""
 	reconcile("container restarting", 2)
-	instance.PodReady = true
+	instance.PodIP = "192.0.2.1"
 	reconcile("container restarted", 3)
 	c.forceConfigResync()
 	reconcile("forced resync", 4)
@@ -90,12 +90,11 @@ func TestReconcileNodePushesOnlyWhenNeeded(t *testing.T) {
 	}
 	oversized := strings.Repeat("x", corev1.MaxSecretSize)
 	c.aggregator.SetExternal("team/large", oversized)
-	if err := c.aggregator.PublishMirror(t.Context()); err == nil {
-		t.Fatal("oversized mirror was accepted")
+	if err := c.reconcileNode(t.Context(), "node1"); err == nil {
+		t.Fatal("oversized config was accepted")
 	}
-	reconcile("oversized config", 5)
-	if !strings.Contains(pushes[4], oversized) {
-		t.Fatal("oversized fragment was not pushed in full")
+	if len(pushes) != 4 {
+		t.Fatal("config that cannot be saved for boot was pushed")
 	}
 	mirror, err := client.CoreV1().ConfigMaps("system").Get(t.Context(), "merged", metav1.GetOptions{})
 	if err != nil {
@@ -124,6 +123,45 @@ func TestReconcileNodeTearsDownUnmanagedNode(t *testing.T) {
 	}
 }
 
+func TestRejectedConfigPreservesBootSnapshot(t *testing.T) {
+	t.Parallel()
+	client := fake.NewClientset()
+	c := newTestController(t, client)
+	addNode(c, "node1")
+	bootstrap := bootstrapAdminCaddyfile("key")
+	if err := c.aggregator.InitializeMirror(t.Context(), bootstrap); err != nil {
+		t.Fatal(err)
+	}
+	c.aggregator.UpdateBase("bad config\n")
+	c.deployFn = func(context.Context, caddy.DeployOptions, string, []string) (*caddy.Instance, error) {
+		return &caddy.Instance{PodIP: "192.0.2.1", ContainerID: "container-1"}, nil
+	}
+	wantError := errors.New("Caddy rejected config")
+	c.pushFn = func(context.Context, *caddy.Instance, string) error { return wantError }
+	if err := c.reconcileConfig(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.reconcileNode(t.Context(), "node1"); !errors.Is(err, wantError) {
+		t.Fatalf("reconcile rejected config = %v", err)
+	}
+	mirror, err := client.CoreV1().ConfigMaps(c.config.Namespace).Get(t.Context(), "merged", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mirror.Data[constants.CaddyfileKey] != bootstrap {
+		t.Fatal("rejected config replaced boot snapshot")
+	}
+	c.aggregator.UpdateBase("accepted\n")
+	c.pushFn = func(context.Context, *caddy.Instance, string) error { return nil }
+	if err := c.reconcileNode(t.Context(), "node1"); err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := c.aggregator.CurrentAccepted()
+	if err != nil || accepted != "accepted\n" {
+		t.Fatalf("non-ready bootstrap pod did not receive config: accepted=%q, err=%v", accepted, err)
+	}
+}
+
 func TestRunWaitsForBaseAndPushesAllConfigFragments(t *testing.T) {
 	t.Parallel()
 	client := fake.NewClientset(
@@ -132,13 +170,13 @@ func TestRunWaitsForBaseAndPushesAllConfigFragments(t *testing.T) {
 	)
 	c, err := NewController(client, Config{
 		Namespace: "system", ConfigMapName: "base", ExternalEnable: true, ExternalLabel: "aggregate=true",
-		ExternalPublishAggregated: true, ExternalAggregatedConfigName: "merged",
+		ExternalAggregatedConfigName: "merged",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	c.deployFn = func(context.Context, caddy.DeployOptions, string, []string) (*caddy.Instance, error) {
-		return &caddy.Instance{PodReady: true, ContainerID: "container-1"}, nil
+		return &caddy.Instance{PodIP: "192.0.2.1", ContainerID: "container-1"}, nil
 	}
 	pushed := make(chan string, 1)
 	c.pushFn = func(_ context.Context, _ *caddy.Instance, config string) error {
@@ -154,7 +192,7 @@ func TestRunWaitsForBaseAndPushesAllConfigFragments(t *testing.T) {
 	go func() { done <- c.Run(ctx) }()
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
-	for c.queue.NumRequeues(configReconcileKey) == 0 {
+	for c.queue.NumRequeues("node1") == 0 {
 		select {
 		case err := <-done:
 			t.Fatalf("Run exited while the base ConfigMap was missing: %v", err)
@@ -256,5 +294,104 @@ func TestManagedResourceEventsEnqueueNode(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestMirrorRetryDoesNotReloadCaddy(t *testing.T) {
+	client := fake.NewClientset()
+	c := newTestController(t, client)
+	addNode(c, "node1")
+	if err := c.aggregator.InitializeMirror(t.Context(), "bootstrap"); err != nil {
+		t.Fatal(err)
+	}
+	c.aggregator.UpdateBase("accepted\n")
+	key, _ := c.queue.Get()
+	c.queue.Done(key)
+	c.deployFn = func(context.Context, caddy.DeployOptions, string, []string) (*caddy.Instance, error) {
+		return &caddy.Instance{PodIP: "192.0.2.1", ContainerID: "container-1"}, nil
+	}
+	pushes := 0
+	c.pushFn = func(context.Context, *caddy.Instance, string) error { pushes++; return nil }
+	writeError := apierrors.NewForbidden(corev1.Resource("configmaps"), "merged", errors.New("patch denied"))
+	shouldFail := true
+	client.PrependReactor("patch", "configmaps", func(clienttesting.Action) (bool, runtime.Object, error) {
+		if shouldFail {
+			return true, nil, writeError
+		}
+		return false, nil, nil
+	})
+	if err := c.reconcileConfig(t.Context()); !errors.Is(err, writeError) {
+		t.Fatalf("initial mirror write failure = %v", err)
+	}
+	if c.queue.Len() != 1 {
+		t.Fatal("mirror write failure blocked node reconciliation")
+	}
+	key, _ = c.queue.Get()
+	c.queue.Done(key)
+	if key != "node1" {
+		t.Fatalf("config change enqueued %q, want node1", key)
+	}
+	if err := c.reconcileNode(t.Context(), "node1"); !errors.Is(err, writeError) {
+		t.Fatalf("mirror write failure = %v", err)
+	}
+	retryError := c.reconcileNode(t.Context(), "node1")
+	if pushes != 1 {
+		t.Fatalf("mirror failure caused %d Caddy reloads, want 1", pushes)
+	}
+	if retryError != nil {
+		t.Fatal(retryError)
+	}
+	if c.queue.Len() != 1 {
+		t.Fatal("mirror write was not queued for retry")
+	}
+	shouldFail = false
+	c.processNextItem(t.Context())
+	mirror, err := client.CoreV1().ConfigMaps(c.config.Namespace).Get(t.Context(), "merged", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mirror.Data[constants.CaddyfileKey] != "accepted\n" {
+		t.Fatal("mirror retry did not persist the accepted config")
+	}
+	if c.queue.Len() != 1 {
+		t.Fatal("config retry did not enqueue the node")
+	}
+	c.processNextItem(t.Context())
+	if pushes != 1 {
+		t.Fatal("mirror recovery reloaded an unchanged Caddy config")
+	}
+}
+
+func TestReturningToLoadedConfigPublishesBootSnapshot(t *testing.T) {
+	client := fake.NewClientset()
+	c := newTestController(t, client)
+	addNode(c, "node1")
+	if err := c.aggregator.InitializeMirror(t.Context(), "bootstrap"); err != nil {
+		t.Fatal(err)
+	}
+	c.deployFn = func(context.Context, caddy.DeployOptions, string, []string) (*caddy.Instance, error) {
+		return &caddy.Instance{PodIP: "192.0.2.1", ContainerID: "container-1"}, nil
+	}
+	pushes := 0
+	c.pushFn = func(context.Context, *caddy.Instance, string) error {
+		pushes++
+		c.aggregator.UpdateBase("newer\n")
+		return nil
+	}
+	for range 2 {
+		c.aggregator.UpdateBase("accepted\n")
+		if err := c.reconcileNode(t.Context(), "node1"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mirror, err := client.CoreV1().ConfigMaps(c.config.Namespace).Get(t.Context(), "merged", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mirror.Data[constants.CaddyfileKey] != "accepted\n" {
+		t.Fatal("returning to an already loaded config did not update the boot snapshot")
+	}
+	if pushes != 1 {
+		t.Fatalf("already loaded config was reloaded %d times, want 1", pushes)
 	}
 }

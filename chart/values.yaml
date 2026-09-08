@@ -10,7 +10,7 @@ updateStrategy:
 image:
   repository: docker.horse
   image: vapronva/ckic/manager
-  tag: 0.36.2
+  tag: 0.36.3
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -93,7 +93,6 @@ config:
     label: ckic.cmld.ru/aggregate=true
     allowNamespaces: []
     denyNamespaces: []
-    publishAggregated: true
     aggregatedConfigName: ckic-caddy-config-working
 
 loadBalancer:

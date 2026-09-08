@@ -18,7 +18,7 @@ flowchart LR
         subgraph CaddyPkg["<b><code>pkg/caddy</code></b>"]
             direction TB
             Deployer["<b>Deployer</b><br/>SSA <code>Deployment</code> and <code>Service</code> + prepull on image change"]
-            Admin["<b>Admin client</b><br/>validate (<code>/adapt</code>) then push (<code>/load</code>)"]
+            Admin["<b>Admin client</b><br/>adapt (<code>/adapt</code>) then validate and load (<code>/load</code>)"]
         end
         Entry -->|"run <i>(leader only)</i>"| Reconciler
         Informers -->|"enqueue node and config keys"| Reconciler
@@ -31,13 +31,13 @@ flowchart LR
         direction TB
         K8s["<b>Kubernetes API</b>"]
         ConfigMaps[("<b>base</b> + <b>external</b><br/><code>ConfigMap</code>s")]
-        MirrorCM[("<b>merged mirror</b><br/><code>ConfigMap</code>")]
+        MirrorCM[("<b>accepted boot config</b><br/><code>ConfigMap</code>")]
         Instances["<b>Caddy instances</b><br/>one <code>Deployment</code> per labelled node"]
         LB["<b>LoadBalancer</b><br/><code>none</code> / <code>cilium</code> / <code>shared</code>"]
     end
     Informers <-->|"watch nodes and managed objects"| K8s
     ConfigMaps -->|"watched"| Informers
-    Aggregator -->|"publish (SSA)"| MirrorCM
+    Aggregator -->|"publish after successful load"| MirrorCM
     Deployer -->|"apply objects (SSA)"| K8s
     K8s -->|"schedules"| Instances
     MirrorCM -.->|"mounted at boot"| Instances

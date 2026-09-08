@@ -91,17 +91,20 @@ func (c *Controller) reconcileNode(ctx context.Context, nodeName string) error {
 		return err
 	}
 	digest := configDigest(merged)
-	if c.pushUpToDate(nodeName, digest, instance.ContainerID) {
-		return nil
+	if !c.pushUpToDate(nodeName, digest, instance.ContainerID) {
+		if instance.PodIP == "" || instance.ContainerID == "" {
+			c.queue.AddAfter(nodeName, podStartupRequeueInterval)
+			return nil
+		}
+		if err := c.pushFn(ctx, instance, merged); err != nil {
+			return err
+		}
+		c.recordPush(nodeName, digest, instance.ContainerID)
 	}
-	if !instance.PodReady {
-		c.queue.AddAfter(nodeName, podStartupRequeueInterval)
-		return nil
+	if err := c.aggregator.PublishAccepted(ctx, merged); err != nil {
+		c.queue.Add(configReconcileKey)
+		return err
 	}
-	if pushErr := c.pushFn(ctx, instance, merged); pushErr != nil {
-		return pushErr
-	}
-	c.recordPush(nodeName, digest, instance.ContainerID)
 	return nil
 }
 

@@ -97,7 +97,6 @@ spec:
             - {{ printf "--external-deny-namespaces=%s" (join "," .Values.config.external.denyNamespaces) | quote }}
             {{- end }}
             {{- end }}
-            - {{ printf "--external-publish-aggregated=%v" .Values.config.external.publishAggregated | quote }}
             - {{ printf "--external-aggregated-config-name=%v" .Values.config.external.aggregatedConfigName | quote }}
           {{- if .Values.probes.enabled }}
           ports:

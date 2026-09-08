@@ -25,7 +25,8 @@ const (
 	caddyBinary                    = "caddy"
 	caddyContainerName             = caddyBinary
 	fieldManager                   = "ckic"
-	adminProbePath                 = "/config/"
+	adminProbePath                 = "/config/admin/listen"
+	readinessProbePath             = "/config/apps/http/http_port"
 	probeTimeoutSeconds            = 3
 	startupProbePeriodSeconds      = 3
 	startupProbeFailureThreshold   = 30
@@ -115,7 +116,6 @@ func EnsureCaddy(ctx context.Context, opts DeployOptions, nodeName string, exter
 	}
 	instance.PodName = pod.Name
 	instance.PodIP = pod.Status.PodIP
-	instance.PodReady = isPodReady(pod)
 	instance.ContainerID = caddyContainerID(pod)
 	return instance, nil
 }
@@ -188,9 +188,9 @@ func caddyContainer(opts DeployOptions) *corev1ac.ContainerApplyConfiguration {
 			corev1ac.VolumeMount().WithName(constants.VolumeNameConfig).WithMountPath("/config"),
 		).
 		WithEnv(caddyEnvVars(opts)...).
-		WithStartupProbe(adminProbe(opts.CaddyAdminOriginKey, startupProbePeriodSeconds, startupProbeFailureThreshold)).
-		WithLivenessProbe(adminProbe(opts.CaddyAdminOriginKey, livenessProbePeriodSeconds, livenessProbeFailureThreshold)).
-		WithReadinessProbe(adminProbe(opts.CaddyAdminOriginKey, readinessProbePeriodSeconds, readinessProbeFailureThreshold)).
+		WithStartupProbe(adminProbe(opts.CaddyAdminOriginKey, adminProbePath, startupProbePeriodSeconds, startupProbeFailureThreshold)).
+		WithLivenessProbe(adminProbe(opts.CaddyAdminOriginKey, adminProbePath, livenessProbePeriodSeconds, livenessProbeFailureThreshold)).
+		WithReadinessProbe(adminProbe(opts.CaddyAdminOriginKey, readinessProbePath, readinessProbePeriodSeconds, readinessProbeFailureThreshold)).
 		WithSecurityContext(corev1ac.SecurityContext().
 			WithAllowPrivilegeEscalation(false).
 			WithRunAsNonRoot(false).
@@ -198,9 +198,9 @@ func caddyContainer(opts DeployOptions) *corev1ac.ContainerApplyConfiguration {
 			WithSeccompProfile(corev1ac.SeccompProfile().WithType(corev1.SeccompProfileTypeRuntimeDefault)))
 }
 
-func adminProbe(originKey string, periodSeconds, failureThreshold int32) *corev1ac.ProbeApplyConfiguration {
+func adminProbe(originKey, path string, periodSeconds, failureThreshold int32) *corev1ac.ProbeApplyConfiguration {
 	get := corev1ac.HTTPGetAction().
-		WithPath(adminProbePath).
+		WithPath(path).
 		WithPort(intstr.FromInt32(constants.CaddyAdminPort)).
 		WithScheme(corev1.URISchemeHTTP)
 	if originKey != "" {
@@ -316,15 +316,6 @@ func selectNewestActivePod(pods []corev1.Pod) (*corev1.Pod, bool) {
 		}
 	}
 	return selected, selected != nil
-}
-
-func isPodReady(pod *corev1.Pod) bool {
-	for _, cond := range pod.Status.Conditions {
-		if cond.Type == corev1.PodReady {
-			return cond.Status == corev1.ConditionTrue
-		}
-	}
-	return false
 }
 
 func caddyContainerID(pod *corev1.Pod) string {

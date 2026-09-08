@@ -41,7 +41,8 @@ func TestEnsureCaddyModeTransitions(t *testing.T) {
 	unrelated.Name = "unrelated-newer-pod"
 	unrelated.CreationTimestamp = metav1.NewTime(time.Now().Add(time.Hour))
 	delete(unrelated.Labels, constants.LabelCaddyManaged)
-	client := fake.NewClientset(runningCaddyPod(), unrelated,
+	client := fake.NewClientset(
+		runningCaddyPod(), unrelated,
 		&corev1.Service{Name: "caddy-node1", Namespace: testNS, Labels: managedLabels(testNode)},
 		&corev1.Service{Name: "caddy-node1-lb", Namespace: testNS, Labels: managedLabels(testNode)},
 		&corev1.Service{Name: "caddy-loadbalancer", Namespace: testNS},
@@ -64,8 +65,8 @@ func TestEnsureCaddyModeTransitions(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if instance.PodName != "caddy-node1-abc" || instance.PodIP != "192.0.2.1" || instance.ContainerID != "container-1" || !instance.PodReady {
-					t.Fatalf("pod was not resolved as ready: %+v", instance)
+				if instance.PodName != "caddy-node1-abc" || instance.PodIP != "192.0.2.1" || instance.ContainerID != "container-1" {
+					t.Fatalf("pod was not resolved: %+v", instance)
 				}
 			}
 			deployment, err := client.AppsV1().Deployments(testNS).Get(t.Context(), "caddy-node1", metav1.GetOptions{})
