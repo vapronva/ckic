@@ -53,7 +53,6 @@ spec:
           args:
             - {{ printf "--node-label=%s" .Values.config.nodeLabel | quote }}
             - {{ printf "--config-map=%s" .Values.config.configMapName | quote }}
-            - {{ printf "--bootstrap-default-config=%v" .Values.config.bootstrapDefaultConfig | quote }}
             - {{ printf "--config-resync-interval=%v" .Values.config.configResyncInterval | quote }}
             - {{ printf "--leader-elect=%v" .Values.leaderElection.enabled | quote }}
             - {{ printf "--leader-election-lease-name=%v" .Values.leaderElection.leaseName | quote }}

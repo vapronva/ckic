@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rs/zerolog"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -138,9 +137,6 @@ func TestRejectedConfigPreservesBootSnapshot(t *testing.T) {
 	}
 	wantError := errors.New("Caddy rejected config")
 	c.pushFn = func(context.Context, *caddy.Instance, string) error { return wantError }
-	if err := c.reconcileConfig(t.Context()); err != nil {
-		t.Fatal(err)
-	}
 	if err := c.reconcileNode(t.Context(), "node1"); !errors.Is(err, wantError) {
 		t.Fatalf("reconcile rejected config = %v", err)
 	}
@@ -227,34 +223,6 @@ func TestRunWaitsForBaseAndPushesAllConfigFragments(t *testing.T) {
 	}
 }
 
-func TestBootstrapPreservesConcurrentCreate(t *testing.T) {
-	t.Parallel()
-	client := fake.NewClientset()
-	c := newTestController(t, client)
-	c.config.BootstrapDefaultConfig = true
-	resource := corev1.SchemeGroupVersion.WithResource("configmaps")
-	client.PrependReactor("get", "configmaps", func(clienttesting.Action) (bool, runtime.Object, error) {
-		base := &corev1.ConfigMap{
-			Name: c.config.ConfigMapName, Namespace: c.config.Namespace,
-			Data: map[string]string{constants.CaddyfileKey: "existing"},
-		}
-		if err := client.Tracker().Create(resource, base, c.config.Namespace); err != nil {
-			return true, nil, err
-		}
-		return true, nil, apierrors.NewNotFound(corev1.Resource("configmaps"), base.Name)
-	})
-	if err := c.bootstrapBaseConfig(t.Context(), zerolog.Nop()); err != nil {
-		t.Fatal(err)
-	}
-	base, err := client.Tracker().Get(resource, c.config.Namespace, c.config.ConfigMapName)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if base.(*corev1.ConfigMap).Data[constants.CaddyfileKey] != "existing" {
-		t.Fatal("bootstrap overwrote a concurrently created ConfigMap")
-	}
-}
-
 func TestManagedResourceEventsEnqueueNode(t *testing.T) {
 	t.Parallel()
 	labels := map[string]string{constants.LabelApp: constants.LabelAppValue, constants.LabelCaddyManaged: constants.LabelManagedValue, constants.LabelInstance: "node1"}
@@ -298,6 +266,7 @@ func TestManagedResourceEventsEnqueueNode(t *testing.T) {
 }
 
 func TestMirrorRetryDoesNotReloadCaddy(t *testing.T) {
+	t.Parallel()
 	client := fake.NewClientset()
 	c := newTestController(t, client)
 	addNode(c, "node1")
@@ -305,8 +274,6 @@ func TestMirrorRetryDoesNotReloadCaddy(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.aggregator.UpdateBase("accepted\n")
-	key, _ := c.queue.Get()
-	c.queue.Done(key)
 	c.deployFn = func(context.Context, caddy.DeployOptions, string, []string) (*caddy.Instance, error) {
 		return &caddy.Instance{PodIP: "192.0.2.1", ContainerID: "container-1"}, nil
 	}
@@ -320,32 +287,18 @@ func TestMirrorRetryDoesNotReloadCaddy(t *testing.T) {
 		}
 		return false, nil, nil
 	})
-	if err := c.reconcileConfig(t.Context()); !errors.Is(err, writeError) {
-		t.Fatalf("initial mirror write failure = %v", err)
+	for range 2 {
+		if err := c.reconcileNode(t.Context(), "node1"); !errors.Is(err, writeError) {
+			t.Fatalf("mirror write failure = %v", err)
+		}
 	}
-	if c.queue.Len() != 1 {
-		t.Fatal("mirror write failure blocked node reconciliation")
-	}
-	key, _ = c.queue.Get()
-	c.queue.Done(key)
-	if key != "node1" {
-		t.Fatalf("config change enqueued %q, want node1", key)
-	}
-	if err := c.reconcileNode(t.Context(), "node1"); !errors.Is(err, writeError) {
-		t.Fatalf("mirror write failure = %v", err)
-	}
-	retryError := c.reconcileNode(t.Context(), "node1")
 	if pushes != 1 {
 		t.Fatalf("mirror failure caused %d Caddy reloads, want 1", pushes)
 	}
-	if retryError != nil {
-		t.Fatal(retryError)
-	}
-	if c.queue.Len() != 1 {
-		t.Fatal("mirror write was not queued for retry")
-	}
 	shouldFail = false
-	c.processNextItem(t.Context())
+	if err := c.reconcileNode(t.Context(), "node1"); err != nil {
+		t.Fatal(err)
+	}
 	mirror, err := client.CoreV1().ConfigMaps(c.config.Namespace).Get(t.Context(), "merged", metav1.GetOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -353,16 +306,13 @@ func TestMirrorRetryDoesNotReloadCaddy(t *testing.T) {
 	if mirror.Data[constants.CaddyfileKey] != "accepted\n" {
 		t.Fatal("mirror retry did not persist the accepted config")
 	}
-	if c.queue.Len() != 1 {
-		t.Fatal("config retry did not enqueue the node")
-	}
-	c.processNextItem(t.Context())
 	if pushes != 1 {
 		t.Fatal("mirror recovery reloaded an unchanged Caddy config")
 	}
 }
 
-func TestReturningToLoadedConfigPublishesBootSnapshot(t *testing.T) {
+func TestLoadedConfigIsMirroredDespiteDrift(t *testing.T) {
+	t.Parallel()
 	client := fake.NewClientset()
 	c := newTestController(t, client)
 	addNode(c, "node1")
@@ -372,26 +322,33 @@ func TestReturningToLoadedConfigPublishesBootSnapshot(t *testing.T) {
 	c.deployFn = func(context.Context, caddy.DeployOptions, string, []string) (*caddy.Instance, error) {
 		return &caddy.Instance{PodIP: "192.0.2.1", ContainerID: "container-1"}, nil
 	}
-	pushes := 0
-	c.pushFn = func(context.Context, *caddy.Instance, string) error {
-		pushes++
-		c.aggregator.UpdateBase("newer\n")
+	rejected := errors.New("Caddy rejected config")
+	c.pushFn = func(_ context.Context, _ *caddy.Instance, merged string) error {
+		if merged != "loaded\n" {
+			return rejected
+		}
+		c.aggregator.UpdateBase("broken\n")
 		return nil
 	}
-	for range 2 {
-		c.aggregator.UpdateBase("accepted\n")
-		if err := c.reconcileNode(t.Context(), "node1"); err != nil {
+	mirror := func() string {
+		t.Helper()
+		cm, err := client.CoreV1().ConfigMaps(c.config.Namespace).Get(t.Context(), "merged", metav1.GetOptions{})
+		if err != nil {
 			t.Fatal(err)
 		}
+		return cm.Data[constants.CaddyfileKey]
 	}
-	mirror, err := client.CoreV1().ConfigMaps(c.config.Namespace).Get(t.Context(), "merged", metav1.GetOptions{})
-	if err != nil {
+	c.aggregator.UpdateBase("loaded\n")
+	if err := c.reconcileNode(t.Context(), "node1"); err != nil {
 		t.Fatal(err)
 	}
-	if mirror.Data[constants.CaddyfileKey] != "accepted\n" {
-		t.Fatal("returning to an already loaded config did not update the boot snapshot")
+	if got := mirror(); got != "loaded\n" {
+		t.Fatalf("boot snapshot = %q, want the config Caddy loaded", got)
 	}
-	if pushes != 1 {
-		t.Fatalf("already loaded config was reloaded %d times, want 1", pushes)
+	if err := c.reconcileNode(t.Context(), "node1"); !errors.Is(err, rejected) {
+		t.Fatalf("reconcile of rejected config = %v", err)
+	}
+	if got := mirror(); got != "loaded\n" {
+		t.Fatalf("boot snapshot = %q after a rejected push", got)
 	}
 }

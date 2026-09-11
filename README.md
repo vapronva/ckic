@@ -21,7 +21,7 @@ flowchart LR
             Admin["<b>Admin client</b><br/>adapt (<code>/adapt</code>) then validate and load (<code>/load</code>)"]
         end
         Entry -->|"run <i>(leader only)</i>"| Reconciler
-        Informers -->|"enqueue node and config keys"| Reconciler
+        Informers -->|"enqueue node and mirror-repair keys"| Reconciler
         Informers -->|"base and external fragments"| Aggregator
         Aggregator -->|"merged <code>Caddyfile</code>"| Reconciler
         Reconciler -->|"per managed node"| Deployer

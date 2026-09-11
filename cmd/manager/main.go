@@ -105,7 +105,6 @@ func parseFlags() options {
 	pflag.StringVar(&cfg.NodeLabel, "node-label", "ckic.cmld.ru/enabled=true", "Kubernetes label selector used to choose managed nodes (empty for all nodes)")
 	pflag.StringVar(&cfg.ConfigMapName, "config-map", "caddy-config", "ConfigMap containing Caddy configuration")
 	pflag.StringVar(&cfg.Namespace, "namespace", "", "Namespace for managed Caddy resources, ConfigMaps and leases (defaults to CKIC_NAMESPACE or the in-cluster service account namespace)")
-	pflag.BoolVar(&cfg.BootstrapDefaultConfig, "bootstrap-default-config", false, "Create a default ConfigMap on startup only when it is missing")
 	pflag.DurationVar(&cfg.ConfigResyncInterval, "config-resync-interval", 0, "Periodically re-push the merged Caddyfile to all instances even when unchanged (0 disables; e.g. 5m)")
 	pflag.StringVar(&opts.healthBindAddress, "health-bind-address", ":8081", "Address where health and readiness probes are served (set empty to disable)")
 	pflag.StringVar(&opts.logLevel, "log-level", "info", "Log level (trace, debug, info, warn, error, fatal, panic, disabled)")
@@ -142,9 +141,6 @@ func (o options) resolveControllerConfig() (controller.Config, error) {
 		cfg.Deploy.EnableCiliumLB = true
 	default:
 		return cfg, fmt.Errorf("invalid loadbalancer mode %q (want none or cilium)", o.loadBalancerMode)
-	}
-	if cfg.Deploy.UseHostNetwork && cfg.Deploy.EnableCiliumLB {
-		return cfg, errors.New("cannot combine --use-host-network with the cilium loadbalancer")
 	}
 	switch policy := corev1.PullPolicy(o.imagePullPolicy); policy {
 	case corev1.PullAlways, corev1.PullIfNotPresent, corev1.PullNever:

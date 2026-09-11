@@ -7,11 +7,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/informers"
@@ -32,7 +30,6 @@ type Config struct {
 	NodeLabel                    string
 	ConfigMapName                string
 	Namespace                    string
-	BootstrapDefaultConfig       bool
 	ConfigResyncInterval         time.Duration
 	ExternalEndpoints            utils.ExternalEndpointsMap
 	ExternalEnable               bool
@@ -43,7 +40,7 @@ type Config struct {
 }
 
 const (
-	configReconcileKey        = "\x00config-reconcile"
+	mirrorRepairKey           = "\x00mirror-repair"
 	workerCount               = 4
 	reconcileTimeout          = 5 * time.Minute
 	informerResync            = 10 * time.Minute
@@ -78,37 +75,9 @@ type Controller struct {
 }
 
 func NewController(clientset kubernetes.Interface, config Config) (*Controller, error) {
-	normalized, selector, err := utils.NormalizeNodeLabelSelector(config.NodeLabel)
+	config, selector, err := validateConfig(config)
 	if err != nil {
 		return nil, err
-	}
-	config.NodeLabel = normalized
-	if config.ConfigResyncInterval < 0 {
-		return nil, errors.New("config resync interval cannot be negative")
-	}
-	envKeys := map[string]bool{
-		constants.PodNameEnvVar:  true,
-		constants.NodeNameEnvVar: true,
-		constants.PodIPEnvVar:    true,
-	}
-	for _, key := range config.Deploy.EnvSecretKeys {
-		if envKeys[key] {
-			return nil, fmt.Errorf("duplicate or reserved environment key %q", key)
-		}
-		envKeys[key] = true
-	}
-	if config.ExternalEnable {
-		externalLabel, _, labelErr := utils.NormalizeNodeLabelSelector(config.ExternalLabel)
-		if labelErr != nil {
-			return nil, fmt.Errorf("invalid external label selector: %w", labelErr)
-		}
-		config.ExternalLabel = externalLabel
-	}
-	if config.ExternalAggregatedConfigName == "" {
-		return nil, errors.New("external aggregated config name must be set for accepted boot snapshots")
-	}
-	if config.ExternalAggregatedConfigName == config.ConfigMapName {
-		return nil, errors.New("external aggregated config name must differ from the base config-map name")
 	}
 	deployOpts := config.Deploy
 	deployOpts.Clientset = clientset
@@ -129,17 +98,53 @@ func NewController(clientset kubernetes.Interface, config Config) (*Controller, 
 		return instance.UpdateConfig(ctx, merged, c.adminConfig)
 	}
 	c.queue = workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]())
-	c.aggregator = aggregator.New(
-		clientset,
-		config.Namespace,
-		config.ExternalAggregatedConfigName,
-		func() { c.queue.Add(configReconcileKey) },
-	)
+	c.aggregator = aggregator.New(clientset, config.Namespace, config.ExternalAggregatedConfigName, c.enqueueManagedNodes)
 	if err := c.setupInformers(); err != nil {
 		c.queue.ShutDown()
 		return nil, err
 	}
 	return c, nil
+}
+
+func validateConfig(config Config) (Config, labels.Selector, error) {
+	selector, err := labels.Parse(config.NodeLabel)
+	if err != nil {
+		return config, nil, fmt.Errorf("invalid node label selector %q: %w", config.NodeLabel, err)
+	}
+	if config.ConfigResyncInterval < 0 {
+		return config, nil, errors.New("config resync interval cannot be negative")
+	}
+	envKeys := map[string]bool{
+		constants.PodNameEnvVar:  true,
+		constants.NodeNameEnvVar: true,
+		constants.PodIPEnvVar:    true,
+	}
+	for _, key := range config.Deploy.EnvSecretKeys {
+		if envKeys[key] {
+			return config, nil, fmt.Errorf("duplicate or reserved environment key %q", key)
+		}
+		envKeys[key] = true
+	}
+	if config.ExternalEnable {
+		externalSelector, err := labels.Parse(config.ExternalLabel)
+		if err != nil {
+			return config, nil, fmt.Errorf("invalid external label selector %q: %w", config.ExternalLabel, err)
+		}
+		if externalSelector.Empty() {
+			return config, nil, errors.New("external label selector must not be empty")
+		}
+		config.ExternalLabel = externalSelector.String()
+	}
+	if config.Deploy.UseHostNetwork && config.Deploy.EnableCiliumLB {
+		return config, nil, errors.New("cannot combine host networking with the cilium loadbalancer")
+	}
+	if config.ExternalAggregatedConfigName == "" {
+		return config, nil, errors.New("external aggregated config name must be set for accepted boot snapshots")
+	}
+	if config.ExternalAggregatedConfigName == config.ConfigMapName {
+		return config, nil, errors.New("external aggregated config name must differ from the base config-map name")
+	}
+	return config, selector, nil
 }
 
 func namespaceSet(namespaces []string) map[string]struct{} {
@@ -253,7 +258,7 @@ func (c *Controller) addConfigMapHandler(informer cache.SharedIndexInformer) err
 				log.Warn().Str("configmap", cm.Name).Msg("Base ConfigMap deleted; keeping last known configuration")
 			}
 			if cm.Name == c.config.ExternalAggregatedConfigName {
-				c.queue.Add(configReconcileKey)
+				c.queue.Add(mirrorRepairKey)
 			}
 		},
 	})
@@ -266,18 +271,8 @@ func (c *Controller) addConfigMapHandler(informer cache.SharedIndexInformer) err
 
 func (c *Controller) enqueueChangedMirror(cm *corev1.ConfigMap) {
 	accepted, err := c.aggregator.CurrentAccepted()
-	if err != nil {
-		return
-	}
-	if cm.Data[constants.CaddyfileKey] != accepted {
-		c.queue.Add(configReconcileKey)
-		return
-	}
-	for key, value := range constants.AggregatedConfigLabels() {
-		if cm.Labels[key] != value {
-			c.queue.Add(configReconcileKey)
-			return
-		}
+	if err == nil && cm.Data[constants.CaddyfileKey] != accepted {
+		c.queue.Add(mirrorRepairKey)
 	}
 }
 
@@ -386,7 +381,7 @@ func (c *Controller) Run(ctx context.Context) error {
 	defer cancel()
 	defer c.queue.ShutDown()
 	logger := log.With().Str("component", "controller").Logger()
-	if err := c.bootstrapBaseConfig(ctx, logger); err != nil {
+	if err := c.aggregator.InitializeMirror(ctx, bootstrapAdminCaddyfile(c.config.Deploy.CaddyAdminOriginKey)); err != nil {
 		return err
 	}
 	stopCh := ctx.Done()
@@ -400,12 +395,7 @@ func (c *Controller) Run(ctx context.Context) error {
 		return fmt.Errorf("shutting down before informer caches synced: %w", ctx.Err())
 	}
 	logger.Info().Msg("Caches synced; starting reconcile workers")
-	if err := c.aggregator.InitializeMirror(ctx, bootstrapAdminCaddyfile(c.config.Deploy.CaddyAdminOriginKey)); err != nil {
-		return err
-	}
-	c.enqueueExistingDeployments(logger)
 	caddy.ReapPrePullPods(ctx, c.clientset, c.config.Namespace, logger)
-	c.queue.Add(configReconcileKey)
 	var wg sync.WaitGroup
 	for range workerCount {
 		wg.Go(func() {
@@ -438,51 +428,15 @@ func (c *Controller) runConfigResync(stopCh <-chan struct{}) {
 	}
 }
 
-func (c *Controller) enqueueExistingDeployments(logger zerolog.Logger) {
-	deployments, err := c.deployLister.Deployments(c.config.Namespace).List(labels.Everything())
+func (c *Controller) enqueueManagedNodes() {
+	nodes, err := c.nodeLister.List(c.nodeSelector)
 	if err != nil {
-		logger.Warn().Err(err).Msg("Failed to list managed deployments for adoption")
+		log.Warn().Err(err).Msg("Failed to list managed nodes")
 		return
 	}
-	for _, dep := range deployments {
-		c.enqueueManagedObject(dep)
+	for _, node := range nodes {
+		c.queue.Add(node.Name)
 	}
-}
-
-func (c *Controller) bootstrapBaseConfig(ctx context.Context, logger zerolog.Logger) error {
-	configMaps := c.clientset.CoreV1().ConfigMaps(c.config.Namespace)
-	_, err := configMaps.Get(ctx, c.config.ConfigMapName, metav1.GetOptions{})
-	if err == nil {
-		return nil
-	}
-	if !apierrors.IsNotFound(err) {
-		return fmt.Errorf("failed to read base ConfigMap: %w", err)
-	}
-	if !c.config.BootstrapDefaultConfig {
-		logger.Warn().
-			Str("configmap", c.config.ConfigMapName).
-			Msg("Base ConfigMap not found and bootstrap disabled; waiting for it to be created")
-		return nil
-	}
-	base := &corev1.ConfigMap{
-		Name: c.config.ConfigMapName, Namespace: c.config.Namespace,
-		Data: map[string]string{
-			constants.CaddyfileKey: defaultBootstrapCaddyfile(c.config.Deploy.CaddyAdminOriginKey),
-		},
-	}
-	_, err = configMaps.Create(ctx, base, metav1.CreateOptions{})
-	if apierrors.IsAlreadyExists(err) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("failed to bootstrap default ConfigMap: %w", err)
-	}
-	logger.Info().Msg("Bootstrapped default base ConfigMap")
-	return nil
-}
-
-func defaultBootstrapCaddyfile(originKey string) string {
-	return bootstrapAdminCaddyfile(originKey) + "\n:80 {\n\trespond \"Hello, world!\"\n}\n"
 }
 
 func bootstrapAdminCaddyfile(originKey string) string {

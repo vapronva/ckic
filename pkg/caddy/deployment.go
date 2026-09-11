@@ -121,7 +121,7 @@ func EnsureCaddy(ctx context.Context, opts DeployOptions, nodeName string, exter
 }
 
 func applyLoadBalancerService(ctx context.Context, opts DeployOptions, instance *Instance, logger zerolog.Logger) error {
-	if !opts.EnableCiliumLB || opts.UseHostNetwork {
+	if !opts.EnableCiliumLB {
 		return instance.deleteServicesExcept(ctx, "", logger)
 	}
 	serviceName := instance.LoadBalancerServiceName()

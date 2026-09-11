@@ -24,18 +24,25 @@ const (
 	mirrorFieldManager   = "ckic-aggregator"
 )
 
+type Snapshot struct {
+	Caddyfile string
+	Revision  uint64
+}
+
 type Aggregator struct {
-	mu          sync.RWMutex
-	publishMu   sync.Mutex
-	base        string
-	hasBase     bool
-	accepted    string
-	hasAccepted bool
-	externals   map[string]string
-	clientset   kubernetes.Interface
-	namespace   string
-	mirrorName  string
-	enqueue     func()
+	mu               sync.RWMutex
+	publishMu        sync.Mutex
+	base             string
+	hasBase          bool
+	revision         uint64
+	accepted         string
+	hasAccepted      bool
+	acceptedRevision uint64
+	externals        map[string]string
+	clientset        kubernetes.Interface
+	namespace        string
+	mirrorName       string
+	enqueue          func()
 }
 
 func New(
@@ -53,42 +60,48 @@ func New(
 	}
 }
 
-func (a *Aggregator) notifyIfChanged(changed bool) {
+func (a *Aggregator) update(mutate func() bool) {
+	a.mu.Lock()
+	changed := mutate()
+	if changed {
+		a.revision++
+	}
+	a.mu.Unlock()
 	if changed && a.enqueue != nil {
 		a.enqueue()
 	}
 }
 
 func (a *Aggregator) UpdateBase(base string) {
-	a.mu.Lock()
-	changed := !a.hasBase || a.base != base
-	a.base = base
-	a.hasBase = true
-	a.mu.Unlock()
-	a.notifyIfChanged(changed)
+	a.update(func() bool {
+		changed := !a.hasBase || a.base != base
+		a.base = base
+		a.hasBase = true
+		return changed
+	})
 }
 
 func (a *Aggregator) SetExternal(source, fragment string) {
-	a.mu.Lock()
-	changed := a.externals[source] != fragment
-	a.externals[source] = fragment
-	a.mu.Unlock()
-	a.notifyIfChanged(changed)
+	a.update(func() bool {
+		changed := a.externals[source] != fragment
+		a.externals[source] = fragment
+		return changed
+	})
 }
 
 func (a *Aggregator) RemoveExternal(source string) {
-	a.mu.Lock()
-	_, changed := a.externals[source]
-	delete(a.externals, source)
-	a.mu.Unlock()
-	a.notifyIfChanged(changed)
+	a.update(func() bool {
+		_, changed := a.externals[source]
+		delete(a.externals, source)
+		return changed
+	})
 }
 
-func (a *Aggregator) CurrentMerged() (string, error) {
+func (a *Aggregator) CurrentMerged() (Snapshot, error) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	if !a.hasBase {
-		return "", errors.New("base ConfigMap has not supplied a Caddyfile")
+		return Snapshot{}, errors.New("base ConfigMap has not supplied a Caddyfile")
 	}
 	var sb strings.Builder
 	sb.WriteString(a.base)
@@ -106,9 +119,9 @@ func (a *Aggregator) CurrentMerged() (string, error) {
 	}
 	merged := sb.String()
 	if len(merged) > corev1.MaxSecretSize {
-		return "", fmt.Errorf("merged Caddyfile is %d bytes, exceeding the ConfigMap limit of %d", len(merged), corev1.MaxSecretSize)
+		return Snapshot{}, fmt.Errorf("merged Caddyfile is %d bytes, exceeding the ConfigMap limit of %d", len(merged), corev1.MaxSecretSize)
 	}
-	return merged, nil
+	return Snapshot{Caddyfile: merged, Revision: a.revision}, nil
 }
 
 func (a *Aggregator) InitializeMirror(ctx context.Context, bootstrap string) error {
@@ -152,24 +165,24 @@ func (a *Aggregator) CurrentAccepted() (string, error) {
 	return a.accepted, nil
 }
 
-func (a *Aggregator) PublishAccepted(ctx context.Context, accepted string) error {
+func (a *Aggregator) PublishAccepted(ctx context.Context, snapshot Snapshot) error {
 	a.publishMu.Lock()
 	defer a.publishMu.Unlock()
-	if current, err := a.CurrentAccepted(); err == nil && current == accepted {
+	a.mu.RLock()
+	isSuperseded := snapshot.Revision <= a.acceptedRevision
+	a.mu.RUnlock()
+	if isSuperseded {
 		return nil
 	}
-	merged, err := a.CurrentMerged()
-	if err != nil {
+	if err := a.publishMirror(ctx, snapshot.Caddyfile); err != nil {
 		return err
 	}
-	if merged != accepted {
-		return nil
-	}
 	a.mu.Lock()
-	a.accepted = accepted
+	a.accepted = snapshot.Caddyfile
 	a.hasAccepted = true
+	a.acceptedRevision = snapshot.Revision
 	a.mu.Unlock()
-	return a.publishMirror(ctx, accepted)
+	return nil
 }
 
 func (a *Aggregator) PublishMirror(ctx context.Context) error {

@@ -11,6 +11,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
 
+	"git.horse/vapronva/ckic/pkg/aggregator"
 	"git.horse/vapronva/ckic/pkg/caddy"
 )
 
@@ -42,30 +43,19 @@ func logReconcileError(key string, err error, requeues int) {
 }
 
 func reconcileKeyLabel(key string) string {
-	if key == configReconcileKey {
-		return "config"
+	if key == mirrorRepairKey {
+		return "mirror"
 	}
 	return key
 }
 
 func (c *Controller) reconcile(ctx context.Context, key string) error {
-	reconcileCtx, cancel := context.WithTimeout(ctx, reconcileTimeout)
+	ctx, cancel := context.WithTimeout(ctx, reconcileTimeout)
 	defer cancel()
-	if key == configReconcileKey {
-		return c.reconcileConfig(reconcileCtx)
+	if key == mirrorRepairKey {
+		return c.aggregator.PublishMirror(ctx)
 	}
-	return c.reconcileNode(reconcileCtx, key)
-}
-
-func (c *Controller) reconcileConfig(ctx context.Context) error {
-	nodes, err := c.nodeLister.List(c.nodeSelector)
-	if err != nil {
-		return err
-	}
-	for _, node := range nodes {
-		c.queue.Add(node.Name)
-	}
-	return c.aggregator.PublishMirror(ctx)
+	return c.reconcileNode(ctx, key)
 }
 
 func (c *Controller) reconcileNode(ctx context.Context, nodeName string) error {
@@ -73,11 +63,11 @@ func (c *Controller) reconcileNode(ctx context.Context, nodeName string) error {
 	if err != nil && !apierrors.IsNotFound(err) {
 		return err
 	}
-	managed := err == nil && c.nodeSelector.Matches(labels.Set(node.Labels))
-	if !managed {
+	isManaged := err == nil && c.nodeSelector.Matches(labels.Set(node.Labels))
+	if !isManaged {
 		return c.teardownNode(ctx, nodeName)
 	}
-	merged, err := c.aggregator.CurrentMerged()
+	snapshot, err := c.aggregator.CurrentMerged()
 	if err != nil {
 		return err
 	}
@@ -90,22 +80,32 @@ func (c *Controller) reconcileNode(ctx context.Context, nodeName string) error {
 	if err != nil {
 		return err
 	}
-	digest := configDigest(merged)
-	if !c.pushUpToDate(nodeName, digest, instance.ContainerID) {
-		if instance.PodIP == "" || instance.ContainerID == "" {
-			c.queue.AddAfter(nodeName, podStartupRequeueInterval)
-			return nil
-		}
-		if err := c.pushFn(ctx, instance, merged); err != nil {
-			return err
-		}
-		c.recordPush(nodeName, digest, instance.ContainerID)
-	}
-	if err := c.aggregator.PublishAccepted(ctx, merged); err != nil {
-		c.queue.Add(configReconcileKey)
+	isLoaded, err := c.ensureLoaded(ctx, nodeName, instance, snapshot)
+	if err != nil || !isLoaded {
 		return err
 	}
-	return nil
+	return c.aggregator.PublishAccepted(ctx, snapshot)
+}
+
+func (c *Controller) ensureLoaded(
+	ctx context.Context,
+	nodeName string,
+	instance *caddy.Instance,
+	snapshot aggregator.Snapshot,
+) (bool, error) {
+	digest := configDigest(snapshot.Caddyfile)
+	if c.pushUpToDate(nodeName, digest, instance.ContainerID) {
+		return true, nil
+	}
+	if instance.PodIP == "" || instance.ContainerID == "" {
+		c.queue.AddAfter(nodeName, podStartupRequeueInterval)
+		return false, nil
+	}
+	if err := c.pushFn(ctx, instance, snapshot.Caddyfile); err != nil {
+		return false, err
+	}
+	c.recordPush(nodeName, digest, instance.ContainerID)
+	return true, nil
 }
 
 func (c *Controller) deployOptionsForNode(nodeName string) caddy.DeployOptions {
@@ -164,7 +164,7 @@ func (c *Controller) forceConfigResync() {
 	c.pushMu.Lock()
 	clear(c.pushState)
 	c.pushMu.Unlock()
-	c.queue.Add(configReconcileKey)
+	c.enqueueManagedNodes()
 }
 
 func configDigest(configData string) string {

@@ -55,7 +55,7 @@ func TestEnsureCaddyModeTransitions(t *testing.T) {
 	}{
 		{"cilium", true, false, 1},
 		{"none", false, false, 0},
-		{"hostnetwork", true, true, 0},
+		{"hostnetwork", false, true, 0},
 	} {
 		t.Run(mode.name, func(t *testing.T) {
 			opts.EnableCiliumLB = mode.cilium

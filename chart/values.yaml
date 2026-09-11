@@ -10,7 +10,7 @@ updateStrategy:
 image:
   repository: docker.horse
   image: vapronva/ckic/manager
-  tag: 0.36.4
+  tag: 0.36.5
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -75,7 +75,6 @@ probes:
 config:
   nodeLabel: ckic.cmld.ru/enabled=true
   configMapName: caddy-config
-  bootstrapDefaultConfig: false
   configResyncInterval: 0s
   logLevel: info
   caddyImage: docker.horse/oss-images/zerossl-caddy/caddy:2.11.4-alpine

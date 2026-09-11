@@ -23,10 +23,11 @@ func TestCurrentMergedSortsExternalsAfterBase(t *testing.T) {
 	agg.SetExternal("team-b/cm", "b.example.com {\n  respond \"b\"\n}")
 	agg.SetExternal("team-a/cm", "a.example.com {\n  respond \"a\"\n}")
 	agg.SetExternal("team-c/cm", "   ")
-	merged, err := agg.CurrentMerged()
+	snapshot, err := agg.CurrentMerged()
 	if err != nil {
 		t.Fatal(err)
 	}
+	merged := snapshot.Caddyfile
 	if !strings.HasPrefix(merged, ":80 {\n  respond \"base\"\n}\n") {
 		t.Fatalf("base not followed by newline:\n%s", merged)
 	}
@@ -58,28 +59,39 @@ func TestBootMirrorKeepsAcceptedSnapshot(t *testing.T) {
 			t.Fatalf("boot snapshot = %q, want %q", got, want)
 		}
 	}
+	updateBase := func(base string) aggregator.Snapshot {
+		t.Helper()
+		agg.UpdateBase(base)
+		snapshot, err := agg.CurrentMerged()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return snapshot
+	}
 	checkMirror(bootstrap)
-	agg.UpdateBase("candidate\n")
+	candidate := updateBase("candidate\n")
 	if err := agg.PublishMirror(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	checkMirror(bootstrap)
-	if err := agg.PublishAccepted(t.Context(), "candidate\n"); err != nil {
+	if err := agg.PublishAccepted(t.Context(), candidate); err != nil {
 		t.Fatal(err)
 	}
 	checkMirror("candidate\n")
 	actions := len(client.Actions())
-	if err := agg.PublishAccepted(t.Context(), "candidate\n"); err != nil {
+	if err := agg.PublishAccepted(t.Context(), candidate); err != nil {
 		t.Fatal(err)
 	}
 	if len(client.Actions()) != actions {
 		t.Fatal("unchanged accepted snapshot was republished")
 	}
-	agg.UpdateBase("newer\n")
-	if err := agg.PublishAccepted(t.Context(), "newer\n"); err != nil {
+	newer := updateBase("newer\n")
+	updateBase("rejected-by-caddy\n")
+	if err := agg.PublishAccepted(t.Context(), newer); err != nil {
 		t.Fatal(err)
 	}
-	if err := agg.PublishAccepted(t.Context(), "candidate\n"); err != nil {
+	checkMirror("newer\n")
+	if err := agg.PublishAccepted(t.Context(), candidate); err != nil {
 		t.Fatal(err)
 	}
 	checkMirror("newer\n")
