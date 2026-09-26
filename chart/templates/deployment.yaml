@@ -54,6 +54,7 @@ spec:
             - {{ printf "--node-label=%s" .Values.config.nodeLabel | quote }}
             - {{ printf "--config-map=%s" .Values.config.configMapName | quote }}
             - {{ printf "--config-resync-interval=%v" .Values.config.configResyncInterval | quote }}
+            - {{ printf "--force-reload=%v" .Values.config.forceReload | quote }}
             - {{ printf "--leader-elect=%v" .Values.leaderElection.enabled | quote }}
             - {{ printf "--leader-election-lease-name=%v" .Values.leaderElection.leaseName | quote }}
             - {{ printf "--leader-election-lease-duration=%v" .Values.leaderElection.leaseDuration | quote }}

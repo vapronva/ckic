@@ -18,16 +18,18 @@ import (
 )
 
 type AdminAPIConfig struct {
-	OriginKey string
-	Client    *http.Client
+	OriginKey   string
+	ForceReload bool
+	Client      *http.Client
 }
 
-func NewAdminAPIConfig(originKey string) *AdminAPIConfig {
+func NewAdminAPIConfig(originKey string, forceReload bool) *AdminAPIConfig {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
 	return &AdminAPIConfig{
-		OriginKey: originKey,
-		Client:    &http.Client{Timeout: 30 * time.Second, Transport: transport},
+		OriginKey:   originKey,
+		ForceReload: forceReload,
+		Client:      &http.Client{Timeout: 30 * time.Second, Transport: transport},
 	}
 }
 
@@ -71,7 +73,7 @@ func (i *Instance) postConfig(
 		return nil, err
 	}
 	req.Header.Set("Content-Type", contentType)
-	if req.URL.Path == "/load" {
+	if req.URL.Path == "/load" && apiConfig.ForceReload {
 		req.Header.Set("Cache-Control", "must-revalidate")
 	}
 	if apiConfig.OriginKey != "" {

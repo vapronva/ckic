@@ -31,6 +31,7 @@ type Config struct {
 	ConfigMapName                string
 	Namespace                    string
 	ConfigResyncInterval         time.Duration
+	ForceReload                  bool
 	ExternalEndpoints            utils.ExternalEndpointsMap
 	ExternalEnable               bool
 	ExternalLabel                string
@@ -87,7 +88,7 @@ func NewController(clientset kubernetes.Interface, config Config) (*Controller, 
 		clientset:         clientset,
 		config:            config,
 		deployOpts:        deployOpts,
-		adminConfig:       caddy.NewAdminAPIConfig(config.Deploy.CaddyAdminOriginKey),
+		adminConfig:       caddy.NewAdminAPIConfig(config.Deploy.CaddyAdminOriginKey, config.ForceReload),
 		nodeSelector:      selector,
 		allowedNamespaces: namespaceSet(config.ExternalAllowNamespaces),
 		deniedNamespaces:  namespaceSet(config.ExternalDenyNamespaces),

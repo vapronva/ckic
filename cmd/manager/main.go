@@ -106,6 +106,7 @@ func parseFlags() options {
 	pflag.StringVar(&cfg.ConfigMapName, "config-map", "caddy-config", "ConfigMap containing Caddy configuration")
 	pflag.StringVar(&cfg.Namespace, "namespace", "", "Namespace for managed Caddy resources, ConfigMaps and leases (defaults to CKIC_NAMESPACE or the in-cluster service account namespace)")
 	pflag.DurationVar(&cfg.ConfigResyncInterval, "config-resync-interval", 0, "Periodically re-push the merged Caddyfile to all instances even when unchanged (0 disables; e.g. 5m)")
+	pflag.BoolVar(&cfg.ForceReload, "force-reload", false, "force Caddy to reload on every push even when the config is unchanged")
 	pflag.StringVar(&opts.healthBindAddress, "health-bind-address", ":8081", "Address where health and readiness probes are served (set empty to disable)")
 	pflag.StringVar(&opts.logLevel, "log-level", "info", "Log level (trace, debug, info, warn, error, fatal, panic, disabled)")
 	pflag.StringVar(&deploy.CaddyImage, "caddy-image", "docker.horse/oss-images/zerossl-caddy/caddy:2.11.4-alpine", "Caddy image (format image:tag)")
@@ -168,7 +169,9 @@ func setupLogger(level string) error {
 	zerolog.SetGlobalLevel(parsedLevel)
 	var output io.Writer = os.Stdout
 	if os.Getenv("LOG_FORMAT") != "json" {
-		output = zerolog.SyncWriter(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339})
+		stat, err := os.Stdout.Stat()
+		isTerminal := err == nil && stat.Mode()&os.ModeCharDevice != 0
+		output = zerolog.SyncWriter(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339, NoColor: !isTerminal})
 	}
 	//nolint:reassign // zerolog, configuring global logger
 	log.Logger = log.Output(output).With().Str("service", "ckic-manager").Logger()
