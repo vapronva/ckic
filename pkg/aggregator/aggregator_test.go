@@ -10,7 +10,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	"git.horse/vapronva/ckic/pkg/aggregator"
-	"git.horse/vapronva/ckic/pkg/constants"
+	"git.horse/vapronva/ckic/pkg/caddy"
 )
 
 func TestCurrentMergedSortsExternalsAfterBase(t *testing.T) {
@@ -55,7 +55,7 @@ func TestBootMirrorKeepsAcceptedSnapshot(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got := mirror.Data[constants.CaddyfileKey]; got != want {
+		if got := mirror.Data[caddy.CaddyfileKey]; got != want {
 			t.Fatalf("boot snapshot = %q, want %q", got, want)
 		}
 	}
@@ -115,7 +115,7 @@ func TestBootMirrorKeepsAcceptedSnapshot(t *testing.T) {
 
 func TestBootMirrorRepairsMissingCaddyfile(t *testing.T) {
 	t.Parallel()
-	for _, data := range []map[string]string{nil, {constants.CaddyfileKey: ""}, {constants.CaddyfileKey: " \n"}} {
+	for _, data := range []map[string]string{nil, {caddy.CaddyfileKey: ""}, {caddy.CaddyfileKey: " \n"}} {
 		client := fake.NewClientset(&corev1.ConfigMap{Name: "accepted", Namespace: "system", Data: data})
 		agg := aggregator.New(client, "system", "accepted", nil)
 		const bootstrap = "{\n\tadmin :2019\n}\n"
@@ -126,7 +126,7 @@ func TestBootMirrorRepairsMissingCaddyfile(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got := mirror.Data[constants.CaddyfileKey]; got != bootstrap {
+		if got := mirror.Data[caddy.CaddyfileKey]; got != bootstrap {
 			t.Fatalf("boot snapshot = %q, want %q", got, bootstrap)
 		}
 	}

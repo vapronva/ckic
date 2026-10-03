@@ -9,7 +9,6 @@ import (
 	"github.com/rs/zerolog/log"
 	appsv1 "k8s.io/api/apps/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/labels"
 
 	"git.horse/vapronva/ckic/pkg/aggregator"
 	"git.horse/vapronva/ckic/pkg/caddy"
@@ -32,7 +31,7 @@ func (c *Controller) processNextItem(ctx context.Context) bool {
 
 func logReconcileError(key string, err error, requeues int) {
 	logger := log.With().
-		Str("key", reconcileKeyLabel(key)).
+		Str("key", key).
 		Int("requeues", requeues).
 		Logger()
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -40,13 +39,6 @@ func logReconcileError(key string, err error, requeues int) {
 		return
 	}
 	logger.Warn().Err(err).Msg("Reconcile failed; requeueing")
-}
-
-func reconcileKeyLabel(key string) string {
-	if key == mirrorRepairKey {
-		return "mirror"
-	}
-	return key
 }
 
 func (c *Controller) reconcile(ctx context.Context, key string) error {
@@ -63,48 +55,38 @@ func (c *Controller) reconcileNode(ctx context.Context, nodeName string) error {
 	if err != nil && !apierrors.IsNotFound(err) {
 		return err
 	}
-	isManaged := err == nil && c.nodeSelector.Matches(labels.Set(node.Labels))
-	if !isManaged {
+	if err != nil || !c.isManagedNode(node) {
 		return c.teardownNode(ctx, nodeName)
 	}
 	snapshot, err := c.aggregator.CurrentMerged()
 	if err != nil {
 		return err
 	}
-	instance, err := c.deployFn(
-		ctx,
-		c.deployOptionsForNode(nodeName),
-		nodeName,
-		c.config.ExternalEndpoints[nodeName],
-	)
+	pod, err := c.deployFn(ctx, c.deployOptionsForNode(nodeName), nodeName, c.config.ExternalEndpoints[nodeName])
 	if err != nil {
 		return err
 	}
-	isLoaded, err := c.ensureLoaded(ctx, nodeName, instance, snapshot)
+	isLoaded, err := c.ensureLoaded(ctx, nodeName, pod, snapshot)
 	if err != nil || !isLoaded {
 		return err
 	}
 	return c.aggregator.PublishAccepted(ctx, snapshot)
 }
 
-func (c *Controller) ensureLoaded(
-	ctx context.Context,
-	nodeName string,
-	instance *caddy.Instance,
-	snapshot aggregator.Snapshot,
-) (bool, error) {
+func (c *Controller) ensureLoaded(ctx context.Context, nodeName string, pod caddy.Pod, snapshot aggregator.Snapshot) (bool, error) {
 	digest := configDigest(snapshot.Caddyfile)
-	if c.pushUpToDate(nodeName, digest, instance.ContainerID) {
+	if c.pushUpToDate(nodeName, digest, pod.ContainerID) {
 		return true, nil
 	}
-	if instance.PodIP == "" || instance.ContainerID == "" {
+	if pod.IP == "" || pod.ContainerID == "" {
+		log.Debug().Str("node", nodeName).Str("pod", pod.Name).Msg("Caddy container not running yet; requeueing push")
 		c.queue.AddAfter(nodeName, podStartupRequeueInterval)
 		return false, nil
 	}
-	if err := c.pushFn(ctx, instance, snapshot.Caddyfile); err != nil {
+	if err := c.pushFn(ctx, pod, snapshot.Caddyfile); err != nil {
 		return false, err
 	}
-	c.recordPush(nodeName, digest, instance.ContainerID)
+	c.recordPush(nodeName, digest, pod.ContainerID)
 	return true, nil
 }
 
@@ -125,13 +107,7 @@ func caddyImageOf(dep *appsv1.Deployment) string {
 }
 
 func (c *Controller) teardownNode(ctx context.Context, nodeName string) error {
-	instance := &caddy.Instance{
-		NodeName:       nodeName,
-		Namespace:      c.config.Namespace,
-		DeploymentName: caddy.DeploymentName(nodeName),
-		KubeClient:     c.clientset,
-	}
-	if err := instance.Delete(ctx); err != nil {
+	if err := caddy.Teardown(ctx, c.deployOpts, nodeName); err != nil {
 		return err
 	}
 	c.clearPushState(nodeName)

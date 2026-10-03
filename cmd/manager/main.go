@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -17,20 +19,21 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/pflag"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/validate/content"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 
 	"git.horse/vapronva/ckic/pkg/controller"
-	"git.horse/vapronva/ckic/pkg/utils"
 )
 
 const (
-	probeShutdownTimeout       = 5 * time.Second
-	probeReadHeaderTimeout     = 10 * time.Second
-	leaderRunErrTimeout        = 30 * time.Second
-	leaderElectionJitterFactor = 1.2
+	probeShutdownTimeout   = 5 * time.Second
+	probeReadHeaderTimeout = 10 * time.Second
+	leaderRunErrTimeout    = 30 * time.Second
 )
 
 var errLeaderElectionLost = errors.New("leader election lost")
@@ -59,20 +62,23 @@ func main() {
 	if err := setupLogger(opts.logLevel); err != nil {
 		log.Fatal().Err(err).Msg("Invalid log level")
 	}
+	if err := run(opts); err != nil {
+		log.Fatal().Err(err).Msg("CKIC manager failed")
+	}
+}
+
+func run(opts options) error {
 	cfg, err := opts.resolveControllerConfig()
 	if err != nil {
-		log.Fatal().Err(err).Msg("Invalid configuration")
+		return fmt.Errorf("invalid configuration: %w", err)
 	}
-	if err := validateLeaderElectionTimings(opts.leaderElection); err != nil {
-		log.Fatal().Err(err).Msg("Invalid leader election configuration")
-	}
-	clientset, err := utils.GetKubernetesClient(opts.kubeconfigPath)
+	clientset, err := kubernetesClient(opts.kubeconfigPath)
 	if err != nil {
-		log.Fatal().Err(err).Msg("Failed to build Kubernetes client")
+		return err
 	}
 	ctrl, err := controller.NewController(clientset, cfg)
 	if err != nil {
-		log.Fatal().Err(err).Msg("Failed to initialize controller")
+		return fmt.Errorf("failed to initialize controller: %w", err)
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -90,10 +96,10 @@ func main() {
 		cancel()
 		<-runErrCh
 	}
-	if runErr != nil && !errors.Is(runErr, context.Canceled) {
-		log.Error().Err(runErr).Msg("Controller exited with error")
-		os.Exit(1)
+	if errors.Is(runErr, context.Canceled) {
+		return nil
 	}
+	return runErr
 }
 
 func parseFlags() options {
@@ -149,13 +155,44 @@ func (o options) resolveControllerConfig() (controller.Config, error) {
 	default:
 		return cfg, fmt.Errorf("invalid image pull policy %q (want Always, IfNotPresent, or Never)", o.imagePullPolicy)
 	}
-	endpoints, err := utils.ParseExternalEndpoints(o.externalEndpoints)
+	endpoints, err := parseExternalEndpoints(o.externalEndpoints)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.ExternalEndpoints = endpoints
 	cfg.Namespace, err = resolveNamespace(cfg.Namespace)
 	return cfg, err
+}
+
+func parseExternalEndpoints(endpoints []string) (map[string][]string, error) {
+	result := make(map[string][]string)
+	for _, endpoint := range endpoints {
+		nodeName, addresses, ok := strings.Cut(endpoint, "=")
+		if !ok {
+			return nil, fmt.Errorf("--external-endpoints: invalid endpoint %q; expected format 'nodeName=ip1,ip2,...'", endpoint)
+		}
+		nodeName = strings.TrimSpace(nodeName)
+		if errs := content.IsDNS1123Subdomain(nodeName); len(errs) > 0 {
+			return nil, fmt.Errorf("--external-endpoints: invalid Kubernetes node name %q: %s", nodeName, strings.Join(errs, "; "))
+		}
+		if errs := validation.IsValidLabelValue(nodeName); len(errs) > 0 {
+			return nil, fmt.Errorf("--external-endpoints: node %q cannot be used as an instance label: %s", nodeName, strings.Join(errs, "; "))
+		}
+		for rawIP := range strings.SplitSeq(addresses, ",") {
+			ip := strings.TrimSpace(rawIP)
+			parsed := net.ParseIP(ip)
+			if parsed == nil {
+				return nil, fmt.Errorf("--external-endpoints: invalid IP address %q for node %q", ip, nodeName)
+			}
+			if !parsed.IsGlobalUnicast() {
+				return nil, fmt.Errorf("--external-endpoints: IP address %q for node %q must be unicast and cannot be unspecified, loopback or link-local", ip, nodeName)
+			}
+			if canonical := parsed.String(); !slices.Contains(result[nodeName], canonical) {
+				result[nodeName] = append(result[nodeName], canonical)
+			}
+		}
+	}
+	return result, nil
 }
 
 func setupLogger(level string) error {
@@ -173,31 +210,22 @@ func setupLogger(level string) error {
 		isTerminal := err == nil && stat.Mode()&os.ModeCharDevice != 0
 		output = zerolog.SyncWriter(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339, NoColor: !isTerminal})
 	}
-	//nolint:reassign // zerolog, configuring global logger
 	log.Logger = log.Output(output).With().Str("service", "ckic-manager").Logger()
 	return nil
 }
 
-func validateLeaderElectionTimings(le leaderElectionOptions) error {
-	if !le.enabled {
-		return nil
+func kubernetesClient(kubeconfigPath string) (*kubernetes.Clientset, error) {
+	rules := clientcmd.NewDefaultClientConfigLoadingRules()
+	rules.ExplicitPath = kubeconfigPath
+	config, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, &clientcmd.ConfigOverrides{}).ClientConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to build kubernetes config: %w", err)
 	}
-	if le.leaseDuration <= 0 || le.renewDeadline <= 0 || le.retryPeriod <= 0 {
-		return errors.New("leader election durations must all be positive")
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create kubernetes client: %w", err)
 	}
-	if le.leaseDuration <= le.renewDeadline {
-		return fmt.Errorf(
-			"leader-election-lease-duration (%s) must be greater than leader-election-renew-deadline (%s)",
-			le.leaseDuration, le.renewDeadline,
-		)
-	}
-	if minRenew := time.Duration(leaderElectionJitterFactor * float64(le.retryPeriod)); le.renewDeadline <= minRenew {
-		return fmt.Errorf(
-			"leader-election-renew-deadline (%s) must be greater than %s (%.1f × leader-election-retry-period)",
-			le.renewDeadline, minRenew, leaderElectionJitterFactor,
-		)
-	}
-	return nil
+	return clientset, nil
 }
 
 func runWithLeaderElection(
@@ -214,18 +242,11 @@ func runWithLeaderElection(
 		return ctrl.Run(ctx)
 	}
 	identity := leaderElectionIdentity()
-	log.Info().
-		Str("leaseName", le.leaseName).
-		Str("leaseNamespace", namespace).
-		Dur("leaseDuration", le.leaseDuration).
-		Dur("renewDeadline", le.renewDeadline).
-		Dur("retryPeriod", le.retryPeriod).
-		Msg("Leader election is enabled")
 	electionCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var leading atomic.Bool
 	runErrCh := make(chan error, 1)
-	leaderelection.RunOrDie(electionCtx, leaderelection.LeaderElectionConfig{
+	elector, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
 		Lock: &resourcelock.LeaseLock{
 			LeaseMeta:  metav1.ObjectMeta{Name: le.leaseName, Namespace: namespace},
 			Client:     clientset.CoordinationV1(),
@@ -255,6 +276,17 @@ func runWithLeaderElection(
 			},
 		},
 	})
+	if err != nil {
+		return fmt.Errorf("invalid leader election configuration: %w", err)
+	}
+	log.Info().
+		Str("leaseName", le.leaseName).
+		Str("leaseNamespace", namespace).
+		Dur("leaseDuration", le.leaseDuration).
+		Dur("renewDeadline", le.renewDeadline).
+		Dur("retryPeriod", le.retryPeriod).
+		Msg("Leader election is enabled")
+	elector.Run(electionCtx)
 	if !leading.Load() {
 		return nil
 	}

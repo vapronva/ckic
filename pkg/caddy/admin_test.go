@@ -11,8 +11,9 @@ import (
 	"testing"
 )
 
-func TestUpdateConfigLoadsAdaptedJSON(t *testing.T) {
+func TestLoadPushesAdaptedJSON(t *testing.T) {
 	t.Parallel()
+	const reachable = `{"admin":{"listen":":2019","origins":["http://key.caddy-admin-api.ckic.cmld.ru"]},"apps":{}}`
 	for _, test := range []struct {
 		name, adaptation        string
 		adaptStatus, loadStatus int
@@ -20,12 +21,14 @@ func TestUpdateConfigLoadsAdaptedJSON(t *testing.T) {
 		wantLoads               int32
 		wantError               bool
 	}{
-		{"success", `{"result":{"apps":{}},"warnings":[{"message":"warning"}]}`, 200, 200, true, 1, false},
-		{"success without forced reload", `{"result":{"apps":{}}}`, 200, 200, false, 1, false},
-		{"load failure", `{"result":{"apps":{}},"warnings":[{"message":"warning"}]}`, 200, 400, true, 1, true},
+		{"success", `{"result":` + reachable + `,"warnings":[{"message":"warning"}]}`, 200, 200, true, 1, false},
+		{"success without forced reload", `{"result":` + reachable + `}`, 200, 200, false, 1, false},
+		{"load failure", `{"result":` + reachable + `}`, 200, 400, true, 1, true},
 		{"adapt failure", `{"error":"bad config"}`, 400, 200, true, 0, true},
 		{"missing result", `{"warnings":[]}`, 200, 200, true, 0, true},
 		{"null result", `{"result":null}`, 200, 200, true, 0, true},
+		{"admin on loopback", `{"result":{"apps":{}}}`, 200, 200, true, 0, true},
+		{"admin origin dropped", `{"result":{"admin":{"listen":":2019"},"apps":{}}}`, 200, 200, true, 0, true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
@@ -50,7 +53,7 @@ func TestUpdateConfigLoadsAdaptedJSON(t *testing.T) {
 					_, _ = io.WriteString(w, test.adaptation)
 				case "/load":
 					loads.Add(1)
-					if request.Method != http.MethodPost || request.Header.Get("Content-Type") != "application/json" || string(body) != `{"apps":{}}` {
+					if request.Method != http.MethodPost || request.Header.Get("Content-Type") != "application/json" || string(body) != reachable {
 						t.Errorf("unexpected load request: %s %s %q", request.Method, request.Header.Get("Content-Type"), body)
 					}
 					if forced := request.Header.Get("Cache-Control") == "must-revalidate"; forced != test.forceReload {
@@ -67,12 +70,11 @@ func TestUpdateConfigLoadsAdaptedJSON(t *testing.T) {
 				return (&net.Dialer{}).DialContext(ctx, network, strings.TrimPrefix(server.URL, "http://"))
 			}}
 			defer transport.CloseIdleConnections()
-			api := NewAdminAPIConfig("key", test.forceReload)
-			api.Client.Transport = transport
-			instance := &Instance{NodeName: "node1", PodIP: "192.0.2.1"}
-			err := instance.UpdateConfig(t.Context(), "config", api)
+			admin := NewAdmin("key", test.forceReload)
+			admin.client.Transport = transport
+			err := admin.Load(t.Context(), Pod{NodeName: "node1", IP: "192.0.2.1"}, "config")
 			if (err != nil) != test.wantError {
-				t.Fatalf("UpdateConfig = %v, want error=%v", err, test.wantError)
+				t.Fatalf("Load = %v, want error=%v", err, test.wantError)
 			}
 			if loads.Load() != test.wantLoads {
 				t.Fatalf("loads = %d, want %d", loads.Load(), test.wantLoads)

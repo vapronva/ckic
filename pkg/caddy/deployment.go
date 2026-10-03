@@ -2,29 +2,32 @@ package caddy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
-	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation"
 	appsv1ac "k8s.io/client-go/applyconfigurations/apps/v1"
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	metav1ac "k8s.io/client-go/applyconfigurations/meta/v1"
 	"k8s.io/client-go/kubernetes"
-
-	"git.horse/vapronva/ckic/pkg/constants"
 )
 
 const (
+	CaddyfileKey = "Caddyfile"
+
 	caddyBinary                    = "caddy"
 	caddyContainerName             = caddyBinary
 	fieldManager                   = "ckic"
+	volumeNameCaddyConfig          = "caddy-config"
+	volumeNameData                 = "opt-data"
+	volumeNameConfig               = "opt-config"
+	ciliumNodeLoadBalancerClass    = "io.cilium/node"
 	adminProbePath                 = "/config/admin/listen"
 	readinessProbePath             = "/config/apps/http/http_port"
 	probeTimeoutSeconds            = 3
@@ -49,6 +52,12 @@ var trafficPorts = []trafficPort{
 	{"https-udp", 443, corev1.ProtocolUDP},
 }
 
+var podFieldEnvVars = []struct{ name, fieldPath string }{
+	{"CKIC_POD_NAME", "metadata.name"},
+	{"CKIC_NODE_NAME", "spec.nodeName"},
+	{"CKIC_POD_IP", "status.podIP"},
+}
+
 type DeployOptions struct {
 	Clientset           kubernetes.Interface
 	Namespace           string
@@ -65,77 +74,73 @@ type DeployOptions struct {
 	CaddyAdminOriginKey string
 }
 
+type Pod struct {
+	NodeName    string
+	Name        string
+	IP          string
+	ContainerID string
+}
+
+func (o DeployOptions) Validate() error {
+	if o.UseHostNetwork && o.EnableCiliumLB {
+		return errors.New("cannot combine host networking with the cilium loadbalancer")
+	}
+	envKeys := make(map[string]bool)
+	for _, env := range podFieldEnvVars {
+		envKeys[env.name] = true
+	}
+	for _, key := range o.EnvSecretKeys {
+		if envKeys[key] {
+			return fmt.Errorf("duplicate or reserved environment key %q", key)
+		}
+		envKeys[key] = true
+	}
+	return nil
+}
+
 func applyOptions() metav1.ApplyOptions {
 	return metav1.ApplyOptions{FieldManager: fieldManager, Force: true}
 }
 
-func selectorLabels(nodeName string) map[string]string {
-	return map[string]string{
-		constants.LabelApp:      constants.LabelAppValue,
-		constants.LabelInstance: nodeName,
-	}
-}
-
-func managedLabels(nodeName string) map[string]string {
-	managed := selectorLabels(nodeName)
-	managed[constants.LabelCaddyManaged] = constants.LabelManagedValue
-	return managed
-}
-
-func EnsureCaddy(ctx context.Context, opts DeployOptions, nodeName string, externalIPs []string) (*Instance, error) {
+func EnsureCaddy(ctx context.Context, opts DeployOptions, nodeName string, externalIPs []string) (Pod, error) {
 	if errs := validation.IsValidLabelValue(nodeName); len(errs) > 0 {
-		return nil, fmt.Errorf("node %q cannot be used as an instance label: %s", nodeName, strings.Join(errs, "; "))
+		return Pod{}, fmt.Errorf("node %q cannot be used as an instance label: %s", nodeName, strings.Join(errs, "; "))
 	}
-	instance := &Instance{
-		NodeName:       nodeName,
-		Namespace:      opts.Namespace,
-		DeploymentName: DeploymentName(nodeName),
-		ExternalIPs:    externalIPs,
-		KubeClient:     opts.Clientset,
-	}
-	logger := log.With().Str("node", nodeName).Logger()
 	if opts.PrePullImage {
+		logger := log.With().Str("node", nodeName).Logger()
 		if err := prePullImage(ctx, opts, nodeName, logger); err != nil {
 			logger.Warn().Err(err).Msg("Image pre-pull did not complete; proceeding (kubelet will pull on rollout)")
 		}
 	}
+	deploymentName := DeploymentName(nodeName)
 	if _, err := opts.Clientset.AppsV1().Deployments(opts.Namespace).
-		Apply(ctx, deploymentApplyConfig(instance, opts), applyOptions()); err != nil {
-		return nil, fmt.Errorf("failed to apply deployment %s: %w", instance.DeploymentName, err)
+		Apply(ctx, deploymentApplyConfig(opts, nodeName), applyOptions()); err != nil {
+		return Pod{}, fmt.Errorf("failed to apply deployment %s: %w", deploymentName, err)
 	}
-	if err := applyLoadBalancerService(ctx, opts, instance, logger); err != nil {
-		return nil, err
+	if err := applyLoadBalancerService(ctx, opts, nodeName, externalIPs); err != nil {
+		return Pod{}, err
 	}
-	if err := instance.deleteDeploymentsExcept(ctx, instance.DeploymentName, logger); err != nil {
-		return nil, err
+	if err := deleteDeploymentsExcept(ctx, opts, nodeName, deploymentName); err != nil {
+		return Pod{}, err
 	}
-	pod, err := resolveActivePod(ctx, opts.Clientset, opts.Namespace, nodeName)
-	if err != nil {
-		logger.Debug().Err(err).Msg("Active Caddy pod not resolved yet; will reconcile on next requeue")
-		return instance, nil
-	}
-	instance.PodName = pod.Name
-	instance.PodIP = pod.Status.PodIP
-	instance.ContainerID = caddyContainerID(pod)
-	return instance, nil
+	return findActivePod(ctx, opts, nodeName)
 }
 
-func applyLoadBalancerService(ctx context.Context, opts DeployOptions, instance *Instance, logger zerolog.Logger) error {
+func applyLoadBalancerService(ctx context.Context, opts DeployOptions, nodeName string, externalIPs []string) error {
 	if !opts.EnableCiliumLB {
-		return instance.deleteServicesExcept(ctx, "", logger)
+		return deleteServicesExcept(ctx, opts, nodeName, "")
 	}
-	serviceName := instance.LoadBalancerServiceName()
-	if _, err := opts.Clientset.CoreV1().Services(instance.Namespace).
-		Apply(ctx, loadBalancerServiceApplyConfig(instance), applyOptions()); err != nil {
+	serviceName := loadBalancerServiceName(nodeName)
+	if _, err := opts.Clientset.CoreV1().Services(opts.Namespace).
+		Apply(ctx, loadBalancerServiceApplyConfig(opts.Namespace, nodeName, externalIPs), applyOptions()); err != nil {
 		return fmt.Errorf("failed to apply loadbalancer service %s: %w", serviceName, err)
 	}
-	return instance.deleteServicesExcept(ctx, serviceName, logger)
+	return deleteServicesExcept(ctx, opts, nodeName, serviceName)
 }
 
-func deploymentApplyConfig(instance *Instance, opts DeployOptions) *appsv1ac.DeploymentApplyConfiguration {
-	podLabels := managedLabels(instance.NodeName)
+func deploymentApplyConfig(opts DeployOptions, nodeName string) *appsv1ac.DeploymentApplyConfiguration {
 	podSpec := corev1ac.PodSpec().
-		WithAffinity(nodeNameAffinity(instance.NodeName)).
+		WithAffinity(nodeNameAffinity(nodeName)).
 		WithAutomountServiceAccountToken(false).
 		WithSecurityContext(corev1ac.PodSecurityContext().
 			WithRunAsNonRoot(false).
@@ -143,15 +148,22 @@ func deploymentApplyConfig(instance *Instance, opts DeployOptions) *appsv1ac.Dep
 		WithContainers(caddyContainer(opts)).
 		WithVolumes(caddyVolumes(opts)...).
 		WithDNSPolicy(corev1.DNSClusterFirst)
+	strategy := appsv1ac.DeploymentStrategy().
+		WithType(appsv1.RollingUpdateDeploymentStrategyType).
+		WithRollingUpdate(appsv1ac.RollingUpdateDeployment().
+			WithMaxSurge(intstr.FromString("25%")).
+			WithMaxUnavailable(intstr.FromString("25%")))
 	if opts.UseHostNetwork {
 		podSpec = podSpec.WithHostNetwork(true).WithDNSPolicy(corev1.DNSClusterFirstWithHostNet)
+		strategy = appsv1ac.DeploymentStrategy().WithType(appsv1.RecreateDeploymentStrategyType)
 	}
-	return appsv1ac.Deployment(instance.DeploymentName, instance.Namespace).
+	podLabels := ManagedLabels(nodeName)
+	return appsv1ac.Deployment(DeploymentName(nodeName), opts.Namespace).
 		WithLabels(podLabels).
 		WithSpec(appsv1ac.DeploymentSpec().
 			WithReplicas(1).
-			WithStrategy(deploymentStrategy(opts.UseHostNetwork)).
-			WithSelector(metav1ac.LabelSelector().WithMatchLabels(selectorLabels(instance.NodeName))).
+			WithStrategy(strategy).
+			WithSelector(metav1ac.LabelSelector().WithMatchLabels(selectorLabels(nodeName))).
 			WithTemplate(corev1ac.PodTemplateSpec().WithLabels(podLabels).WithSpec(podSpec)))
 }
 
@@ -167,7 +179,7 @@ func nodeNameAffinity(nodeName string) *corev1ac.AffinityApplyConfiguration {
 
 func caddyContainer(opts DeployOptions) *corev1ac.ContainerApplyConfiguration {
 	ports := []*corev1ac.ContainerPortApplyConfiguration{
-		corev1ac.ContainerPort().WithName("admin").WithContainerPort(constants.CaddyAdminPort).WithProtocol(corev1.ProtocolTCP),
+		corev1ac.ContainerPort().WithName("admin").WithContainerPort(adminPort).WithProtocol(corev1.ProtocolTCP),
 	}
 	for _, traffic := range trafficPorts {
 		port := corev1ac.ContainerPort().WithName(traffic.name).WithContainerPort(traffic.port).WithProtocol(traffic.protocol)
@@ -182,10 +194,10 @@ func caddyContainer(opts DeployOptions) *corev1ac.ContainerApplyConfiguration {
 		WithImagePullPolicy(opts.ImagePullPolicy).
 		WithPorts(ports...).
 		WithVolumeMounts(
-			corev1ac.VolumeMount().WithName(constants.VolumeNameCaddyConfig).
-				WithMountPath("/etc/caddy/Caddyfile").WithSubPath(constants.CaddyfileKey).WithReadOnly(true),
-			corev1ac.VolumeMount().WithName(constants.VolumeNameData).WithMountPath("/data"),
-			corev1ac.VolumeMount().WithName(constants.VolumeNameConfig).WithMountPath("/config"),
+			corev1ac.VolumeMount().WithName(volumeNameCaddyConfig).
+				WithMountPath("/etc/caddy/Caddyfile").WithSubPath(CaddyfileKey).WithReadOnly(true),
+			corev1ac.VolumeMount().WithName(volumeNameData).WithMountPath("/data"),
+			corev1ac.VolumeMount().WithName(volumeNameConfig).WithMountPath("/config"),
 		).
 		WithEnv(caddyEnvVars(opts)...).
 		WithStartupProbe(adminProbe(opts.CaddyAdminOriginKey, adminProbePath, startupProbePeriodSeconds, startupProbeFailureThreshold)).
@@ -201,7 +213,7 @@ func caddyContainer(opts DeployOptions) *corev1ac.ContainerApplyConfiguration {
 func adminProbe(originKey, path string, periodSeconds, failureThreshold int32) *corev1ac.ProbeApplyConfiguration {
 	get := corev1ac.HTTPGetAction().
 		WithPath(path).
-		WithPort(intstr.FromInt32(constants.CaddyAdminPort)).
+		WithPort(intstr.FromInt32(adminPort)).
 		WithScheme(corev1.URISchemeHTTP)
 	if originKey != "" {
 		get = get.WithHTTPHeaders(corev1ac.HTTPHeader().WithName("Origin").WithValue(adminOrigin(originKey)))
@@ -221,25 +233,20 @@ func caddyEnvVars(opts DeployOptions) []*corev1ac.EnvVarApplyConfiguration {
 				WithSecretKeyRef(corev1ac.SecretKeySelector().WithName(opts.EnvSecretName).WithKey(key))))
 		}
 	}
-	fieldRefs := []struct{ name, fieldPath string }{
-		{constants.PodNameEnvVar, "metadata.name"},
-		{constants.NodeNameEnvVar, "spec.nodeName"},
-		{constants.PodIPEnvVar, "status.podIP"},
-	}
-	for _, ref := range fieldRefs {
-		envVars = append(envVars, corev1ac.EnvVar().WithName(ref.name).WithValueFrom(corev1ac.EnvVarSource().
-			WithFieldRef(corev1ac.ObjectFieldSelector().WithFieldPath(ref.fieldPath))))
+	for _, env := range podFieldEnvVars {
+		envVars = append(envVars, corev1ac.EnvVar().WithName(env.name).WithValueFrom(corev1ac.EnvVarSource().
+			WithFieldRef(corev1ac.ObjectFieldSelector().WithFieldPath(env.fieldPath))))
 	}
 	return envVars
 }
 
 func caddyVolumes(opts DeployOptions) []*corev1ac.VolumeApplyConfiguration {
 	return []*corev1ac.VolumeApplyConfiguration{
-		corev1ac.Volume().WithName(constants.VolumeNameCaddyConfig).
+		corev1ac.Volume().WithName(volumeNameCaddyConfig).
 			WithConfigMap(corev1ac.ConfigMapVolumeSource().WithName(opts.ConfigMapName).
-				WithItems(corev1ac.KeyToPath().WithKey(constants.CaddyfileKey).WithPath(constants.CaddyfileKey))),
-		storageVolume(constants.VolumeNameData, opts.DataVolumePVC, "/opt/cmld/caddy/data"),
-		storageVolume(constants.VolumeNameConfig, opts.ConfigVolumePVC, "/opt/cmld/caddy/config"),
+				WithItems(corev1ac.KeyToPath().WithKey(CaddyfileKey).WithPath(CaddyfileKey))),
+		storageVolume(volumeNameData, opts.DataVolumePVC, "/opt/cmld/caddy/data"),
+		storageVolume(volumeNameConfig, opts.ConfigVolumePVC, "/opt/cmld/caddy/config"),
 	}
 }
 
@@ -252,17 +259,7 @@ func storageVolume(name, pvcName, hostPath string) *corev1ac.VolumeApplyConfigur
 		WithHostPath(corev1ac.HostPathVolumeSource().WithPath(hostPath).WithType(corev1.HostPathDirectoryOrCreate))
 }
 
-func deploymentStrategy(useHostNetwork bool) *appsv1ac.DeploymentStrategyApplyConfiguration {
-	if useHostNetwork {
-		return appsv1ac.DeploymentStrategy().WithType(appsv1.RecreateDeploymentStrategyType)
-	}
-	quarter := intstr.FromString("25%")
-	return appsv1ac.DeploymentStrategy().
-		WithType(appsv1.RollingUpdateDeploymentStrategyType).
-		WithRollingUpdate(appsv1ac.RollingUpdateDeployment().WithMaxSurge(quarter).WithMaxUnavailable(quarter))
-}
-
-func loadBalancerServiceApplyConfig(instance *Instance) *corev1ac.ServiceApplyConfiguration {
+func loadBalancerServiceApplyConfig(namespace, nodeName string, externalIPs []string) *corev1ac.ServiceApplyConfiguration {
 	ports := make([]*corev1ac.ServicePortApplyConfiguration, 0, len(trafficPorts))
 	for _, traffic := range trafficPorts {
 		ports = append(ports, corev1ac.ServicePort().
@@ -271,29 +268,28 @@ func loadBalancerServiceApplyConfig(instance *Instance) *corev1ac.ServiceApplyCo
 			WithTargetPort(intstr.FromInt32(traffic.port)).
 			WithProtocol(traffic.protocol))
 	}
-	return corev1ac.Service(instance.LoadBalancerServiceName(), instance.Namespace).
-		WithLabels(managedLabels(instance.NodeName)).
+	return corev1ac.Service(loadBalancerServiceName(nodeName), namespace).
+		WithLabels(ManagedLabels(nodeName)).
 		WithSpec(corev1ac.ServiceSpec().
-			WithSelector(managedLabels(instance.NodeName)).
+			WithSelector(ManagedLabels(nodeName)).
 			WithType(corev1.ServiceTypeLoadBalancer).
-			WithLoadBalancerClass(constants.CiliumNodeLoadBalancerClass).
+			WithLoadBalancerClass(ciliumNodeLoadBalancerClass).
 			WithExternalTrafficPolicy(corev1.ServiceExternalTrafficPolicyLocal).
 			WithAllocateLoadBalancerNodePorts(false).
-			WithExternalIPs(instance.ExternalIPs...).
+			WithExternalIPs(externalIPs...).
 			WithPorts(ports...))
 }
 
-func resolveActivePod(ctx context.Context, clientset kubernetes.Interface, namespace, nodeName string) (*corev1.Pod, error) {
-	pods, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: labels.SelectorFromSet(managedLabels(nodeName)).String(),
-	})
+func findActivePod(ctx context.Context, opts DeployOptions, nodeName string) (Pod, error) {
+	pods, err := opts.Clientset.CoreV1().Pods(opts.Namespace).List(ctx, managedListOptions(nodeName))
 	if err != nil {
-		return nil, fmt.Errorf("failed to list pods for node %s: %w", nodeName, err)
+		return Pod{}, fmt.Errorf("failed to list pods for node %s: %w", nodeName, err)
 	}
-	if pod, ok := selectNewestActivePod(pods.Items); ok {
-		return pod, nil
+	pod, ok := selectNewestActivePod(pods.Items)
+	if !ok {
+		return Pod{}, nil
 	}
-	return nil, fmt.Errorf("no active pod found for node %s", nodeName)
+	return Pod{NodeName: nodeName, Name: pod.Name, IP: pod.Status.PodIP, ContainerID: caddyContainerID(pod)}, nil
 }
 
 func selectNewestActivePod(pods []corev1.Pod) (*corev1.Pod, bool) {

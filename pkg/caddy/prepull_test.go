@@ -14,8 +14,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	clienttesting "k8s.io/client-go/testing"
-
-	"git.horse/vapronva/ckic/pkg/constants"
 )
 
 func TestWaitForImagePulled(t *testing.T) {
@@ -98,11 +96,11 @@ func TestPrePullCleanupPreservesReplacement(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			pod := &corev1.Pod{
 				Name: prePullPodName(testNode), Namespace: testNS, UID: "original",
-				Labels: managedLabels(testNode), Status: corev1.PodStatus{Phase: corev1.PodSucceeded},
+				Labels: ManagedLabels(testNode), Status: corev1.PodStatus{Phase: corev1.PodSucceeded},
 			}
-			pod.Labels[constants.LabelType] = constants.LabelTypeImagePrePull
+			pod.Labels[labelType] = labelTypePrePull
 			client := fake.NewClientset(pod)
-			client.PrependReactor("patch", "pods", func(action clienttesting.Action) (bool, runtime.Object, error) {
+			client.PrependReactor("patch", "pods", func(clienttesting.Action) (bool, runtime.Object, error) {
 				return true, pod.DeepCopy(), client.Tracker().Add(pod)
 			})
 			deletes := 0

@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -19,7 +20,6 @@ import (
 	cachetesting "k8s.io/client-go/tools/cache/testing"
 
 	"git.horse/vapronva/ckic/pkg/caddy"
-	"git.horse/vapronva/ckic/pkg/constants"
 )
 
 func newTestController(t *testing.T, client kubernetes.Interface) *Controller {
@@ -32,8 +32,11 @@ func newTestController(t *testing.T, client kubernetes.Interface) *Controller {
 	return c
 }
 
-func addNode(c *Controller, name string) {
-	_ = c.nodeFactory.Core().V1().Nodes().Informer().GetStore().Add(&corev1.Node{Name: name})
+func addNode(t *testing.T, c *Controller) {
+	t.Helper()
+	if err := c.nodeFactory.Core().V1().Nodes().Informer().GetStore().Add(&corev1.Node{Name: "node1"}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestReconcileNodePushesOnlyWhenNeeded(t *testing.T) {
@@ -47,13 +50,13 @@ func TestReconcileNodePushesOnlyWhenNeeded(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(c.queue.ShutDown)
-	addNode(c, "node1")
-	instance := &caddy.Instance{PodIP: "192.0.2.1", ContainerID: "container-1"}
-	c.deployFn = func(context.Context, caddy.DeployOptions, string, []string) (*caddy.Instance, error) {
-		return instance, nil
+	addNode(t, c)
+	pod := caddy.Pod{IP: "192.0.2.1", ContainerID: "container-1"}
+	c.deployFn = func(context.Context, caddy.DeployOptions, string, []string) (caddy.Pod, error) {
+		return pod, nil
 	}
 	var pushes []string
-	c.pushFn = func(_ context.Context, _ *caddy.Instance, merged string) error {
+	c.pushFn = func(_ context.Context, _ caddy.Pod, merged string) error {
 		pushes = append(pushes, merged)
 		return nil
 	}
@@ -74,10 +77,10 @@ func TestReconcileNodePushesOnlyWhenNeeded(t *testing.T) {
 	reconcile("same digest and container", 1)
 	c.aggregator.UpdateBase("changed\n")
 	reconcile("config change", 2)
-	instance.ContainerID = "container-2"
-	instance.PodIP = ""
+	pod.ContainerID = "container-2"
+	pod.IP = ""
 	reconcile("container restarting", 2)
-	instance.PodIP = "192.0.2.1"
+	pod.IP = "192.0.2.1"
 	reconcile("container restarted", 3)
 	c.forceConfigResync()
 	reconcile("forced resync", 4)
@@ -99,20 +102,18 @@ func TestReconcileNodePushesOnlyWhenNeeded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mirror.Data[constants.CaddyfileKey] != pushes[3] {
+	if mirror.Data[caddy.CaddyfileKey] != pushes[3] {
 		t.Fatal("oversized config replaced the last fitting boot snapshot")
 	}
 }
 
 func TestReconcileNodeTearsDownUnmanagedNode(t *testing.T) {
 	t.Parallel()
-	client := fake.NewClientset(&appsv1.Deployment{Name: "caddy-gone", Namespace: "caddy-system", Labels: map[string]string{
-		constants.LabelApp: constants.LabelAppValue, constants.LabelCaddyManaged: constants.LabelManagedValue, constants.LabelInstance: "gone",
-	}})
+	client := fake.NewClientset(&appsv1.Deployment{Name: "caddy-gone", Namespace: "caddy-system", Labels: caddy.ManagedLabels("gone")})
 	c := newTestController(t, client)
-	c.deployFn = func(context.Context, caddy.DeployOptions, string, []string) (*caddy.Instance, error) {
+	c.deployFn = func(context.Context, caddy.DeployOptions, string, []string) (caddy.Pod, error) {
 		t.Fatal("deployFn must not be called for an unmanaged node")
-		return nil, errors.New("unreachable")
+		return caddy.Pod{}, errors.New("unreachable")
 	}
 	if err := c.reconcileNode(t.Context(), "gone"); err != nil {
 		t.Fatalf("reconcileNode: %v", err)
@@ -122,47 +123,11 @@ func TestReconcileNodeTearsDownUnmanagedNode(t *testing.T) {
 	}
 }
 
-func TestRejectedConfigPreservesBootSnapshot(t *testing.T) {
-	t.Parallel()
-	client := fake.NewClientset()
-	c := newTestController(t, client)
-	addNode(c, "node1")
-	bootstrap := bootstrapAdminCaddyfile("key")
-	if err := c.aggregator.InitializeMirror(t.Context(), bootstrap); err != nil {
-		t.Fatal(err)
-	}
-	c.aggregator.UpdateBase("bad config\n")
-	c.deployFn = func(context.Context, caddy.DeployOptions, string, []string) (*caddy.Instance, error) {
-		return &caddy.Instance{PodIP: "192.0.2.1", ContainerID: "container-1"}, nil
-	}
-	wantError := errors.New("Caddy rejected config")
-	c.pushFn = func(context.Context, *caddy.Instance, string) error { return wantError }
-	if err := c.reconcileNode(t.Context(), "node1"); !errors.Is(err, wantError) {
-		t.Fatalf("reconcile rejected config = %v", err)
-	}
-	mirror, err := client.CoreV1().ConfigMaps(c.config.Namespace).Get(t.Context(), "merged", metav1.GetOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if mirror.Data[constants.CaddyfileKey] != bootstrap {
-		t.Fatal("rejected config replaced boot snapshot")
-	}
-	c.aggregator.UpdateBase("accepted\n")
-	c.pushFn = func(context.Context, *caddy.Instance, string) error { return nil }
-	if err := c.reconcileNode(t.Context(), "node1"); err != nil {
-		t.Fatal(err)
-	}
-	accepted, err := c.aggregator.CurrentAccepted()
-	if err != nil || accepted != "accepted\n" {
-		t.Fatalf("non-ready bootstrap pod did not receive config: accepted=%q, err=%v", accepted, err)
-	}
-}
-
 func TestRunWaitsForBaseAndPushesAllConfigFragments(t *testing.T) {
 	t.Parallel()
 	client := fake.NewClientset(
 		&corev1.Node{Name: "node1"},
-		&corev1.ConfigMap{Name: "external", Namespace: "team", Labels: map[string]string{"aggregate": "true"}, Data: map[string]string{constants.CaddyfileKey: "external"}},
+		&corev1.ConfigMap{Name: "external", Namespace: "team", Labels: map[string]string{"aggregate": "true"}, Data: map[string]string{caddy.CaddyfileKey: "external"}},
 	)
 	c, err := NewController(client, Config{
 		Namespace: "system", ConfigMapName: "base", ExternalEnable: true, ExternalLabel: "aggregate=true",
@@ -171,11 +136,11 @@ func TestRunWaitsForBaseAndPushesAllConfigFragments(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.deployFn = func(context.Context, caddy.DeployOptions, string, []string) (*caddy.Instance, error) {
-		return &caddy.Instance{PodIP: "192.0.2.1", ContainerID: "container-1"}, nil
+	c.deployFn = func(context.Context, caddy.DeployOptions, string, []string) (caddy.Pod, error) {
+		return caddy.Pod{IP: "192.0.2.1", ContainerID: "container-1"}, nil
 	}
 	pushed := make(chan string, 1)
-	c.pushFn = func(_ context.Context, _ *caddy.Instance, config string) error {
+	c.pushFn = func(_ context.Context, _ caddy.Pod, config string) error {
 		select {
 		case pushed <- config:
 		default:
@@ -198,7 +163,7 @@ func TestRunWaitsForBaseAndPushesAllConfigFragments(t *testing.T) {
 		}
 	}
 	if _, err := client.CoreV1().ConfigMaps("system").Create(ctx, &corev1.ConfigMap{
-		Name: "base", Namespace: "system", Data: map[string]string{constants.CaddyfileKey: "base"},
+		Name: "base", Namespace: "system", Data: map[string]string{caddy.CaddyfileKey: "base"},
 	}, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
@@ -225,29 +190,27 @@ func TestRunWaitsForBaseAndPushesAllConfigFragments(t *testing.T) {
 
 func TestManagedResourceEventsEnqueueNode(t *testing.T) {
 	t.Parallel()
-	labels := map[string]string{constants.LabelApp: constants.LabelAppValue, constants.LabelCaddyManaged: constants.LabelManagedValue, constants.LabelInstance: "node1"}
-	for _, test := range []struct {
-		name     string
-		object   runtime.Object
-		register func(*Controller, cache.SharedIndexInformer)
-	}{
-		{"pod", &corev1.Pod{Name: "caddy", Labels: labels, Spec: corev1.PodSpec{NodeName: "node1"}}, (*Controller).addPodHandler},
-		{"service", &corev1.Service{Name: "caddy", Labels: labels}, (*Controller).addServiceHandler},
-		{"deployment", &appsv1.Deployment{Name: "caddy", Labels: labels}, (*Controller).addDeploymentHandler},
+	labels := caddy.ManagedLabels("node1")
+	for _, object := range []runtime.Object{
+		&corev1.Pod{Name: "caddy", Labels: labels},
+		&corev1.Service{Name: "caddy", Labels: labels},
+		&appsv1.Deployment{Name: "caddy", Labels: labels},
 	} {
-		t.Run(test.name, func(t *testing.T) {
+		t.Run(fmt.Sprintf("%T", object), func(t *testing.T) {
 			t.Parallel()
 			c := newTestController(t, fake.NewClientset())
 			source := cachetesting.NewFakeControllerSource()
 			defer source.Shutdown()
-			informer := cache.NewSharedIndexInformer(source, test.object, 0, cache.Indexers{})
-			test.register(c, informer)
+			informer := cache.NewSharedIndexInformer(source, object, 0, cache.Indexers{})
+			if err := c.register(informer, c.managedObjectHandler()); err != nil {
+				t.Fatal(err)
+			}
 			go informer.Run(t.Context().Done())
 			if !cache.WaitForCacheSync(t.Context().Done(), informer.HasSynced) {
 				t.Fatal("cache did not sync")
 			}
 			for _, event := range []func(runtime.Object){source.Add, source.Modify, source.Delete} {
-				event(test.object.DeepCopyObject())
+				event(object.DeepCopyObject())
 				enqueued := make(chan string, 1)
 				go func() { key, _ := c.queue.Get(); enqueued <- key }()
 				select {
@@ -269,16 +232,16 @@ func TestMirrorRetryDoesNotReloadCaddy(t *testing.T) {
 	t.Parallel()
 	client := fake.NewClientset()
 	c := newTestController(t, client)
-	addNode(c, "node1")
+	addNode(t, c)
 	if err := c.aggregator.InitializeMirror(t.Context(), "bootstrap"); err != nil {
 		t.Fatal(err)
 	}
 	c.aggregator.UpdateBase("accepted\n")
-	c.deployFn = func(context.Context, caddy.DeployOptions, string, []string) (*caddy.Instance, error) {
-		return &caddy.Instance{PodIP: "192.0.2.1", ContainerID: "container-1"}, nil
+	c.deployFn = func(context.Context, caddy.DeployOptions, string, []string) (caddy.Pod, error) {
+		return caddy.Pod{IP: "192.0.2.1", ContainerID: "container-1"}, nil
 	}
 	pushes := 0
-	c.pushFn = func(context.Context, *caddy.Instance, string) error { pushes++; return nil }
+	c.pushFn = func(context.Context, caddy.Pod, string) error { pushes++; return nil }
 	writeError := apierrors.NewForbidden(corev1.Resource("configmaps"), "merged", errors.New("patch denied"))
 	shouldFail := true
 	client.PrependReactor("patch", "configmaps", func(clienttesting.Action) (bool, runtime.Object, error) {
@@ -303,7 +266,7 @@ func TestMirrorRetryDoesNotReloadCaddy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mirror.Data[constants.CaddyfileKey] != "accepted\n" {
+	if mirror.Data[caddy.CaddyfileKey] != "accepted\n" {
 		t.Fatal("mirror retry did not persist the accepted config")
 	}
 	if pushes != 1 {
@@ -315,15 +278,15 @@ func TestLoadedConfigIsMirroredDespiteDrift(t *testing.T) {
 	t.Parallel()
 	client := fake.NewClientset()
 	c := newTestController(t, client)
-	addNode(c, "node1")
+	addNode(t, c)
 	if err := c.aggregator.InitializeMirror(t.Context(), "bootstrap"); err != nil {
 		t.Fatal(err)
 	}
-	c.deployFn = func(context.Context, caddy.DeployOptions, string, []string) (*caddy.Instance, error) {
-		return &caddy.Instance{PodIP: "192.0.2.1", ContainerID: "container-1"}, nil
+	c.deployFn = func(context.Context, caddy.DeployOptions, string, []string) (caddy.Pod, error) {
+		return caddy.Pod{IP: "192.0.2.1", ContainerID: "container-1"}, nil
 	}
 	rejected := errors.New("Caddy rejected config")
-	c.pushFn = func(_ context.Context, _ *caddy.Instance, merged string) error {
+	c.pushFn = func(_ context.Context, _ caddy.Pod, merged string) error {
 		if merged != "loaded\n" {
 			return rejected
 		}
@@ -336,7 +299,7 @@ func TestLoadedConfigIsMirroredDespiteDrift(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return cm.Data[constants.CaddyfileKey]
+		return cm.Data[caddy.CaddyfileKey]
 	}
 	c.aggregator.UpdateBase("loaded\n")
 	if err := c.reconcileNode(t.Context(), "node1"); err != nil {

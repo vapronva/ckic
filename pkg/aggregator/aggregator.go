@@ -16,7 +16,7 @@ import (
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	"k8s.io/client-go/kubernetes"
 
-	"git.horse/vapronva/ckic/pkg/constants"
+	"git.horse/vapronva/ckic/pkg/caddy"
 )
 
 const (
@@ -132,17 +132,17 @@ func (a *Aggregator) InitializeMirror(ctx context.Context, bootstrap string) err
 	if apierrors.IsNotFound(err) {
 		mirror, err = configMaps.Create(ctx, &corev1.ConfigMap{
 			Name: a.mirrorName, Namespace: a.namespace,
-			Labels: constants.AggregatedConfigLabels(),
-			Data:   map[string]string{constants.CaddyfileKey: bootstrap},
+			Labels: caddy.BootConfigLabels(),
+			Data:   map[string]string{caddy.CaddyfileKey: bootstrap},
 		}, metav1.CreateOptions{})
 		if apierrors.IsAlreadyExists(err) {
 			mirror, err = configMaps.Get(ctx, a.mirrorName, metav1.GetOptions{})
 		}
 	}
 	if err != nil {
-		return fmt.Errorf("failed to initialize boot ConfigMap: %w", err)
+		return fmt.Errorf("failed to initialize boot ConfigMap %s: %w", a.mirrorName, err)
 	}
-	accepted := mirror.Data[constants.CaddyfileKey]
+	accepted := mirror.Data[caddy.CaddyfileKey]
 	if strings.TrimSpace(accepted) == "" {
 		accepted = bootstrap
 		if err := a.publishMirror(ctx, accepted); err != nil {
@@ -156,13 +156,10 @@ func (a *Aggregator) InitializeMirror(ctx context.Context, bootstrap string) err
 	return nil
 }
 
-func (a *Aggregator) CurrentAccepted() (string, error) {
+func (a *Aggregator) CurrentAccepted() (string, bool) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	if !a.hasAccepted {
-		return "", errors.New("boot ConfigMap has not been initialized")
-	}
-	return a.accepted, nil
+	return a.accepted, a.hasAccepted
 }
 
 func (a *Aggregator) PublishAccepted(ctx context.Context, snapshot Snapshot) error {
@@ -188,23 +185,23 @@ func (a *Aggregator) PublishAccepted(ctx context.Context, snapshot Snapshot) err
 func (a *Aggregator) PublishMirror(ctx context.Context) error {
 	a.publishMu.Lock()
 	defer a.publishMu.Unlock()
-	accepted, err := a.CurrentAccepted()
-	if err != nil {
-		return err
+	accepted, ok := a.CurrentAccepted()
+	if !ok {
+		return fmt.Errorf("boot ConfigMap %s has not been initialized", a.mirrorName)
 	}
 	return a.publishMirror(ctx, accepted)
 }
 
 func (a *Aggregator) publishMirror(ctx context.Context, accepted string) error {
 	apply := corev1ac.ConfigMap(a.mirrorName, a.namespace).
-		WithLabels(constants.AggregatedConfigLabels()).
-		WithData(map[string]string{constants.CaddyfileKey: accepted})
+		WithLabels(caddy.BootConfigLabels()).
+		WithData(map[string]string{caddy.CaddyfileKey: accepted})
 	ctx, cancel := context.WithTimeout(ctx, mirrorPublishTimeout)
 	defer cancel()
 	if _, err := a.clientset.CoreV1().ConfigMaps(a.namespace).Apply(
 		ctx, apply, metav1.ApplyOptions{FieldManager: mirrorFieldManager, Force: true},
 	); err != nil {
-		return fmt.Errorf("failed to publish mirror ConfigMap: %w", err)
+		return fmt.Errorf("failed to publish boot ConfigMap %s: %w", a.mirrorName, err)
 	}
 	return nil
 }

@@ -17,8 +17,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	"k8s.io/client-go/kubernetes"
-
-	"git.horse/vapronva/ckic/pkg/constants"
 )
 
 const (
@@ -31,7 +29,7 @@ const (
 
 func prePullImage(ctx context.Context, opts DeployOptions, nodeName string, logger zerolog.Logger) error {
 	podName := prePullPodName(nodeName)
-	logger = logger.With().Str("prepullPod", podName).Str("image", opts.CaddyImage).Logger()
+	logger = logger.With().Str("pod", podName).Str("image", opts.CaddyImage).Logger()
 	if err := deletePrePullPod(ctx, opts.Clientset, opts.Namespace, podName, nil); err != nil {
 		return err
 	}
@@ -58,9 +56,9 @@ func prePullImage(ctx context.Context, opts DeployOptions, nodeName string, logg
 func prePullPodApplyConfig(opts DeployOptions, nodeName string) *corev1ac.PodApplyConfiguration {
 	return corev1ac.Pod(prePullPodName(nodeName), opts.Namespace).
 		WithLabels(map[string]string{
-			constants.LabelCaddyManaged: constants.LabelManagedValue,
-			constants.LabelType:         constants.LabelTypeImagePrePull,
-			constants.LabelInstance:     nodeName,
+			labelCaddyManaged: labelManagedValue,
+			labelType:         labelTypePrePull,
+			labelInstance:     nodeName,
 		}).
 		WithSpec(corev1ac.PodSpec().
 			WithAffinity(nodeNameAffinity(nodeName)).
@@ -172,8 +170,8 @@ func ReapPrePullPods(ctx context.Context, clientset kubernetes.Interface, namesp
 	defer cancel()
 	pods, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: labels.SelectorFromSet(labels.Set{
-			constants.LabelCaddyManaged: constants.LabelManagedValue,
-			constants.LabelType:         constants.LabelTypeImagePrePull,
+			labelCaddyManaged: labelManagedValue,
+			labelType:         labelTypePrePull,
 		}).String(),
 	})
 	if err != nil {

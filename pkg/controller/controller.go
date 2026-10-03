@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -21,8 +20,6 @@ import (
 
 	"git.horse/vapronva/ckic/pkg/aggregator"
 	"git.horse/vapronva/ckic/pkg/caddy"
-	"git.horse/vapronva/ckic/pkg/constants"
-	"git.horse/vapronva/ckic/pkg/utils"
 )
 
 type Config struct {
@@ -32,7 +29,7 @@ type Config struct {
 	Namespace                    string
 	ConfigResyncInterval         time.Duration
 	ForceReload                  bool
-	ExternalEndpoints            utils.ExternalEndpointsMap
+	ExternalEndpoints            map[string][]string
 	ExternalEnable               bool
 	ExternalLabel                string
 	ExternalAllowNamespaces      []string
@@ -41,7 +38,7 @@ type Config struct {
 }
 
 const (
-	mirrorRepairKey           = "\x00mirror-repair"
+	mirrorRepairKey           = "mirror/repair"
 	workerCount               = 4
 	reconcileTimeout          = 5 * time.Minute
 	informerResync            = 10 * time.Minute
@@ -57,7 +54,7 @@ type Controller struct {
 	clientset         kubernetes.Interface
 	config            Config
 	deployOpts        caddy.DeployOptions
-	adminConfig       *caddy.AdminAPIConfig
+	admin             *caddy.Admin
 	aggregator        *aggregator.Aggregator
 	nodeSelector      labels.Selector
 	allowedNamespaces map[string]struct{}
@@ -71,8 +68,8 @@ type Controller struct {
 	queue             workqueue.TypedRateLimitingInterface[string]
 	pushMu            sync.Mutex
 	pushState         map[string]pushRecord
-	deployFn          func(context.Context, caddy.DeployOptions, string, []string) (*caddy.Instance, error)
-	pushFn            func(context.Context, *caddy.Instance, string) error
+	deployFn          func(context.Context, caddy.DeployOptions, string, []string) (caddy.Pod, error)
+	pushFn            func(context.Context, caddy.Pod, string) error
 }
 
 func NewController(clientset kubernetes.Interface, config Config) (*Controller, error) {
@@ -84,21 +81,20 @@ func NewController(clientset kubernetes.Interface, config Config) (*Controller, 
 	deployOpts.Clientset = clientset
 	deployOpts.Namespace = config.Namespace
 	deployOpts.ConfigMapName = config.ExternalAggregatedConfigName
+	admin := caddy.NewAdmin(config.Deploy.CaddyAdminOriginKey, config.ForceReload)
 	c := &Controller{
 		clientset:         clientset,
 		config:            config,
 		deployOpts:        deployOpts,
-		adminConfig:       caddy.NewAdminAPIConfig(config.Deploy.CaddyAdminOriginKey, config.ForceReload),
+		admin:             admin,
 		nodeSelector:      selector,
 		allowedNamespaces: namespaceSet(config.ExternalAllowNamespaces),
 		deniedNamespaces:  namespaceSet(config.ExternalDenyNamespaces),
+		queue:             workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
 		pushState:         make(map[string]pushRecord),
 		deployFn:          caddy.EnsureCaddy,
+		pushFn:            admin.Load,
 	}
-	c.pushFn = func(ctx context.Context, instance *caddy.Instance, merged string) error {
-		return instance.UpdateConfig(ctx, merged, c.adminConfig)
-	}
-	c.queue = workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]())
 	c.aggregator = aggregator.New(clientset, config.Namespace, config.ExternalAggregatedConfigName, c.enqueueManagedNodes)
 	if err := c.setupInformers(); err != nil {
 		c.queue.ShutDown()
@@ -115,16 +111,8 @@ func validateConfig(config Config) (Config, labels.Selector, error) {
 	if config.ConfigResyncInterval < 0 {
 		return config, nil, errors.New("config resync interval cannot be negative")
 	}
-	envKeys := map[string]bool{
-		constants.PodNameEnvVar:  true,
-		constants.NodeNameEnvVar: true,
-		constants.PodIPEnvVar:    true,
-	}
-	for _, key := range config.Deploy.EnvSecretKeys {
-		if envKeys[key] {
-			return config, nil, fmt.Errorf("duplicate or reserved environment key %q", key)
-		}
-		envKeys[key] = true
+	if err := config.Deploy.Validate(); err != nil {
+		return config, nil, err
 	}
 	if config.ExternalEnable {
 		externalSelector, err := labels.Parse(config.ExternalLabel)
@@ -135,9 +123,6 @@ func validateConfig(config Config) (Config, labels.Selector, error) {
 			return config, nil, errors.New("external label selector must not be empty")
 		}
 		config.ExternalLabel = externalSelector.String()
-	}
-	if config.Deploy.UseHostNetwork && config.Deploy.EnableCiliumLB {
-		return config, nil, errors.New("cannot combine host networking with the cilium loadbalancer")
 	}
 	if config.ExternalAggregatedConfigName == "" {
 		return config, nil, errors.New("external aggregated config name must be set for accepted boot snapshots")
@@ -161,29 +146,20 @@ func (c *Controller) setupInformers() error {
 	c.nsFactory = informers.NewSharedInformerFactoryWithOptions(
 		c.clientset, informerResync, informers.WithNamespace(c.config.Namespace),
 	)
-	nodeInformer := c.nodeFactory.Core().V1().Nodes()
-	cmInformer := c.nsFactory.Core().V1().ConfigMaps()
-	deployInformer := c.nsFactory.Apps().V1().Deployments()
-	podInformer := c.nsFactory.Core().V1().Pods()
-	serviceInformer := c.nsFactory.Core().V1().Services()
-	c.nodeLister = nodeInformer.Lister()
-	c.deployLister = deployInformer.Lister()
-	c.addNodeHandler(nodeInformer.Informer())
-	c.addDeploymentHandler(deployInformer.Informer())
-	c.addPodHandler(podInformer.Informer())
-	c.addServiceHandler(serviceInformer.Informer())
-	c.cacheSyncs = []cache.InformerSynced{
-		nodeInformer.Informer().HasSynced,
-		cmInformer.Informer().HasSynced,
-		deployInformer.Informer().HasSynced,
-		podInformer.Informer().HasSynced,
-		serviceInformer.Informer().HasSynced,
-	}
-	if err := c.addConfigMapHandler(cmInformer.Informer()); err != nil {
+	nodes := c.nodeFactory.Core().V1().Nodes()
+	deployments := c.nsFactory.Apps().V1().Deployments()
+	c.nodeLister = nodes.Lister()
+	c.deployLister = deployments.Lister()
+	managed := c.managedObjectHandler()
+	err := errors.Join(
+		c.register(nodes.Informer(), c.nodeHandler()),
+		c.register(c.nsFactory.Core().V1().ConfigMaps().Informer(), c.configMapHandler()),
+		c.register(deployments.Informer(), managed),
+		c.register(c.nsFactory.Core().V1().Pods().Informer(), managed),
+		c.register(c.nsFactory.Core().V1().Services().Informer(), managed),
+	)
+	if err != nil || !c.config.ExternalEnable {
 		return err
-	}
-	if !c.config.ExternalEnable {
-		return nil
 	}
 	label := c.config.ExternalLabel
 	c.extFactory = informers.NewSharedInformerFactoryWithOptions(
@@ -192,30 +168,39 @@ func (c *Controller) setupInformers() error {
 			opts.LabelSelector = label
 		}),
 	)
-	return c.addExternalConfigMapHandler(c.extFactory.Core().V1().ConfigMaps().Informer())
+	return c.register(c.extFactory.Core().V1().ConfigMaps().Informer(), c.externalConfigMapHandler())
+}
+
+func (c *Controller) register(informer cache.SharedIndexInformer, handler cache.ResourceEventHandler) error {
+	registration, err := informer.AddEventHandler(handler)
+	if err != nil {
+		return err
+	}
+	c.cacheSyncs = append(c.cacheSyncs, registration.HasSynced)
+	return nil
+}
+
+func (c *Controller) isManagedNode(node *corev1.Node) bool {
+	return c.nodeSelector.Matches(labels.Set(node.Labels))
 }
 
 func (c *Controller) enqueueNodeIfManaged(node *corev1.Node) {
-	if c.nodeSelector.Matches(labels.Set(node.Labels)) {
+	if c.isManagedNode(node) {
 		c.queue.Add(node.Name)
 	}
 }
 
-func (c *Controller) addNodeHandler(informer cache.SharedIndexInformer) {
-	_, _ = informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+func (c *Controller) nodeHandler() cache.ResourceEventHandler {
+	return cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj any) {
 			if node, ok := obj.(*corev1.Node); ok {
 				c.enqueueNodeIfManaged(node)
 			}
 		},
 		UpdateFunc: func(oldObj, newObj any) {
-			oldNode, ok1 := oldObj.(*corev1.Node)
-			newNode, ok2 := newObj.(*corev1.Node)
-			if !ok2 {
-				return
-			}
-			if (ok1 && c.nodeSelector.Matches(labels.Set(oldNode.Labels))) ||
-				c.nodeSelector.Matches(labels.Set(newNode.Labels)) {
+			oldNode, isOldNode := oldObj.(*corev1.Node)
+			newNode, isNewNode := newObj.(*corev1.Node)
+			if isNewNode && (c.isManagedNode(newNode) || isOldNode && c.isManagedNode(oldNode)) {
 				c.queue.Add(newNode.Name)
 			}
 		},
@@ -224,10 +209,10 @@ func (c *Controller) addNodeHandler(informer cache.SharedIndexInformer) {
 				c.enqueueNodeIfManaged(node)
 			}
 		},
-	})
+	}
 }
 
-func (c *Controller) addConfigMapHandler(informer cache.SharedIndexInformer) error {
+func (c *Controller) configMapHandler() cache.ResourceEventHandler {
 	handle := func(obj any) {
 		cm, ok := obj.(*corev1.ConfigMap)
 		if !ok {
@@ -240,14 +225,14 @@ func (c *Controller) addConfigMapHandler(informer cache.SharedIndexInformer) err
 		if cm.Name != c.config.ConfigMapName {
 			return
 		}
-		data, exists := cm.Data[constants.CaddyfileKey]
+		data, exists := cm.Data[caddy.CaddyfileKey]
 		if !exists {
 			log.Warn().Str("configmap", cm.Name).Msg("Base ConfigMap has no Caddyfile; ignoring update")
 			return
 		}
 		c.aggregator.UpdateBase(data)
 	}
-	handler, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	return cache.ResourceEventHandlerFuncs{
 		AddFunc:    handle,
 		UpdateFunc: func(_, newObj any) { handle(newObj) },
 		DeleteFunc: func(obj any) {
@@ -262,36 +247,31 @@ func (c *Controller) addConfigMapHandler(informer cache.SharedIndexInformer) err
 				c.queue.Add(mirrorRepairKey)
 			}
 		},
-	})
-	if err != nil {
-		return err
 	}
-	c.cacheSyncs = append(c.cacheSyncs, handler.HasSynced)
-	return nil
 }
 
 func (c *Controller) enqueueChangedMirror(cm *corev1.ConfigMap) {
-	accepted, err := c.aggregator.CurrentAccepted()
-	if err == nil && cm.Data[constants.CaddyfileKey] != accepted {
+	accepted, ok := c.aggregator.CurrentAccepted()
+	if ok && cm.Data[caddy.CaddyfileKey] != accepted {
 		c.queue.Add(mirrorRepairKey)
 	}
 }
 
-func (c *Controller) addExternalConfigMapHandler(informer cache.SharedIndexInformer) error {
+func (c *Controller) externalConfigMapHandler() cache.ResourceEventHandler {
 	upsert := func(obj any) {
 		cm, ok := obj.(*corev1.ConfigMap)
 		if !ok || !c.namespaceAllowed(cm.Namespace) {
 			return
 		}
 		source := cm.Namespace + "/" + cm.Name
-		fragment, exists := cm.Data[constants.CaddyfileKey]
+		fragment, exists := cm.Data[caddy.CaddyfileKey]
 		if !exists {
 			c.aggregator.RemoveExternal(source)
 			return
 		}
 		c.aggregator.SetExternal(source, fragment)
 	}
-	handler, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	return cache.ResourceEventHandlerFuncs{
 		AddFunc:    upsert,
 		UpdateFunc: func(_, newObj any) { upsert(newObj) },
 		DeleteFunc: func(obj any) {
@@ -299,68 +279,24 @@ func (c *Controller) addExternalConfigMapHandler(informer cache.SharedIndexInfor
 				c.aggregator.RemoveExternal(cm.Namespace + "/" + cm.Name)
 			}
 		},
-	})
-	if err != nil {
-		return err
 	}
-	c.cacheSyncs = append(c.cacheSyncs, handler.HasSynced)
-	return nil
 }
 
-func (c *Controller) addPodHandler(informer cache.SharedIndexInformer) {
-	handle := func(obj any) {
-		pod, ok := tombstone[*corev1.Pod](obj)
-		if ok && pod.Spec.NodeName != "" &&
-			pod.Labels[constants.LabelApp] == constants.LabelAppValue &&
-			pod.Labels[constants.LabelCaddyManaged] == constants.LabelManagedValue {
-			c.queue.Add(pod.Spec.NodeName)
+func (c *Controller) managedObjectHandler() cache.ResourceEventHandler {
+	enqueue := func(obj any) {
+		object, ok := tombstone[metav1.Object](obj)
+		if !ok {
+			return
+		}
+		if nodeName := caddy.ManagedNodeName(object); nodeName != "" {
+			c.queue.Add(nodeName)
 		}
 	}
-	_, _ = informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    handle,
-		UpdateFunc: func(_, obj any) { handle(obj) },
-		DeleteFunc: handle,
-	})
-}
-
-func (c *Controller) addDeploymentHandler(informer cache.SharedIndexInformer) {
-	handle := func(obj any) {
-		if dep, ok := tombstone[*appsv1.Deployment](obj); ok {
-			c.enqueueManagedObject(dep)
-		}
+	return cache.ResourceEventHandlerFuncs{
+		AddFunc:    enqueue,
+		UpdateFunc: func(_, newObj any) { enqueue(newObj) },
+		DeleteFunc: enqueue,
 	}
-	_, _ = informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    handle,
-		UpdateFunc: func(_, obj any) { handle(obj) },
-		DeleteFunc: handle,
-	})
-}
-
-func (c *Controller) addServiceHandler(informer cache.SharedIndexInformer) {
-	handle := func(obj any) {
-		if service, ok := tombstone[*corev1.Service](obj); ok {
-			c.enqueueManagedObject(service)
-		}
-	}
-	_, _ = informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    handle,
-		UpdateFunc: func(_, obj any) { handle(obj) },
-		DeleteFunc: handle,
-	})
-}
-
-func (c *Controller) enqueueManagedObject(obj metav1.Object) {
-	if nodeName := managedNodeName(obj); nodeName != "" {
-		c.queue.Add(nodeName)
-	}
-}
-
-func managedNodeName(obj metav1.Object) string {
-	objLabels := obj.GetLabels()
-	if objLabels[constants.LabelCaddyManaged] != constants.LabelManagedValue {
-		return ""
-	}
-	return objLabels[constants.LabelInstance]
 }
 
 func (c *Controller) namespaceAllowed(namespace string) bool {
@@ -382,7 +318,7 @@ func (c *Controller) Run(ctx context.Context) error {
 	defer cancel()
 	defer c.queue.ShutDown()
 	logger := log.With().Str("component", "controller").Logger()
-	if err := c.aggregator.InitializeMirror(ctx, bootstrapAdminCaddyfile(c.config.Deploy.CaddyAdminOriginKey)); err != nil {
+	if err := c.aggregator.InitializeMirror(ctx, c.admin.BootstrapCaddyfile()); err != nil {
 		return err
 	}
 	stopCh := ctx.Done()
@@ -438,17 +374,6 @@ func (c *Controller) enqueueManagedNodes() {
 	for _, node := range nodes {
 		c.queue.Add(node.Name)
 	}
-}
-
-func bootstrapAdminCaddyfile(originKey string) string {
-	admin := "\tadmin :2019\n"
-	if originKey != "" {
-		admin = fmt.Sprintf(
-			"\tadmin :2019 {\n\t\torigins http://%s.caddy-admin-api.ckic.cmld.ru\n\t\tenforce_origin\n\t}\n",
-			originKey,
-		)
-	}
-	return fmt.Sprintf("{\n%s}\n", admin)
 }
 
 func tombstone[T any](obj any) (T, bool) {
