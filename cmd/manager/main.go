@@ -109,7 +109,7 @@ func parseFlags() options {
 	pflag.BoolVar(&cfg.ForceReload, "force-reload", false, "force Caddy to reload on every push even when the config is unchanged")
 	pflag.StringVar(&opts.healthBindAddress, "health-bind-address", ":8081", "Address where health and readiness probes are served (set empty to disable)")
 	pflag.StringVar(&opts.logLevel, "log-level", "info", "Log level (trace, debug, info, warn, error, fatal, panic, disabled)")
-	pflag.StringVar(&deploy.CaddyImage, "caddy-image", "docker.horse/oss-images/zerossl-caddy/caddy:2.11.4-alpine", "Caddy image (format image:tag)")
+	pflag.StringVar(&deploy.CaddyImage, "caddy-image", "docker.horse/oss-images/zerossl-caddy/caddy:2.11.7-alpine", "Caddy image (format image:tag)")
 	pflag.StringVar(&opts.imagePullPolicy, "image-pull-policy", "IfNotPresent", "ImagePullPolicy for deployed Caddy pods (Always, IfNotPresent, Never)")
 	pflag.BoolVar(&deploy.PrePullImage, "prepull-image", true, "Pre-pull the Caddy image on a node before creating or updating its Deployment")
 	pflag.StringVar(&opts.loadBalancerMode, "loadbalancer-mode", "none", "LoadBalancer strategy: none, or cilium (one LB per node)")
