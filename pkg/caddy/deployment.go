@@ -61,7 +61,7 @@ var podFieldEnvVars = []struct{ name, fieldPath string }{
 type DeployOptions struct {
 	Clientset           kubernetes.Interface
 	Namespace           string
-	ConfigMapName       string
+	BootConfigMapName   string
 	CaddyImage          string
 	ImagePullPolicy     corev1.PullPolicy
 	PrePullImage        bool
@@ -84,6 +84,9 @@ type Pod struct {
 func (o DeployOptions) Validate() error {
 	if o.UseHostNetwork && o.EnableCiliumLB {
 		return errors.New("cannot combine host networking with the cilium loadbalancer")
+	}
+	if len(o.EnvSecretKeys) > 0 && o.EnvSecretName == "" {
+		return fmt.Errorf("environment keys %q require an environment secret", o.EnvSecretKeys)
 	}
 	envKeys := make(map[string]bool)
 	for _, env := range podFieldEnvVars {
@@ -227,11 +230,9 @@ func adminProbe(originKey, path string, periodSeconds, failureThreshold int32) *
 
 func caddyEnvVars(opts DeployOptions) []*corev1ac.EnvVarApplyConfiguration {
 	var envVars []*corev1ac.EnvVarApplyConfiguration
-	if opts.EnvSecretName != "" {
-		for _, key := range opts.EnvSecretKeys {
-			envVars = append(envVars, corev1ac.EnvVar().WithName(key).WithValueFrom(corev1ac.EnvVarSource().
-				WithSecretKeyRef(corev1ac.SecretKeySelector().WithName(opts.EnvSecretName).WithKey(key))))
-		}
+	for _, key := range opts.EnvSecretKeys {
+		envVars = append(envVars, corev1ac.EnvVar().WithName(key).WithValueFrom(corev1ac.EnvVarSource().
+			WithSecretKeyRef(corev1ac.SecretKeySelector().WithName(opts.EnvSecretName).WithKey(key))))
 	}
 	for _, env := range podFieldEnvVars {
 		envVars = append(envVars, corev1ac.EnvVar().WithName(env.name).WithValueFrom(corev1ac.EnvVarSource().
@@ -243,7 +244,7 @@ func caddyEnvVars(opts DeployOptions) []*corev1ac.EnvVarApplyConfiguration {
 func caddyVolumes(opts DeployOptions) []*corev1ac.VolumeApplyConfiguration {
 	return []*corev1ac.VolumeApplyConfiguration{
 		corev1ac.Volume().WithName(volumeNameCaddyConfig).
-			WithConfigMap(corev1ac.ConfigMapVolumeSource().WithName(opts.ConfigMapName).
+			WithConfigMap(corev1ac.ConfigMapVolumeSource().WithName(opts.BootConfigMapName).
 				WithItems(corev1ac.KeyToPath().WithKey(CaddyfileKey).WithPath(CaddyfileKey))),
 		storageVolume(volumeNameData, opts.DataVolumePVC, "/opt/cmld/caddy/data"),
 		storageVolume(volumeNameConfig, opts.ConfigVolumePVC, "/opt/cmld/caddy/config"),

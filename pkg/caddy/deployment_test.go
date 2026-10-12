@@ -44,7 +44,7 @@ func TestEnsureCaddyModeTransitions(t *testing.T) {
 		&corev1.Service{Name: "caddy-node1-lb", Namespace: testNS, Labels: ManagedLabels(testNode)},
 		&corev1.Service{Name: "caddy-loadbalancer", Namespace: testNS},
 	)
-	opts := DeployOptions{Clientset: client, Namespace: testNS, CaddyImage: testImage, ImagePullPolicy: corev1.PullIfNotPresent, ConfigMapName: "caddy-config"}
+	opts := DeployOptions{Clientset: client, Namespace: testNS, CaddyImage: testImage, ImagePullPolicy: corev1.PullIfNotPresent, BootConfigMapName: "caddy-config"}
 	for _, mode := range []struct {
 		name                string
 		cilium, hostNetwork bool

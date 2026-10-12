@@ -24,7 +24,7 @@ import (
 
 func newTestController(t *testing.T, client kubernetes.Interface) *Controller {
 	t.Helper()
-	c, err := NewController(client, Config{ConfigMapName: "caddy-config", Namespace: "caddy-system", ExternalAggregatedConfigName: "merged"})
+	c, err := NewController(client, Config{BaseConfigMapName: "caddy-config", Namespace: "caddy-system", BootConfigMapName: "merged"})
 	if err != nil {
 		t.Fatalf("NewController: %v", err)
 	}
@@ -43,8 +43,8 @@ func TestReconcileNodePushesOnlyWhenNeeded(t *testing.T) {
 	t.Parallel()
 	client := fake.NewClientset()
 	c, err := NewController(client, Config{
-		Namespace: "system", ConfigMapName: "base",
-		ExternalAggregatedConfigName: "merged",
+		Namespace: "system", BaseConfigMapName: "base",
+		BootConfigMapName: "merged",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -130,8 +130,8 @@ func TestRunWaitsForBaseAndPushesAllConfigFragments(t *testing.T) {
 		&corev1.ConfigMap{Name: "external", Namespace: "team", Labels: map[string]string{"aggregate": "true"}, Data: map[string]string{caddy.CaddyfileKey: "external"}},
 	)
 	c, err := NewController(client, Config{
-		Namespace: "system", ConfigMapName: "base", ExternalEnable: true, ExternalLabel: "aggregate=true",
-		ExternalAggregatedConfigName: "merged",
+		Namespace: "system", BaseConfigMapName: "base", ExternalEnable: true, ExternalLabel: "aggregate=true",
+		BootConfigMapName: "merged",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -167,15 +167,27 @@ func TestRunWaitsForBaseAndPushesAllConfigFragments(t *testing.T) {
 	}, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
+	var loaded string
 	select {
-	case config := <-pushed:
-		if !strings.HasPrefix(config, "base\n") || !strings.Contains(config, "external") {
-			t.Fatalf("initial config omitted informer data: %q", config)
-		}
+	case loaded = <-pushed:
 	case err := <-done:
 		t.Fatalf("Run exited: %v", err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("initial config was not pushed")
+	}
+	if !strings.HasPrefix(loaded, "base\n") || !strings.Contains(loaded, "external") {
+		t.Fatalf("initial config omitted informer data: %q", loaded)
+	}
+	for {
+		mirror, err := client.CoreV1().ConfigMaps("system").Get(ctx, "merged", metav1.GetOptions{})
+		if err == nil && mirror.Data[caddy.CaddyfileKey] == loaded {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("loaded config was not published as the boot snapshot")
+		case <-ticker.C:
+		}
 	}
 	cancel()
 	select {
@@ -228,53 +240,7 @@ func TestManagedResourceEventsEnqueueNode(t *testing.T) {
 	}
 }
 
-func TestMirrorRetryDoesNotReloadCaddy(t *testing.T) {
-	t.Parallel()
-	client := fake.NewClientset()
-	c := newTestController(t, client)
-	addNode(t, c)
-	if err := c.aggregator.InitializeMirror(t.Context(), "bootstrap"); err != nil {
-		t.Fatal(err)
-	}
-	c.aggregator.UpdateBase("accepted\n")
-	c.deployFn = func(context.Context, caddy.DeployOptions, string, []string) (caddy.Pod, error) {
-		return caddy.Pod{IP: "192.0.2.1", ContainerID: "container-1"}, nil
-	}
-	pushes := 0
-	c.pushFn = func(context.Context, caddy.Pod, string) error { pushes++; return nil }
-	writeError := apierrors.NewForbidden(corev1.Resource("configmaps"), "merged", errors.New("patch denied"))
-	shouldFail := true
-	client.PrependReactor("patch", "configmaps", func(clienttesting.Action) (bool, runtime.Object, error) {
-		if shouldFail {
-			return true, nil, writeError
-		}
-		return false, nil, nil
-	})
-	for range 2 {
-		if err := c.reconcileNode(t.Context(), "node1"); !errors.Is(err, writeError) {
-			t.Fatalf("mirror write failure = %v", err)
-		}
-	}
-	if pushes != 1 {
-		t.Fatalf("mirror failure caused %d Caddy reloads, want 1", pushes)
-	}
-	shouldFail = false
-	if err := c.reconcileNode(t.Context(), "node1"); err != nil {
-		t.Fatal(err)
-	}
-	mirror, err := client.CoreV1().ConfigMaps(c.config.Namespace).Get(t.Context(), "merged", metav1.GetOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if mirror.Data[caddy.CaddyfileKey] != "accepted\n" {
-		t.Fatal("mirror retry did not persist the accepted config")
-	}
-	if pushes != 1 {
-		t.Fatal("mirror recovery reloaded an unchanged Caddy config")
-	}
-}
-
-func TestLoadedConfigIsMirroredDespiteDrift(t *testing.T) {
+func TestBootSnapshotKeepsLoadedConfigAcrossWriteFailures(t *testing.T) {
 	t.Parallel()
 	client := fake.NewClientset()
 	c := newTestController(t, client)
@@ -286,32 +252,45 @@ func TestLoadedConfigIsMirroredDespiteDrift(t *testing.T) {
 		return caddy.Pod{IP: "192.0.2.1", ContainerID: "container-1"}, nil
 	}
 	rejected := errors.New("Caddy rejected config")
+	pushes := 0
 	c.pushFn = func(_ context.Context, _ caddy.Pod, merged string) error {
+		pushes++
 		if merged != "loaded\n" {
 			return rejected
 		}
 		c.aggregator.UpdateBase("broken\n")
 		return nil
 	}
-	mirror := func() string {
-		t.Helper()
-		cm, err := client.CoreV1().ConfigMaps(c.config.Namespace).Get(t.Context(), "merged", metav1.GetOptions{})
-		if err != nil {
-			t.Fatal(err)
+	writeError := apierrors.NewServiceUnavailable("etcd unavailable")
+	isWriteFailing := true
+	client.PrependReactor("patch", "configmaps", func(clienttesting.Action) (bool, runtime.Object, error) {
+		if isWriteFailing {
+			return true, nil, writeError
 		}
-		return cm.Data[caddy.CaddyfileKey]
-	}
+		return false, nil, nil
+	})
 	c.aggregator.UpdateBase("loaded\n")
 	if err := c.reconcileNode(t.Context(), "node1"); err != nil {
 		t.Fatal(err)
 	}
-	if got := mirror(); got != "loaded\n" {
-		t.Fatalf("boot snapshot = %q, want the config Caddy loaded", got)
+	if err := c.reconcile(t.Context(), mirrorKey); !errors.Is(err, writeError) {
+		t.Fatalf("boot snapshot write = %v", err)
 	}
 	if err := c.reconcileNode(t.Context(), "node1"); !errors.Is(err, rejected) {
 		t.Fatalf("reconcile of rejected config = %v", err)
 	}
-	if got := mirror(); got != "loaded\n" {
-		t.Fatalf("boot snapshot = %q after a rejected push", got)
+	isWriteFailing = false
+	if err := c.reconcile(t.Context(), mirrorKey); err != nil {
+		t.Fatal(err)
+	}
+	mirror, err := client.CoreV1().ConfigMaps(c.config.Namespace).Get(t.Context(), "merged", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := mirror.Data[caddy.CaddyfileKey]; got != "loaded\n" {
+		t.Fatalf("boot snapshot = %q, want the config Caddy loaded", got)
+	}
+	if pushes != 2 {
+		t.Fatalf("pushes = %d, want 2: boot snapshot retries must not reload Caddy", pushes)
 	}
 }

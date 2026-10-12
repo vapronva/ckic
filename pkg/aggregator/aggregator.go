@@ -31,12 +31,10 @@ type Snapshot struct {
 
 type Aggregator struct {
 	mu               sync.RWMutex
-	publishMu        sync.Mutex
 	base             string
 	hasBase          bool
 	revision         uint64
 	accepted         string
-	hasAccepted      bool
 	acceptedRevision uint64
 	externals        map[string]string
 	clientset        kubernetes.Interface
@@ -151,7 +149,6 @@ func (a *Aggregator) InitializeMirror(ctx context.Context, bootstrap string) err
 	}
 	a.mu.Lock()
 	a.accepted = accepted
-	a.hasAccepted = true
 	a.mu.Unlock()
 	return nil
 }
@@ -159,32 +156,21 @@ func (a *Aggregator) InitializeMirror(ctx context.Context, bootstrap string) err
 func (a *Aggregator) CurrentAccepted() (string, bool) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return a.accepted, a.hasAccepted
+	return a.accepted, a.accepted != ""
 }
 
-func (a *Aggregator) PublishAccepted(ctx context.Context, snapshot Snapshot) error {
-	a.publishMu.Lock()
-	defer a.publishMu.Unlock()
-	a.mu.RLock()
-	isSuperseded := snapshot.Revision <= a.acceptedRevision
-	a.mu.RUnlock()
-	if isSuperseded {
-		return nil
-	}
-	if err := a.publishMirror(ctx, snapshot.Caddyfile); err != nil {
-		return err
-	}
+func (a *Aggregator) Accept(snapshot Snapshot) bool {
 	a.mu.Lock()
+	defer a.mu.Unlock()
+	if snapshot.Revision <= a.acceptedRevision {
+		return false
+	}
 	a.accepted = snapshot.Caddyfile
-	a.hasAccepted = true
 	a.acceptedRevision = snapshot.Revision
-	a.mu.Unlock()
-	return nil
+	return true
 }
 
 func (a *Aggregator) PublishMirror(ctx context.Context) error {
-	a.publishMu.Lock()
-	defer a.publishMu.Unlock()
 	accepted, ok := a.CurrentAccepted()
 	if !ok {
 		return fmt.Errorf("boot ConfigMap %s has not been initialized", a.mirrorName)

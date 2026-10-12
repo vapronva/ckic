@@ -86,9 +86,6 @@ func prePullPodApplyConfig(opts DeployOptions, nodeName string) *corev1ac.PodApp
 func waitForImagePulled(ctx context.Context, clientset kubernetes.Interface, namespace, podName string) error {
 	return wait.PollUntilContextTimeout(ctx, imagePrePullPollDelay, imagePrePullTimeout, true,
 		func(ctx context.Context) (bool, error) {
-			if err := ctx.Err(); err != nil {
-				return false, err
-			}
 			pod, err := clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
 			if isTransientPrePullError(err) {
 				return false, nil

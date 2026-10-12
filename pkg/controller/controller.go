@@ -23,22 +23,22 @@ import (
 )
 
 type Config struct {
-	Deploy                       caddy.DeployOptions
-	NodeLabel                    string
-	ConfigMapName                string
-	Namespace                    string
-	ConfigResyncInterval         time.Duration
-	ForceReload                  bool
-	ExternalEndpoints            map[string][]string
-	ExternalEnable               bool
-	ExternalLabel                string
-	ExternalAllowNamespaces      []string
-	ExternalDenyNamespaces       []string
-	ExternalAggregatedConfigName string
+	Deploy                  caddy.DeployOptions
+	NodeLabel               string
+	BaseConfigMapName       string
+	BootConfigMapName       string
+	Namespace               string
+	ConfigResyncInterval    time.Duration
+	ForceReload             bool
+	ExternalEndpoints       map[string][]string
+	ExternalEnable          bool
+	ExternalLabel           string
+	ExternalAllowNamespaces []string
+	ExternalDenyNamespaces  []string
 }
 
 const (
-	mirrorRepairKey           = "mirror/repair"
+	mirrorKey                 = "mirror/publish"
 	workerCount               = 4
 	reconcileTimeout          = 5 * time.Minute
 	informerResync            = 10 * time.Minute
@@ -80,7 +80,7 @@ func NewController(clientset kubernetes.Interface, config Config) (*Controller, 
 	deployOpts := config.Deploy
 	deployOpts.Clientset = clientset
 	deployOpts.Namespace = config.Namespace
-	deployOpts.ConfigMapName = config.ExternalAggregatedConfigName
+	deployOpts.BootConfigMapName = config.BootConfigMapName
 	admin := caddy.NewAdmin(config.Deploy.CaddyAdminOriginKey, config.ForceReload)
 	c := &Controller{
 		clientset:         clientset,
@@ -95,7 +95,7 @@ func NewController(clientset kubernetes.Interface, config Config) (*Controller, 
 		deployFn:          caddy.EnsureCaddy,
 		pushFn:            admin.Load,
 	}
-	c.aggregator = aggregator.New(clientset, config.Namespace, config.ExternalAggregatedConfigName, c.enqueueManagedNodes)
+	c.aggregator = aggregator.New(clientset, config.Namespace, config.BootConfigMapName, c.enqueueManagedNodes)
 	if err := c.setupInformers(); err != nil {
 		c.queue.ShutDown()
 		return nil, err
@@ -124,10 +124,10 @@ func validateConfig(config Config) (Config, labels.Selector, error) {
 		}
 		config.ExternalLabel = externalSelector.String()
 	}
-	if config.ExternalAggregatedConfigName == "" {
+	if config.BootConfigMapName == "" {
 		return config, nil, errors.New("external aggregated config name must be set for accepted boot snapshots")
 	}
-	if config.ExternalAggregatedConfigName == config.ConfigMapName {
+	if config.BootConfigMapName == config.BaseConfigMapName {
 		return config, nil, errors.New("external aggregated config name must differ from the base config-map name")
 	}
 	return config, selector, nil
@@ -218,11 +218,11 @@ func (c *Controller) configMapHandler() cache.ResourceEventHandler {
 		if !ok {
 			return
 		}
-		if cm.Name == c.config.ExternalAggregatedConfigName {
+		if cm.Name == c.config.BootConfigMapName {
 			c.enqueueChangedMirror(cm)
 			return
 		}
-		if cm.Name != c.config.ConfigMapName {
+		if cm.Name != c.config.BaseConfigMapName {
 			return
 		}
 		data, exists := cm.Data[caddy.CaddyfileKey]
@@ -240,11 +240,11 @@ func (c *Controller) configMapHandler() cache.ResourceEventHandler {
 			if !ok {
 				return
 			}
-			if cm.Name == c.config.ConfigMapName {
+			if cm.Name == c.config.BaseConfigMapName {
 				log.Warn().Str("configmap", cm.Name).Msg("Base ConfigMap deleted; keeping last known configuration")
 			}
-			if cm.Name == c.config.ExternalAggregatedConfigName {
-				c.queue.Add(mirrorRepairKey)
+			if cm.Name == c.config.BootConfigMapName {
+				c.queue.Add(mirrorKey)
 			}
 		},
 	}
@@ -253,7 +253,7 @@ func (c *Controller) configMapHandler() cache.ResourceEventHandler {
 func (c *Controller) enqueueChangedMirror(cm *corev1.ConfigMap) {
 	accepted, ok := c.aggregator.CurrentAccepted()
 	if ok && cm.Data[caddy.CaddyfileKey] != accepted {
-		c.queue.Add(mirrorRepairKey)
+		c.queue.Add(mirrorKey)
 	}
 }
 

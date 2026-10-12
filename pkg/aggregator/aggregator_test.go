@@ -68,32 +68,31 @@ func TestBootMirrorKeepsAcceptedSnapshot(t *testing.T) {
 		}
 		return snapshot
 	}
+	publish := func() {
+		t.Helper()
+		if err := agg.PublishMirror(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
 	checkMirror(bootstrap)
 	candidate := updateBase("candidate\n")
-	if err := agg.PublishMirror(t.Context()); err != nil {
-		t.Fatal(err)
-	}
+	publish()
 	checkMirror(bootstrap)
-	if err := agg.PublishAccepted(t.Context(), candidate); err != nil {
-		t.Fatal(err)
+	if !agg.Accept(candidate) {
+		t.Fatal("first loaded snapshot was not accepted")
 	}
+	publish()
 	checkMirror("candidate\n")
-	actions := len(client.Actions())
-	if err := agg.PublishAccepted(t.Context(), candidate); err != nil {
-		t.Fatal(err)
-	}
-	if len(client.Actions()) != actions {
-		t.Fatal("unchanged accepted snapshot was republished")
+	if agg.Accept(candidate) {
+		t.Fatal("unchanged accepted snapshot was accepted again")
 	}
 	newer := updateBase("newer\n")
 	updateBase("rejected-by-caddy\n")
-	if err := agg.PublishAccepted(t.Context(), newer); err != nil {
-		t.Fatal(err)
+	agg.Accept(newer)
+	if agg.Accept(candidate) {
+		t.Fatal("older snapshot replaced a newer accepted one")
 	}
-	checkMirror("newer\n")
-	if err := agg.PublishAccepted(t.Context(), candidate); err != nil {
-		t.Fatal(err)
-	}
+	publish()
 	checkMirror("newer\n")
 	restarted := aggregator.New(client, "system", "accepted", nil)
 	if err := restarted.InitializeMirror(t.Context(), bootstrap); err != nil {

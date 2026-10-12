@@ -44,7 +44,7 @@ func logReconcileError(key string, err error, requeues int) {
 func (c *Controller) reconcile(ctx context.Context, key string) error {
 	ctx, cancel := context.WithTimeout(ctx, reconcileTimeout)
 	defer cancel()
-	if key == mirrorRepairKey {
+	if key == mirrorKey {
 		return c.aggregator.PublishMirror(ctx)
 	}
 	return c.reconcileNode(ctx, key)
@@ -70,7 +70,10 @@ func (c *Controller) reconcileNode(ctx context.Context, nodeName string) error {
 	if err != nil || !isLoaded {
 		return err
 	}
-	return c.aggregator.PublishAccepted(ctx, snapshot)
+	if c.aggregator.Accept(snapshot) {
+		c.queue.Add(mirrorKey)
+	}
+	return nil
 }
 
 func (c *Controller) ensureLoaded(ctx context.Context, nodeName string, pod caddy.Pod, snapshot aggregator.Snapshot) (bool, error) {
