@@ -70,9 +70,6 @@ func (a *Admin) Load(ctx context.Context, pod Pod, caddyfile string) error {
 	if err := json.Unmarshal(body, &adaptation); err != nil {
 		return fmt.Errorf("invalid Caddy adaptation response: %w", err)
 	}
-	if len(adaptation.Result) == 0 || bytes.Equal(adaptation.Result, []byte("null")) {
-		return errors.New("caddy adaptation response has no result")
-	}
 	if err := a.checkAdminReachable(adaptation.Result); err != nil {
 		return err
 	}
@@ -131,11 +128,7 @@ func (a *Admin) do(req *http.Request) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("caddy %s request failed: %w", req.URL.Path, err)
 	}
-	defer func() {
-		if err := resp.Body.Close(); err != nil {
-			log.Warn().Err(err).Str("host", req.URL.Host).Msg("Failed to close Caddy API response")
-		}
-	}()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read Caddy %s response: %w", req.URL.Path, err)

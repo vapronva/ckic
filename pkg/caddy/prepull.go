@@ -151,9 +151,8 @@ func prePullImagePresent(pod *corev1.Pod) (bool, error) {
 }
 
 func deletePrePullPod(ctx context.Context, clientset kubernetes.Interface, namespace, podName string, uid *types.UID) error {
-	gracePeriod := int64(0)
 	err := clientset.CoreV1().Pods(namespace).Delete(ctx, podName, metav1.DeleteOptions{
-		GracePeriodSeconds: &gracePeriod,
+		GracePeriodSeconds: new(int64(0)),
 		Preconditions:      &metav1.Preconditions{UID: uid},
 	})
 	if err == nil || apierrors.IsNotFound(err) || uid != nil && apierrors.IsConflict(err) {

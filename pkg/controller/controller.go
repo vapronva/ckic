@@ -53,7 +53,6 @@ type pushRecord struct {
 type Controller struct {
 	clientset         kubernetes.Interface
 	config            Config
-	deployOpts        caddy.DeployOptions
 	admin             *caddy.Admin
 	aggregator        *aggregator.Aggregator
 	nodeSelector      labels.Selector
@@ -77,15 +76,13 @@ func NewController(clientset kubernetes.Interface, config Config) (*Controller, 
 	if err != nil {
 		return nil, err
 	}
-	deployOpts := config.Deploy
-	deployOpts.Clientset = clientset
-	deployOpts.Namespace = config.Namespace
-	deployOpts.BootConfigMapName = config.BootConfigMapName
+	config.Deploy.Clientset = clientset
+	config.Deploy.Namespace = config.Namespace
+	config.Deploy.BootConfigMapName = config.BootConfigMapName
 	admin := caddy.NewAdmin(config.Deploy.CaddyAdminOriginKey, config.ForceReload)
 	c := &Controller{
 		clientset:         clientset,
 		config:            config,
-		deployOpts:        deployOpts,
 		admin:             admin,
 		nodeSelector:      selector,
 		allowedNamespaces: namespaceSet(config.ExternalAllowNamespaces),
@@ -314,8 +311,6 @@ func (c *Controller) namespaceAllowed(namespace string) bool {
 }
 
 func (c *Controller) Run(ctx context.Context) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
 	defer c.queue.ShutDown()
 	logger := log.With().Str("component", "controller").Logger()
 	if err := c.aggregator.InitializeMirror(ctx, c.admin.BootstrapCaddyfile()); err != nil {
@@ -345,7 +340,7 @@ func (c *Controller) Run(ctx context.Context) error {
 		wg.Go(func() { c.runConfigResync(stopCh) })
 	}
 	<-stopCh
-	logger.Info().Msg("Controller shutting down; draining workqueue")
+	logger.Info().Msg("Controller shutting down; waiting for workers")
 	c.queue.ShutDown()
 	wg.Wait()
 	logger.Info().Msg("Controller stopped")

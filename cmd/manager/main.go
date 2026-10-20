@@ -31,7 +31,6 @@ import (
 )
 
 const (
-	probeShutdownTimeout   = 5 * time.Second
 	probeReadHeaderTimeout = 10 * time.Second
 	leaderRunErrTimeout    = 30 * time.Second
 )
@@ -82,24 +81,15 @@ func run(opts options) error {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
-	readiness := &atomic.Bool{}
-	probeErrCh := startHealthProbeServer(ctx, opts.healthBindAddress, readiness)
-	log.Info().Msg("Starting CKIC manager")
-	runErrCh := make(chan error, 1)
-	go func() {
-		runErrCh <- runWithLeaderElection(ctx, clientset, opts.leaderElection, cfg.Namespace, ctrl, readiness)
-	}()
-	var runErr error
-	select {
-	case runErr = <-runErrCh:
-	case runErr = <-probeErrCh:
-		cancel()
-		<-runErrCh
+	if err := serveHealthProbes(ctx, opts.healthBindAddress); err != nil {
+		return err
 	}
-	if errors.Is(runErr, context.Canceled) {
+	log.Info().Msg("Starting CKIC manager")
+	err = runWithLeaderElection(ctx, clientset, opts.leaderElection, cfg.Namespace, ctrl)
+	if errors.Is(err, context.Canceled) {
 		return nil
 	}
-	return runErr
+	return err
 }
 
 func parseFlags() options {
@@ -234,10 +224,7 @@ func runWithLeaderElection(
 	le leaderElectionOptions,
 	namespace string,
 	ctrl *controller.Controller,
-	readiness *atomic.Bool,
 ) error {
-	readiness.Store(true)
-	defer readiness.Store(false)
 	if !le.enabled {
 		return ctrl.Run(ctx)
 	}
@@ -329,36 +316,22 @@ func leaderElectionIdentity() string {
 	return fmt.Sprintf("%s-%d", hostname, os.Getpid())
 }
 
-func startHealthProbeServer(ctx context.Context, bindAddress string, readiness *atomic.Bool) <-chan error {
-	errCh := make(chan error, 1)
+func serveHealthProbes(ctx context.Context, bindAddress string) error {
 	if bindAddress == "" {
-		return errCh
+		return nil
 	}
+	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", bindAddress)
+	if err != nil {
+		return fmt.Errorf("failed to start probe server: %w", err)
+	}
+	ok := func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "ok") }
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, "ok")
-	})
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
-		if !readiness.Load() {
-			http.Error(w, "not ready", http.StatusServiceUnavailable)
-			return
-		}
-		_, _ = io.WriteString(w, "ready")
-	})
-	server := &http.Server{Addr: bindAddress, Handler: mux, ReadHeaderTimeout: probeReadHeaderTimeout}
+	mux.HandleFunc("/healthz", ok)
+	mux.HandleFunc("/readyz", ok)
+	server := &http.Server{Handler: mux, ReadHeaderTimeout: probeReadHeaderTimeout}
+	log.Info().Str("bindAddress", listener.Addr().String()).Msg("Serving health probes")
 	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), probeShutdownTimeout)
-		defer cancel()
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			log.Warn().Err(err).Msg("Probe server shutdown returned error")
-		}
+		log.Error().Err(server.Serve(listener)).Msg("Probe server stopped")
 	}()
-	go func() {
-		log.Info().Str("bindAddress", bindAddress).Msg("Starting probe server")
-		if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
-			errCh <- fmt.Errorf("probe server failed: %w", err)
-		}
-	}()
-	return errCh
+	return nil
 }

@@ -94,7 +94,7 @@ func (c *Controller) ensureLoaded(ctx context.Context, nodeName string, pod cadd
 }
 
 func (c *Controller) deployOptionsForNode(nodeName string) caddy.DeployOptions {
-	opts := c.deployOpts
+	opts := c.config.Deploy
 	if opts.PrePullImage {
 		existing, err := c.deployLister.Deployments(c.config.Namespace).Get(caddy.DeploymentName(nodeName))
 		opts.PrePullImage = err != nil || caddyImageOf(existing) != opts.CaddyImage
@@ -110,7 +110,7 @@ func caddyImageOf(dep *appsv1.Deployment) string {
 }
 
 func (c *Controller) teardownNode(ctx context.Context, nodeName string) error {
-	if err := caddy.Teardown(ctx, c.deployOpts, nodeName); err != nil {
+	if err := caddy.Teardown(ctx, c.config.Deploy, nodeName); err != nil {
 		return err
 	}
 	c.clearPushState(nodeName)

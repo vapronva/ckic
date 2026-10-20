@@ -125,22 +125,10 @@ func (a *Aggregator) CurrentMerged() (Snapshot, error) {
 func (a *Aggregator) InitializeMirror(ctx context.Context, bootstrap string) error {
 	ctx, cancel := context.WithTimeout(ctx, mirrorPublishTimeout)
 	defer cancel()
-	configMaps := a.clientset.CoreV1().ConfigMaps(a.namespace)
-	mirror, err := configMaps.Get(ctx, a.mirrorName, metav1.GetOptions{})
-	if apierrors.IsNotFound(err) {
-		mirror, err = configMaps.Create(ctx, &corev1.ConfigMap{
-			Name: a.mirrorName, Namespace: a.namespace,
-			Labels: caddy.BootConfigLabels(),
-			Data:   map[string]string{caddy.CaddyfileKey: bootstrap},
-		}, metav1.CreateOptions{})
-		if apierrors.IsAlreadyExists(err) {
-			mirror, err = configMaps.Get(ctx, a.mirrorName, metav1.GetOptions{})
-		}
-	}
+	accepted, err := a.readMirror(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to initialize boot ConfigMap %s: %w", a.mirrorName, err)
+		return err
 	}
-	accepted := mirror.Data[caddy.CaddyfileKey]
 	if strings.TrimSpace(accepted) == "" {
 		accepted = bootstrap
 		if err := a.publishMirror(ctx, accepted); err != nil {
@@ -151,6 +139,17 @@ func (a *Aggregator) InitializeMirror(ctx context.Context, bootstrap string) err
 	a.accepted = accepted
 	a.mu.Unlock()
 	return nil
+}
+
+func (a *Aggregator) readMirror(ctx context.Context) (string, error) {
+	mirror, err := a.clientset.CoreV1().ConfigMaps(a.namespace).Get(ctx, a.mirrorName, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to read boot ConfigMap %s: %w", a.mirrorName, err)
+	}
+	return mirror.Data[caddy.CaddyfileKey], nil
 }
 
 func (a *Aggregator) CurrentAccepted() (string, bool) {
