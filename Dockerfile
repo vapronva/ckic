@@ -2,7 +2,7 @@ ARG TOOLS_IMAGE=docker.horse/ci/on-alpine/tools:1
 
 FROM $TOOLS_IMAGE AS tools
 
-FROM docker.io/library/golang:1.27.2-alpine AS build
+FROM docker.io/library/golang:1.27.3-alpine AS build
 
 WORKDIR /usr/src/app/ckic
 
@@ -12,14 +12,13 @@ ARG MIRROR_ALPINE_FALLBACK_URL=""
 
 ARG MIRROR_GO_URL=""
 
+ARG MIRROR_GO_FALLBACK_URL=""
+
 COPY --from=tools /usr/local/bin/pkg-base-setup /usr/local/bin/
 
-RUN pkg-base-setup && \
-    apk add --no-cache git
+RUN pkg-base-setup
 
 COPY go.mod go.sum ./
-
-RUN if [ -n "$MIRROR_GO_URL" ]; then go env -w GOPROXY="${MIRROR_GO_URL%/}|https://proxy.golang.org,direct"; fi
 
 RUN go mod download
 
