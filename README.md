@@ -17,7 +17,7 @@ flowchart LR
         Aggregator["<b><code>pkg/aggregator</code></b><br/>merge base + external <code>Caddyfile</code>s"]
         subgraph CaddyPkg["<b><code>pkg/caddy</code></b>"]
             direction TB
-            Deployer["<b>Deployer</b><br/>SSA <code>Deployment</code> and <code>Service</code> + prepull on image change"]
+            Deployer["<b>Deployer</b><br/>SSA <code>Deployment</code> and <code>Service</code><br/>prepull everywhere, then roll one node at a time"]
             Admin["<b>Admin client</b><br/>adapt (<code>/adapt</code>) then validate and load (<code>/load</code>)"]
         end
         Entry -->|"run <i>(leader only)</i>"| Reconciler

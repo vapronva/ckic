@@ -7,7 +7,6 @@ import (
 	"errors"
 
 	"github.com/rs/zerolog/log"
-	appsv1 "k8s.io/api/apps/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	"git.horse/vapronva/ckic/pkg/aggregator"
@@ -58,13 +57,14 @@ func (c *Controller) reconcileNode(ctx context.Context, nodeName string) error {
 	if err != nil || !c.isManagedNode(node) {
 		return c.teardownNode(ctx, nodeName)
 	}
-	snapshot, err := c.aggregator.CurrentMerged()
+	pod, err := c.deployFn(ctx, nodeName)
 	if err != nil {
 		return err
 	}
-	pod, err := c.deployFn(ctx, c.deployOptionsForNode(nodeName), nodeName, c.config.ExternalEndpoints[nodeName])
+	snapshot, err := c.aggregator.CurrentMerged()
 	if err != nil {
-		return err
+		log.Warn().Err(err).Str("node", nodeName).Msg("No loadable Caddy configuration; waiting for a ConfigMap change")
+		return nil
 	}
 	isLoaded, err := c.ensureLoaded(ctx, nodeName, pod, snapshot)
 	if err != nil || !isLoaded {
@@ -83,30 +83,20 @@ func (c *Controller) ensureLoaded(ctx context.Context, nodeName string, pod cadd
 	}
 	if pod.IP == "" || pod.ContainerID == "" {
 		log.Debug().Str("node", nodeName).Str("pod", pod.Name).Msg("Caddy container not running yet; requeueing push")
-		c.queue.AddAfter(nodeName, podStartupRequeueInterval)
+		c.queue.AddAfter(nodeName, requeueInterval)
 		return false, nil
 	}
-	if err := c.pushFn(ctx, pod, snapshot.Caddyfile); err != nil {
+	err := c.pushFn(ctx, pod, snapshot.Caddyfile)
+	if errors.Is(err, caddy.ErrConfigRejected) {
+		log.Error().Err(err).Str("node", nodeName).Str("pod", pod.Name).
+			Msg("Caddy rejected the configuration; retrying on the next change or resync")
+		return false, nil
+	}
+	if err != nil {
 		return false, err
 	}
 	c.recordPush(nodeName, digest, pod.ContainerID)
 	return true, nil
-}
-
-func (c *Controller) deployOptionsForNode(nodeName string) caddy.DeployOptions {
-	opts := c.config.Deploy
-	if opts.PrePullImage {
-		existing, err := c.deployLister.Deployments(c.config.Namespace).Get(caddy.DeploymentName(nodeName))
-		opts.PrePullImage = err != nil || caddyImageOf(existing) != opts.CaddyImage
-	}
-	return opts
-}
-
-func caddyImageOf(dep *appsv1.Deployment) string {
-	if dep == nil || len(dep.Spec.Template.Spec.Containers) == 0 {
-		return ""
-	}
-	return dep.Spec.Template.Spec.Containers[0].Image
 }
 
 func (c *Controller) teardownNode(ctx context.Context, nodeName string) error {

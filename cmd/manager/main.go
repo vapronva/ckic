@@ -21,7 +21,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/validate/content"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/leaderelection"
@@ -107,7 +106,7 @@ func parseFlags() options {
 	pflag.StringVar(&opts.logLevel, "log-level", "info", "Log level (trace, debug, info, warn, error, fatal, panic, disabled)")
 	pflag.StringVar(&deploy.CaddyImage, "caddy-image", "docker.horse/oss-images/zerossl-caddy/caddy:2.11.7-alpine", "Caddy image (format image:tag)")
 	pflag.StringVar(&opts.imagePullPolicy, "image-pull-policy", "IfNotPresent", "ImagePullPolicy for deployed Caddy pods (Always, IfNotPresent, Never)")
-	pflag.BoolVar(&deploy.PrePullImage, "prepull-image", true, "Pre-pull the Caddy image on a node before creating or updating its Deployment")
+	pflag.BoolVar(&deploy.PrePullImage, "prepull-image", true, "Pre-pull a new Caddy image on every node before restarting any of them")
 	pflag.StringVar(&opts.loadBalancerMode, "loadbalancer-mode", "none", "LoadBalancer strategy: none, or cilium (one LB per node)")
 	pflag.StringVar(&deploy.EnvSecretName, "env-secret", "", "Name of the Kubernetes Secret to use for environment variables")
 	pflag.StringSliceVar(&deploy.EnvSecretKeys, "env-keys", nil, "Keys from the Secret to use as environment variables")
@@ -165,7 +164,7 @@ func parseExternalEndpoints(endpoints []string) (map[string][]string, error) {
 		if errs := content.IsDNS1123Subdomain(nodeName); len(errs) > 0 {
 			return nil, fmt.Errorf("--external-endpoints: invalid Kubernetes node name %q: %s", nodeName, strings.Join(errs, "; "))
 		}
-		if errs := validation.IsValidLabelValue(nodeName); len(errs) > 0 {
+		if errs := content.IsLabelValue(nodeName); len(errs) > 0 {
 			return nil, fmt.Errorf("--external-endpoints: node %q cannot be used as an instance label: %s", nodeName, strings.Join(errs, "; "))
 		}
 		for rawIP := range strings.SplitSeq(addresses, ",") {
@@ -227,6 +226,9 @@ func runWithLeaderElection(
 ) error {
 	if !le.enabled {
 		return ctrl.Run(ctx)
+	}
+	if errs := content.IsDNS1123Subdomain(le.leaseName); len(errs) > 0 {
+		return fmt.Errorf("invalid leader election lease name %q: %s", le.leaseName, strings.Join(errs, "; "))
 	}
 	identity := leaderElectionIdentity()
 	electionCtx, cancel := context.WithCancel(ctx)

@@ -7,18 +7,18 @@ import (
 
 	"github.com/rs/zerolog/log"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/validate/content"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 func Teardown(ctx context.Context, opts DeployOptions, nodeName string) error {
-	if len(validation.IsValidLabelValue(nodeName)) > 0 {
+	if len(content.IsLabelValue(nodeName)) > 0 {
 		return nil
 	}
 	return errors.Join(
 		deleteServicesExcept(ctx, opts, nodeName, ""),
 		deleteDeploymentsExcept(ctx, opts, nodeName, ""),
-		deletePrePullPod(ctx, opts.Clientset, opts.Namespace, prePullPodName(nodeName), nil),
+		deletePrePullPod(ctx, opts.Clientset, opts.Namespace, PrePullPodName(nodeName), nil),
 	)
 }
 

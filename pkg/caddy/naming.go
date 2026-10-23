@@ -19,6 +19,8 @@ const (
 	labelManagedValue   = "true"
 	labelTypeBootConfig = "aggregated-config"
 	labelTypePrePull    = "image-prepull"
+
+	annotationTemplateHash = "ckic.cmld.ru/template-hash"
 )
 
 func DeploymentName(nodeName string) string {
@@ -37,7 +39,7 @@ func loadBalancerServiceName(nodeName string) string {
 	return strings.TrimRight(prefix, "-") + suffix
 }
 
-func prePullPodName(nodeName string) string {
+func PrePullPodName(nodeName string) string {
 	return "caddy-prepull-" + nodeName
 }
 
@@ -53,7 +55,7 @@ func ManagedLabels(nodeName string) map[string]string {
 
 func ManagedNodeName(obj metav1.Object) string {
 	objLabels := obj.GetLabels()
-	if objLabels[labelApp] != labelAppValue || objLabels[labelCaddyManaged] != labelManagedValue {
+	if objLabels[labelCaddyManaged] != labelManagedValue {
 		return ""
 	}
 	return objLabels[labelInstance]
@@ -65,4 +67,11 @@ func BootConfigLabels() map[string]string {
 
 func managedListOptions(nodeName string) metav1.ListOptions {
 	return metav1.ListOptions{LabelSelector: labels.SelectorFromSet(ManagedLabels(nodeName)).String()}
+}
+
+func ValidateName(kind, name string, check func(string) []string) error {
+	if errs := check(name); len(errs) > 0 {
+		return fmt.Errorf("invalid %s %q: %s", kind, name, strings.Join(errs, "; "))
+	}
+	return nil
 }

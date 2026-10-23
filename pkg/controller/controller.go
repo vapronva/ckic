@@ -9,6 +9,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/validate/content"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/informers"
@@ -38,11 +39,12 @@ type Config struct {
 }
 
 const (
-	mirrorKey                 = "mirror/publish"
-	workerCount               = 4
-	reconcileTimeout          = 5 * time.Minute
-	informerResync            = 10 * time.Minute
-	podStartupRequeueInterval = 5 * time.Second
+	mirrorKey            = "mirror/publish"
+	workerCount          = 4
+	reconcileTimeout     = 5 * time.Minute
+	informerResync       = 10 * time.Minute
+	requeueInterval      = 5 * time.Second
+	prePullRetryInterval = time.Minute
 )
 
 type pushRecord struct {
@@ -63,11 +65,12 @@ type Controller struct {
 	extFactory        informers.SharedInformerFactory
 	nodeLister        corev1listers.NodeLister
 	deployLister      appsv1listers.DeploymentLister
+	podLister         corev1listers.PodLister
 	cacheSyncs        []cache.InformerSynced
 	queue             workqueue.TypedRateLimitingInterface[string]
 	pushMu            sync.Mutex
 	pushState         map[string]pushRecord
-	deployFn          func(context.Context, caddy.DeployOptions, string, []string) (caddy.Pod, error)
+	deployFn          func(context.Context, string) (caddy.Pod, error)
 	pushFn            func(context.Context, caddy.Pod, string) error
 }
 
@@ -89,9 +92,9 @@ func NewController(clientset kubernetes.Interface, config Config) (*Controller, 
 		deniedNamespaces:  namespaceSet(config.ExternalDenyNamespaces),
 		queue:             workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
 		pushState:         make(map[string]pushRecord),
-		deployFn:          caddy.EnsureCaddy,
 		pushFn:            admin.Load,
 	}
+	c.deployFn = c.deployNode
 	c.aggregator = aggregator.New(clientset, config.Namespace, config.BootConfigMapName, c.enqueueManagedNodes)
 	if err := c.setupInformers(); err != nil {
 		c.queue.ShutDown()
@@ -121,8 +124,12 @@ func validateConfig(config Config) (Config, labels.Selector, error) {
 		}
 		config.ExternalLabel = externalSelector.String()
 	}
-	if config.BootConfigMapName == "" {
-		return config, nil, errors.New("external aggregated config name must be set for accepted boot snapshots")
+	if err := errors.Join(
+		caddy.ValidateName("namespace", config.Namespace, content.IsDNS1123Label),
+		caddy.ValidateName("base ConfigMap name", config.BaseConfigMapName, content.IsDNS1123Subdomain),
+		caddy.ValidateName("boot ConfigMap name", config.BootConfigMapName, content.IsDNS1123Subdomain),
+	); err != nil {
+		return config, nil, err
 	}
 	if config.BootConfigMapName == config.BaseConfigMapName {
 		return config, nil, errors.New("external aggregated config name must differ from the base config-map name")
@@ -145,14 +152,16 @@ func (c *Controller) setupInformers() error {
 	)
 	nodes := c.nodeFactory.Core().V1().Nodes()
 	deployments := c.nsFactory.Apps().V1().Deployments()
+	pods := c.nsFactory.Core().V1().Pods()
 	c.nodeLister = nodes.Lister()
 	c.deployLister = deployments.Lister()
+	c.podLister = pods.Lister()
 	managed := c.managedObjectHandler()
 	err := errors.Join(
 		c.register(nodes.Informer(), c.nodeHandler()),
 		c.register(c.nsFactory.Core().V1().ConfigMaps().Informer(), c.configMapHandler()),
 		c.register(deployments.Informer(), managed),
-		c.register(c.nsFactory.Core().V1().Pods().Informer(), managed),
+		c.register(pods.Informer(), managed),
 		c.register(c.nsFactory.Core().V1().Services().Informer(), managed),
 	)
 	if err != nil || !c.config.ExternalEnable {
@@ -327,7 +336,6 @@ func (c *Controller) Run(ctx context.Context) error {
 		return fmt.Errorf("shutting down before informer caches synced: %w", ctx.Err())
 	}
 	logger.Info().Msg("Caches synced; starting reconcile workers")
-	caddy.ReapPrePullPods(ctx, c.clientset, c.config.Namespace, logger)
 	var wg sync.WaitGroup
 	for range workerCount {
 		wg.Go(func() {

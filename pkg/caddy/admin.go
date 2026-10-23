@@ -22,7 +22,10 @@ const (
 	errorBodyLimit      = 1024
 )
 
-var adminListen = ":" + strconv.Itoa(adminPort)
+var (
+	adminListen       = ":" + strconv.Itoa(adminPort)
+	ErrConfigRejected = errors.New("configuration rejected")
+)
 
 type Admin struct {
 	originKey   string
@@ -100,13 +103,13 @@ func (a *Admin) checkAdminReachable(config json.RawMessage) error {
 	}
 	admin := adapted.Admin
 	if admin.Listen != adminListen {
-		return fmt.Errorf("merged Caddyfile must keep the admin endpoint on %s, got %q", adminListen, admin.Listen)
+		return fmt.Errorf("%w: merged Caddyfile must keep the admin endpoint on %s, got %q", ErrConfigRejected, adminListen, admin.Listen)
 	}
 	if a.originKey == "" && admin.EnforceOrigin {
-		return errors.New("merged Caddyfile enforces an admin origin, but no origin key is configured")
+		return fmt.Errorf("%w: merged Caddyfile enforces an admin origin, but no origin key is configured", ErrConfigRejected)
 	}
 	if a.originKey != "" && !slices.Contains(admin.Origins, adminOrigin(a.originKey)) {
-		return fmt.Errorf("merged Caddyfile must allow the admin origin %s", adminOrigin(a.originKey))
+		return fmt.Errorf("%w: merged Caddyfile must allow the admin origin %s", ErrConfigRejected, adminOrigin(a.originKey))
 	}
 	return nil
 }
@@ -133,8 +136,12 @@ func (a *Admin) do(req *http.Request) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read Caddy %s response: %w", req.URL.Path, err)
 	}
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return nil, fmt.Errorf("caddy %s returned HTTP %d: %s", req.URL.Path, resp.StatusCode, body[:min(len(body), errorBodyLimit)])
+	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+		return body, nil
 	}
-	return body, nil
+	failure := fmt.Sprintf("caddy %s returned HTTP %d: %s", req.URL.Path, resp.StatusCode, body[:min(len(body), errorBodyLimit)])
+	if resp.StatusCode >= http.StatusBadRequest && resp.StatusCode < http.StatusInternalServerError {
+		return nil, fmt.Errorf("%w: %s", ErrConfigRejected, failure)
+	}
+	return nil, errors.New(failure)
 }

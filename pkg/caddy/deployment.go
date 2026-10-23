@@ -2,13 +2,15 @@ package caddy
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 
-	"github.com/rs/zerolog/log"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/validate/content"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation"
@@ -88,6 +90,22 @@ func (o DeployOptions) Validate() error {
 	if len(o.EnvSecretKeys) > 0 && o.EnvSecretName == "" {
 		return fmt.Errorf("environment keys %q require an environment secret", o.EnvSecretKeys)
 	}
+	for _, optional := range []struct {
+		kind, name string
+		check      func(string) []string
+	}{
+		{"environment secret name", o.EnvSecretName, content.IsDNS1123Subdomain},
+		{"data PVC name", o.DataVolumePVC, content.IsDNS1123Subdomain},
+		{"config PVC name", o.ConfigVolumePVC, content.IsDNS1123Subdomain},
+		{"admin origin key", o.CaddyAdminOriginKey, content.IsDNS1123Label},
+	} {
+		if optional.name == "" {
+			continue
+		}
+		if err := ValidateName(optional.kind, optional.name, optional.check); err != nil {
+			return err
+		}
+	}
 	envKeys := make(map[string]bool)
 	for _, env := range podFieldEnvVars {
 		envKeys[env.name] = true
@@ -95,6 +113,9 @@ func (o DeployOptions) Validate() error {
 	for _, key := range o.EnvSecretKeys {
 		if envKeys[key] {
 			return fmt.Errorf("duplicate or reserved environment key %q", key)
+		}
+		if err := ValidateName("environment key", key, validation.IsConfigMapKey); err != nil {
+			return err
 		}
 		envKeys[key] = true
 	}
@@ -105,34 +126,29 @@ func applyOptions() metav1.ApplyOptions {
 	return metav1.ApplyOptions{FieldManager: fieldManager, Force: true}
 }
 
-func EnsureCaddy(ctx context.Context, opts DeployOptions, nodeName string, externalIPs []string) (Pod, error) {
-	if errs := validation.IsValidLabelValue(nodeName); len(errs) > 0 {
-		return Pod{}, fmt.Errorf("node %q cannot be used as an instance label: %s", nodeName, strings.Join(errs, "; "))
-	}
-	if opts.PrePullImage {
-		logger := log.With().Str("node", nodeName).Logger()
-		if err := prePullImage(ctx, opts, nodeName, logger); err != nil {
-			logger.Warn().Err(err).Msg("Image pre-pull did not complete; proceeding (kubelet will pull on rollout)")
-		}
+func EnsureCaddy(ctx context.Context, opts DeployOptions, nodeName string, externalIPs []string) error {
+	if err := ValidateName("instance label for node", nodeName, content.IsLabelValue); err != nil {
+		return err
 	}
 	deploymentName := DeploymentName(nodeName)
 	if _, err := opts.Clientset.AppsV1().Deployments(opts.Namespace).
 		Apply(ctx, deploymentApplyConfig(opts, nodeName), applyOptions()); err != nil {
-		return Pod{}, fmt.Errorf("failed to apply deployment %s: %w", deploymentName, err)
+		return fmt.Errorf("failed to apply deployment %s: %w", deploymentName, err)
 	}
-	if err := applyLoadBalancerService(ctx, opts, nodeName, externalIPs); err != nil {
-		return Pod{}, err
+	if err := ensureLoadBalancerService(ctx, opts, nodeName, externalIPs); err != nil {
+		return err
 	}
-	if err := deleteDeploymentsExcept(ctx, opts, nodeName, deploymentName); err != nil {
-		return Pod{}, err
-	}
-	return findActivePod(ctx, opts, nodeName)
+	return deleteDeploymentsExcept(ctx, opts, nodeName, deploymentName)
 }
 
-func applyLoadBalancerService(ctx context.Context, opts DeployOptions, nodeName string, externalIPs []string) error {
+func ensureLoadBalancerService(ctx context.Context, opts DeployOptions, nodeName string, externalIPs []string) error {
 	if !opts.EnableCiliumLB {
 		return deleteServicesExcept(ctx, opts, nodeName, "")
 	}
+	return ApplyLoadBalancerService(ctx, opts, nodeName, externalIPs)
+}
+
+func ApplyLoadBalancerService(ctx context.Context, opts DeployOptions, nodeName string, externalIPs []string) error {
 	serviceName := loadBalancerServiceName(nodeName)
 	if _, err := opts.Clientset.CoreV1().Services(opts.Namespace).
 		Apply(ctx, loadBalancerServiceApplyConfig(opts.Namespace, nodeName, externalIPs), applyOptions()); err != nil {
@@ -141,7 +157,41 @@ func applyLoadBalancerService(ctx context.Context, opts DeployOptions, nodeName 
 	return deleteServicesExcept(ctx, opts, nodeName, serviceName)
 }
 
+func TemplateHash(opts DeployOptions, nodeName string) string {
+	return templateHash(podTemplateApplyConfig(opts, nodeName))
+}
+
+func AppliedTemplateHash(deployment *appsv1.Deployment) string {
+	return deployment.Annotations[annotationTemplateHash]
+}
+
+func templateHash(template *corev1ac.PodTemplateSpecApplyConfiguration) string {
+	encoded, _ := json.Marshal(template)
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:8])
+}
+
 func deploymentApplyConfig(opts DeployOptions, nodeName string) *appsv1ac.DeploymentApplyConfiguration {
+	template := podTemplateApplyConfig(opts, nodeName)
+	strategy := appsv1ac.DeploymentStrategy().
+		WithType(appsv1.RollingUpdateDeploymentStrategyType).
+		WithRollingUpdate(appsv1ac.RollingUpdateDeployment().
+			WithMaxSurge(intstr.FromString("25%")).
+			WithMaxUnavailable(intstr.FromString("25%")))
+	if opts.UseHostNetwork {
+		strategy = appsv1ac.DeploymentStrategy().WithType(appsv1.RecreateDeploymentStrategyType)
+	}
+	return appsv1ac.Deployment(DeploymentName(nodeName), opts.Namespace).
+		WithLabels(ManagedLabels(nodeName)).
+		WithAnnotations(map[string]string{annotationTemplateHash: templateHash(template)}).
+		WithSpec(appsv1ac.DeploymentSpec().
+			WithReplicas(1).
+			WithStrategy(strategy).
+			WithSelector(metav1ac.LabelSelector().WithMatchLabels(selectorLabels(nodeName))).
+			WithTemplate(template))
+}
+
+func podTemplateApplyConfig(opts DeployOptions, nodeName string) *corev1ac.PodTemplateSpecApplyConfiguration {
 	podSpec := corev1ac.PodSpec().
 		WithAffinity(nodeNameAffinity(nodeName)).
 		WithAutomountServiceAccountToken(false).
@@ -151,23 +201,10 @@ func deploymentApplyConfig(opts DeployOptions, nodeName string) *appsv1ac.Deploy
 		WithContainers(caddyContainer(opts)).
 		WithVolumes(caddyVolumes(opts)...).
 		WithDNSPolicy(corev1.DNSClusterFirst)
-	strategy := appsv1ac.DeploymentStrategy().
-		WithType(appsv1.RollingUpdateDeploymentStrategyType).
-		WithRollingUpdate(appsv1ac.RollingUpdateDeployment().
-			WithMaxSurge(intstr.FromString("25%")).
-			WithMaxUnavailable(intstr.FromString("25%")))
 	if opts.UseHostNetwork {
 		podSpec = podSpec.WithHostNetwork(true).WithDNSPolicy(corev1.DNSClusterFirstWithHostNet)
-		strategy = appsv1ac.DeploymentStrategy().WithType(appsv1.RecreateDeploymentStrategyType)
 	}
-	podLabels := ManagedLabels(nodeName)
-	return appsv1ac.Deployment(DeploymentName(nodeName), opts.Namespace).
-		WithLabels(podLabels).
-		WithSpec(appsv1ac.DeploymentSpec().
-			WithReplicas(1).
-			WithStrategy(strategy).
-			WithSelector(metav1ac.LabelSelector().WithMatchLabels(selectorLabels(nodeName))).
-			WithTemplate(corev1ac.PodTemplateSpec().WithLabels(podLabels).WithSpec(podSpec)))
+	return corev1ac.PodTemplateSpec().WithLabels(ManagedLabels(nodeName)).WithSpec(podSpec)
 }
 
 func nodeNameAffinity(nodeName string) *corev1ac.AffinityApplyConfiguration {
@@ -281,7 +318,7 @@ func loadBalancerServiceApplyConfig(namespace, nodeName string, externalIPs []st
 			WithPorts(ports...))
 }
 
-func findActivePod(ctx context.Context, opts DeployOptions, nodeName string) (Pod, error) {
+func FindActivePod(ctx context.Context, opts DeployOptions, nodeName string) (Pod, error) {
 	pods, err := opts.Clientset.CoreV1().Pods(opts.Namespace).List(ctx, managedListOptions(nodeName))
 	if err != nil {
 		return Pod{}, fmt.Errorf("failed to list pods for node %s: %w", nodeName, err)

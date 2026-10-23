@@ -2,6 +2,7 @@ package caddy
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -19,16 +20,18 @@ func TestLoadPushesAdaptedJSON(t *testing.T) {
 		adaptStatus, loadStatus int
 		forceReload             bool
 		wantLoads               int32
-		wantError               bool
+		wantError, wantRejected bool
 	}{
-		{"success", `{"result":` + reachable + `,"warnings":[{"message":"warning"}]}`, 200, 200, true, 1, false},
-		{"success without forced reload", `{"result":` + reachable + `}`, 200, 200, false, 1, false},
-		{"load failure", `{"result":` + reachable + `}`, 200, 400, true, 1, true},
-		{"adapt failure", `{"error":"bad config"}`, 400, 200, true, 0, true},
-		{"missing result", `{"warnings":[]}`, 200, 200, true, 0, true},
-		{"null result", `{"result":null}`, 200, 200, true, 0, true},
-		{"admin on loopback", `{"result":{"apps":{}}}`, 200, 200, true, 0, true},
-		{"admin origin dropped", `{"result":{"admin":{"listen":":2019"},"apps":{}}}`, 200, 200, true, 0, true},
+		{"success", `{"result":` + reachable + `,"warnings":[{"message":"warning"}]}`, 200, 200, true, 1, false, false},
+		{"success without forced reload", `{"result":` + reachable + `}`, 200, 200, false, 1, false, false},
+		{"load failure", `{"result":` + reachable + `}`, 200, 400, true, 1, true, true},
+		{"load unavailable", `{"result":` + reachable + `}`, 200, 503, true, 1, true, false},
+		{"adapt failure", `{"error":"bad config"}`, 400, 200, true, 0, true, true},
+		{"origin refused", `{"error":"client is not allowed to access from origin"}`, 403, 200, true, 0, true, true},
+		{"missing result", `{"warnings":[]}`, 200, 200, true, 0, true, false},
+		{"null result", `{"result":null}`, 200, 200, true, 0, true, true},
+		{"admin on loopback", `{"result":{"apps":{}}}`, 200, 200, true, 0, true, true},
+		{"admin origin dropped", `{"result":{"admin":{"listen":":2019"},"apps":{}}}`, 200, 200, true, 0, true, true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
@@ -73,8 +76,8 @@ func TestLoadPushesAdaptedJSON(t *testing.T) {
 			admin := NewAdmin("key", test.forceReload)
 			admin.client.Transport = transport
 			err := admin.Load(t.Context(), Pod{NodeName: "node1", IP: "192.0.2.1"}, "config")
-			if (err != nil) != test.wantError {
-				t.Fatalf("Load = %v, want error=%v", err, test.wantError)
+			if (err != nil) != test.wantError || errors.Is(err, ErrConfigRejected) != test.wantRejected {
+				t.Fatalf("Load = %v, want error=%v rejected=%v", err, test.wantError, test.wantRejected)
 			}
 			if loads.Load() != test.wantLoads {
 				t.Fatalf("loads = %d, want %d", loads.Load(), test.wantLoads)

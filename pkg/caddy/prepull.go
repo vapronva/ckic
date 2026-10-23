@@ -2,59 +2,46 @@ package caddy
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"net/http"
-	"time"
 
-	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
-	utilnet "k8s.io/apimachinery/pkg/util/net"
-	"k8s.io/apimachinery/pkg/util/wait"
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	"k8s.io/client-go/kubernetes"
 )
 
 const (
-	imagePrePullTimeout   = 3 * time.Minute
-	imagePrePullPollDelay = 2 * time.Second
-	prePullCleanupTimeout = 30 * time.Second
-	prePullContainerName  = "prepull"
-	prePullRunAsID        = int64(1000)
+	prePullContainerName = "prepull"
+	prePullRunAsID       = int64(1000)
 )
 
-func prePullImage(ctx context.Context, opts DeployOptions, nodeName string, logger zerolog.Logger) error {
-	podName := prePullPodName(nodeName)
-	logger = logger.With().Str("pod", podName).Str("image", opts.CaddyImage).Logger()
-	if err := deletePrePullPod(ctx, opts.Clientset, opts.Namespace, podName, nil); err != nil {
-		return err
+func CreatePrePullPod(ctx context.Context, opts DeployOptions, nodeName string) error {
+	if _, err := opts.Clientset.CoreV1().Pods(opts.Namespace).
+		Apply(ctx, prePullPodApplyConfig(opts, nodeName), applyOptions()); err != nil {
+		return fmt.Errorf("failed to create pre-pull pod for node %s: %w", nodeName, err)
 	}
-	pod, err := opts.Clientset.CoreV1().Pods(opts.Namespace).
-		Apply(ctx, prePullPodApplyConfig(opts, nodeName), applyOptions())
-	if err != nil {
-		return fmt.Errorf("failed to create pre-pull pod: %w", err)
-	}
-	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), prePullCleanupTimeout)
-		defer cancel()
-		if err := deletePrePullPod(cleanupCtx, opts.Clientset, opts.Namespace, podName, &pod.UID); err != nil {
-			logger.Warn().Err(err).Msg("Failed to delete pre-pull pod")
-		}
-	}()
-	logger.Info().Msg("Pre-pulling Caddy image on node")
-	if err := waitForImagePulled(ctx, opts.Clientset, opts.Namespace, podName); err != nil {
-		return err
-	}
-	logger.Info().Msg("Caddy image present on node")
+	log.Info().Str("node", nodeName).Str("image", opts.CaddyImage).Msg("Pre-pulling Caddy image on node")
 	return nil
 }
 
+func PrePullPodImage(pod *corev1.Pod) string {
+	for _, container := range pod.Spec.Containers {
+		if container.Name == prePullContainerName {
+			return container.Image
+		}
+	}
+	return ""
+}
+
+func DeletePrePullPod(ctx context.Context, opts DeployOptions, pod *corev1.Pod) error {
+	return deletePrePullPod(ctx, opts.Clientset, opts.Namespace, pod.Name, &pod.UID)
+}
+
 func prePullPodApplyConfig(opts DeployOptions, nodeName string) *corev1ac.PodApplyConfiguration {
-	return corev1ac.Pod(prePullPodName(nodeName), opts.Namespace).
+	return corev1ac.Pod(PrePullPodName(nodeName), opts.Namespace).
 		WithLabels(map[string]string{
 			labelCaddyManaged: labelManagedValue,
 			labelType:         labelTypePrePull,
@@ -79,75 +66,49 @@ func prePullPodApplyConfig(opts DeployOptions, nodeName string) *corev1ac.PodApp
 					WithRunAsNonRoot(true).
 					WithRunAsUser(prePullRunAsID).
 					WithRunAsGroup(prePullRunAsID).
-					WithCapabilities(corev1ac.Capabilities().WithDrop("ALL")).
+					WithCapabilities(corev1ac.Capabilities().WithAdd("NET_BIND_SERVICE").WithDrop("ALL")).
 					WithSeccompProfile(corev1ac.SeccompProfile().WithType(corev1.SeccompProfileTypeRuntimeDefault)))))
 }
 
-func waitForImagePulled(ctx context.Context, clientset kubernetes.Interface, namespace, podName string) error {
-	return wait.PollUntilContextTimeout(ctx, imagePrePullPollDelay, imagePrePullTimeout, true,
-		func(ctx context.Context) (bool, error) {
-			pod, err := clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
-			if isTransientPrePullError(err) {
-				return false, nil
-			}
-			if err != nil {
-				return false, fmt.Errorf("failed to get pre-pull pod: %w", err)
-			}
-			return prePullImagePresent(pod)
-		})
-}
-
-func isTransientPrePullError(err error) bool {
-	if status, ok := errors.AsType[*apierrors.StatusError](err); ok {
-		code := status.Status().Code
-		return code == http.StatusTooManyRequests || code >= http.StatusInternalServerError && code < 600
-	}
-	return utilnet.IsTimeout(err) || utilnet.IsProbableEOF(err) || utilnet.IsHTTP2ConnectionLost(err) ||
-		utilnet.IsConnectionReset(err) || utilnet.IsConnectionRefused(err)
-}
-
-func prePullImagePresent(pod *corev1.Pod) (bool, error) {
+func IsImagePrePulled(pod *corev1.Pod) bool {
 	for _, status := range pod.Status.ContainerStatuses {
 		if status.Name != prePullContainerName {
 			continue
 		}
-		if status.State.Running != nil || status.State.Terminated != nil {
-			return true, nil
+		if status.ContainerID != "" && (status.State.Running != nil || status.State.Terminated != nil) {
+			return true
 		}
-		waiting := status.State.Waiting
-		if waiting == nil {
-			continue
-		}
-		switch waiting.Reason {
-		case "ImagePullBackOff",
-			"ErrImagePull",
-			"ErrImageNeverPull",
-			"InvalidImageName",
-			"ImageInspectError",
-			"RegistryUnavailable",
-			"SignatureValidationFailed":
-			return false, fmt.Errorf("image pull failed (%s): %s", waiting.Reason, waiting.Message)
-		case "CreateContainerConfigError",
-			"CreateContainerError",
-			"PreCreateHookError",
-			"PreStartHookError",
-			"PostStartHookError",
-			"RunContainerError",
-			"CrashLoopBackOff":
-			return true, nil
+		if waiting := status.State.Waiting; waiting != nil {
+			switch waiting.Reason {
+			case "CreateContainerConfigError",
+				"CreateContainerError",
+				"PreCreateHookError",
+				"PreStartHookError",
+				"PostStartHookError",
+				"RunContainerError",
+				"CrashLoopBackOff":
+				return true
+			}
 		}
 	}
-	switch pod.Status.Phase {
-	case corev1.PodSucceeded, corev1.PodRunning:
-		return true, nil
-	case corev1.PodFailed:
-		return false, fmt.Errorf("pre-pull pod failed before image pull (reason=%s): %s", pod.Status.Reason, pod.Status.Message)
-	case corev1.PodPending, corev1.PodUnknown:
+	return false
+}
+
+func PrePullProblem(pod *corev1.Pod) string {
+	if pod.Status.Phase == corev1.PodFailed {
+		return "pod failed: " + pod.Status.Reason
 	}
-	if pod.DeletionTimestamp != nil {
-		return false, fmt.Errorf("pre-pull pod %s is being deleted", pod.Name)
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodScheduled && condition.Status == corev1.ConditionFalse {
+			return condition.Reason + ": " + condition.Message
+		}
 	}
-	return false, nil
+	for _, status := range pod.Status.ContainerStatuses {
+		if waiting := status.State.Waiting; status.Name == prePullContainerName && waiting != nil && waiting.Reason != "ContainerCreating" {
+			return waiting.Reason + ": " + waiting.Message
+		}
+	}
+	return ""
 }
 
 func deletePrePullPod(ctx context.Context, clientset kubernetes.Interface, namespace, podName string, uid *types.UID) error {
@@ -159,24 +120,4 @@ func deletePrePullPod(ctx context.Context, clientset kubernetes.Interface, names
 		return nil
 	}
 	return fmt.Errorf("failed to delete pre-pull pod %s: %w", podName, err)
-}
-
-func ReapPrePullPods(ctx context.Context, clientset kubernetes.Interface, namespace string, logger zerolog.Logger) {
-	ctx, cancel := context.WithTimeout(ctx, prePullCleanupTimeout)
-	defer cancel()
-	pods, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: labels.SelectorFromSet(labels.Set{
-			labelCaddyManaged: labelManagedValue,
-			labelType:         labelTypePrePull,
-		}).String(),
-	})
-	if err != nil {
-		logger.Warn().Err(err).Msg("Failed to list leftover pre-pull pods for cleanup")
-		return
-	}
-	for i := range pods.Items {
-		if err := deletePrePullPod(ctx, clientset, namespace, pods.Items[i].Name, &pods.Items[i].UID); err != nil {
-			logger.Warn().Err(err).Msg("Failed to delete leftover pre-pull pod")
-		}
-	}
 }

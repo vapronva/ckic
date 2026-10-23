@@ -8,6 +8,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/validate/content"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes/fake"
@@ -58,7 +59,10 @@ func TestEnsureCaddyModeTransitions(t *testing.T) {
 			opts.EnableCiliumLB = mode.cilium
 			opts.UseHostNetwork = mode.hostNetwork
 			for range 2 {
-				pod, err := EnsureCaddy(t.Context(), opts, testNode, []string{"203.0.113.5"})
+				if err := EnsureCaddy(t.Context(), opts, testNode, []string{"203.0.113.5"}); err != nil {
+					t.Fatal(err)
+				}
+				pod, err := FindActivePod(t.Context(), opts, testNode)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -113,23 +117,23 @@ func TestEnsureCaddyModeTransitions(t *testing.T) {
 func TestNodeDerivedNames(t *testing.T) {
 	t.Parallel()
 	const dotted = "worker.example.com"
-	if DeploymentName(dotted) != "caddy-"+dotted || prePullPodName(dotted) != "caddy-prepull-"+dotted {
+	if DeploymentName(dotted) != "caddy-"+dotted || PrePullPodName(dotted) != "caddy-prepull-"+dotted {
 		t.Fatal("Deployment and pre-pull identities must preserve the node name")
 	}
 	if loadBalancerServiceName(dotted) == loadBalancerServiceName("worker-example-com") {
 		t.Fatal("dotted and hyphenated node names collide")
 	}
-	longest := strings.Repeat("n", validation.LabelValueMaxLength)
+	longest := strings.Repeat("n", content.LabelValueMaxLength)
 	for _, node := range []string{dotted, longest} {
 		if errs := validation.IsDNS1035Label(loadBalancerServiceName(node)); len(errs) != 0 {
 			t.Fatalf("invalid Service name for %q: %v", node, errs)
 		}
 	}
 	opts := DeployOptions{Clientset: fake.NewClientset(), Namespace: testNS}
-	if _, err := EnsureCaddy(t.Context(), opts, longest, nil); err != nil {
+	if err := EnsureCaddy(t.Context(), opts, longest, nil); err != nil {
 		t.Fatalf("longest label-value node name must be accepted: %v", err)
 	}
-	if _, err := EnsureCaddy(t.Context(), opts, longest+"n", nil); err == nil {
+	if err := EnsureCaddy(t.Context(), opts, longest+"n", nil); err == nil {
 		t.Fatal("node names exceeding the instance label limit must be rejected")
 	}
 }
