@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -97,13 +98,17 @@ func (o DeployOptions) Validate() error {
 		{"environment secret name", o.EnvSecretName, content.IsDNS1123Subdomain},
 		{"data PVC name", o.DataVolumePVC, content.IsDNS1123Subdomain},
 		{"config PVC name", o.ConfigVolumePVC, content.IsDNS1123Subdomain},
-		{"admin origin key", o.CaddyAdminOriginKey, content.IsDNS1123Label},
 	} {
 		if optional.name == "" {
 			continue
 		}
 		if err := ValidateName(optional.kind, optional.name, optional.check); err != nil {
 			return err
+		}
+	}
+	if o.CaddyAdminOriginKey != "" {
+		if errs := content.IsDNS1123Subdomain(strings.ToLower(o.CaddyAdminOriginKey)); len(errs) > 0 {
+			return fmt.Errorf("invalid admin origin key: %s", strings.Join(errs, "; "))
 		}
 	}
 	envKeys := make(map[string]bool)
