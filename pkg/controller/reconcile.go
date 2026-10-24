@@ -7,6 +7,7 @@ import (
 	"errors"
 
 	"github.com/rs/zerolog/log"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	"git.horse/vapronva/ckic/pkg/aggregator"
@@ -57,7 +58,7 @@ func (c *Controller) reconcileNode(ctx context.Context, nodeName string) error {
 	if err != nil || !c.isManagedNode(node) {
 		return c.teardownNode(ctx, nodeName)
 	}
-	pod, err := c.deployFn(ctx, nodeName)
+	pod, err := c.deployFn(ctx, node)
 	if err != nil {
 		return err
 	}
@@ -66,7 +67,7 @@ func (c *Controller) reconcileNode(ctx context.Context, nodeName string) error {
 		log.Warn().Err(err).Str("node", nodeName).Msg("No loadable Caddy configuration; waiting for a ConfigMap change")
 		return nil
 	}
-	isLoaded, err := c.ensureLoaded(ctx, nodeName, pod, snapshot)
+	isLoaded, err := c.ensureLoaded(ctx, node, pod, snapshot)
 	if err != nil || !isLoaded {
 		return err
 	}
@@ -76,14 +77,17 @@ func (c *Controller) reconcileNode(ctx context.Context, nodeName string) error {
 	return nil
 }
 
-func (c *Controller) ensureLoaded(ctx context.Context, nodeName string, pod caddy.Pod, snapshot aggregator.Snapshot) (bool, error) {
+func (c *Controller) ensureLoaded(ctx context.Context, node *corev1.Node, pod caddy.Pod, snapshot aggregator.Snapshot) (bool, error) {
+	nodeName := node.Name
 	digest := configDigest(snapshot.Caddyfile)
 	if c.pushUpToDate(nodeName, digest, pod.ContainerID) {
 		return true, nil
 	}
 	if pod.IP == "" || pod.ContainerID == "" {
-		log.Debug().Str("node", nodeName).Str("pod", pod.Name).Msg("Caddy container not running yet; requeueing push")
-		c.queue.AddAfter(nodeName, requeueInterval)
+		log.Debug().Str("node", nodeName).Str("pod", pod.Name).Msg("Caddy container not running yet")
+		if isInService(node) {
+			c.queue.AddAfter(nodeName, requeueInterval)
+		}
 		return false, nil
 	}
 	err := c.pushFn(ctx, pod, snapshot.Caddyfile)

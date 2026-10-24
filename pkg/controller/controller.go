@@ -68,9 +68,10 @@ type Controller struct {
 	podLister         corev1listers.PodLister
 	cacheSyncs        []cache.InformerSynced
 	queue             workqueue.TypedRateLimitingInterface[string]
+	rolloutMu         sync.Mutex
 	pushMu            sync.Mutex
 	pushState         map[string]pushRecord
-	deployFn          func(context.Context, string) (caddy.Pod, error)
+	deployFn          func(context.Context, *corev1.Node) (caddy.Pod, error)
 	pushFn            func(context.Context, caddy.Pod, string) error
 }
 

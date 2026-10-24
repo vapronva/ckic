@@ -1,6 +1,7 @@
 package caddy
 
 import (
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -33,7 +34,7 @@ func runningCaddyPod() *corev1.Pod {
 	}
 }
 
-func TestEnsureCaddyModeTransitions(t *testing.T) {
+func TestApplyCaddyModeTransitions(t *testing.T) {
 	t.Parallel()
 	unrelated := runningCaddyPod()
 	unrelated.Name = "unrelated-newer-pod"
@@ -59,7 +60,11 @@ func TestEnsureCaddyModeTransitions(t *testing.T) {
 			opts.EnableCiliumLB = mode.cilium
 			opts.UseHostNetwork = mode.hostNetwork
 			for range 2 {
-				if err := EnsureCaddy(t.Context(), opts, testNode, []string{"203.0.113.5"}); err != nil {
+				if err := errors.Join(
+					ApplyDeployment(t.Context(), opts, testNode),
+					EnsureLoadBalancerService(t.Context(), opts, testNode, []string{"203.0.113.5"}),
+					DeleteStaleDeployments(t.Context(), opts, testNode),
+				); err != nil {
 					t.Fatal(err)
 				}
 				pod, err := FindActivePod(t.Context(), opts, testNode)
@@ -130,10 +135,10 @@ func TestNodeDerivedNames(t *testing.T) {
 		}
 	}
 	opts := DeployOptions{Clientset: fake.NewClientset(), Namespace: testNS}
-	if err := EnsureCaddy(t.Context(), opts, longest, nil); err != nil {
+	if err := ApplyDeployment(t.Context(), opts, longest); err != nil {
 		t.Fatalf("longest label-value node name must be accepted: %v", err)
 	}
-	if err := EnsureCaddy(t.Context(), opts, longest+"n", nil); err == nil {
+	if err := ApplyDeployment(t.Context(), opts, longest+"n"); err == nil {
 		t.Fatal("node names exceeding the instance label limit must be rejected")
 	}
 }
@@ -163,5 +168,37 @@ func TestSelectNewestActivePod(t *testing.T) {
 	}
 	if _, noneOK := selectNewestActivePod(nil); noneOK {
 		t.Fatal("expected ok=false for empty input")
+	}
+}
+
+func TestDeploymentProblemIgnoresNormalRollouts(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	unavailableSince := func(age time.Duration, extra ...appsv1.DeploymentCondition) *appsv1.Deployment {
+		deployment := &appsv1.Deployment{Generation: 2}
+		deployment.Spec.ProgressDeadlineSeconds = new(int32(600))
+		deployment.Status.ObservedGeneration = 2
+		deployment.Status.Conditions = append(extra,
+			appsv1.DeploymentCondition{Type: appsv1.DeploymentProgressing, Status: corev1.ConditionTrue, Reason: "NewReplicaSetAvailable"},
+			appsv1.DeploymentCondition{
+				Type: appsv1.DeploymentAvailable, Status: corev1.ConditionFalse, Reason: "MinimumReplicasUnavailable",
+				LastTransitionTime: metav1.NewTime(now.Add(-age)),
+			})
+		return deployment
+	}
+	for _, test := range []struct {
+		name       string
+		deployment *appsv1.Deployment
+		isProblem  bool
+	}{
+		{"recreate or rollback in progress", unavailableSince(30 * time.Second), false},
+		{"readiness lost past the progress deadline", unavailableSince(11 * time.Minute), true},
+		{"replacement rejected", unavailableSince(time.Second, appsv1.DeploymentCondition{
+			Type: appsv1.DeploymentReplicaFailure, Status: corev1.ConditionTrue, Reason: "FailedCreate",
+		}), true},
+	} {
+		if got := DeploymentProblem(test.deployment, now) != ""; got != test.isProblem {
+			t.Errorf("%s: problem = %v, want %v", test.name, got, test.isProblem)
+		}
 	}
 }

@@ -8,126 +8,211 @@ import (
 	"github.com/rs/zerolog/log"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
 
 	"git.horse/vapronva/ckic/pkg/caddy"
 )
 
-var stuckPrePullSampler = &zerolog.BurstSampler{Burst: 1, Period: time.Minute}
+var stuckRolloutSampler = &zerolog.BurstSampler{Burst: 1, Period: time.Minute}
 
 type nodeRollout struct {
 	name         string
+	isInService  bool
 	isPending    bool
 	isAvailable  bool
 	needsPrePull bool
 	prePull      *corev1.Pod
+	deployment   *appsv1.Deployment
 }
 
-func (c *Controller) deployNode(ctx context.Context, nodeName string) (caddy.Pod, error) {
-	isHeld, err := c.syncRollout(ctx, nodeName)
-	if err != nil {
+func (c *Controller) deployNode(ctx context.Context, node *corev1.Node) (caddy.Pod, error) {
+	if err := c.applyCaddy(ctx, node); err != nil {
 		return caddy.Pod{}, err
 	}
-	if isHeld {
-		c.queue.AddAfter(nodeName, requeueInterval)
+	return caddy.FindActivePod(ctx, c.config.Deploy, node.Name)
+}
+
+func (c *Controller) applyCaddy(ctx context.Context, node *corev1.Node) error {
+	isHeld, err := c.syncRollout(ctx, node)
+	if err != nil {
+		return err
 	}
-	opts, externalIPs := c.config.Deploy, c.config.ExternalEndpoints[nodeName]
+	opts, externalIPs := c.config.Deploy, c.config.ExternalEndpoints[node.Name]
 	switch {
-	case !isHeld:
-		err = caddy.EnsureCaddy(ctx, opts, nodeName, externalIPs)
-	case opts.EnableCiliumLB:
-		err = caddy.ApplyLoadBalancerService(ctx, opts, nodeName, externalIPs)
+	case isHeld && opts.EnableCiliumLB:
+		return caddy.ApplyLoadBalancerService(ctx, opts, node.Name, externalIPs)
+	case isHeld:
+		return nil
 	}
-	if err != nil {
-		return caddy.Pod{}, err
+	if err := caddy.EnsureLoadBalancerService(ctx, opts, node.Name, externalIPs); err != nil {
+		return err
 	}
-	return caddy.FindActivePod(ctx, opts, nodeName)
+	return caddy.DeleteStaleDeployments(ctx, opts, node.Name)
 }
 
-func (c *Controller) syncRollout(ctx context.Context, nodeName string) (bool, error) {
-	self := c.nodeRollout(nodeName)
+func (c *Controller) syncRollout(ctx context.Context, node *corev1.Node) (bool, error) {
+	self := c.nodeRollout(node, c.cachedDeployment(node.Name))
 	if err := c.syncPrePullPod(ctx, self, time.Now()); err != nil {
 		return false, err
 	}
-	if problem := self.prePullProblem(); problem != "" {
-		sampled := log.Logger.Sample(stuckPrePullSampler)
-		sampled.Warn().Str("node", nodeName).Str("problem", problem).Msg("Image pre-pull is stuck; every rollout waits for it")
+	switch {
+	case !self.isPending:
+		return false, caddy.ApplyDeployment(ctx, c.config.Deploy, node.Name)
+	case !self.isInService:
+		log.Debug().Str("node", node.Name).Msg("Holding Caddy rollout until the node is schedulable and ready")
+		return true, nil
 	}
-	if !self.isPending {
-		return false, nil
-	}
-	fleet, err := c.listRollouts()
+	return c.admitRollout(ctx, node.Name)
+}
+
+func (c *Controller) admitRollout(ctx context.Context, nodeName string) (bool, error) {
+	c.rolloutMu.Lock()
+	defer c.rolloutMu.Unlock()
+	fleet, err := c.listRollouts(ctx)
 	if err != nil {
 		return false, err
 	}
-	if reason := rolloutHoldReason(fleet, self, c.config.Deploy.CaddyImage); reason != "" {
-		log.Debug().Str("node", nodeName).Str("reason", reason).Msg("Holding Caddy rollout")
+	image := c.config.Deploy.CaddyImage
+	reason, blocker := rolloutHold(fleet, nodeName, image)
+	if reason != "" {
+		logRolloutHold(nodeName, reason, c.blockerProblem(blocker, image))
+		c.queue.AddAfter(nodeName, requeueInterval)
 		return true, nil
 	}
 	log.Info().Str("node", nodeName).Msg("Rolling out Caddy")
-	return false, nil
+	return false, caddy.ApplyDeployment(ctx, c.config.Deploy, nodeName)
 }
 
-func rolloutHoldReason(fleet []nodeRollout, self nodeRollout, image string) string {
-	firstPending, unavailable := "", ""
+func logRolloutHold(nodeName, reason, problem string) {
+	if problem == "" {
+		log.Debug().Str("node", nodeName).Str("reason", reason).Msg("Holding Caddy rollout")
+		return
+	}
+	sampled := log.Logger.Sample(stuckRolloutSampler)
+	sampled.Warn().Str("node", nodeName).Str("reason", reason).Str("status", problem).
+		Msg("Caddy rollout is stuck; fix or cordon the blocking node")
+}
+
+func rolloutHold(fleet []nodeRollout, selfName, image string) (string, *nodeRollout) {
+	var self, unavailable *nodeRollout
+	firstPending := ""
 	for _, node := range fleet {
 		if node.needsPrePull && !node.hasPrePulled(image) {
-			return "waiting for the image pre-pull on node " + node.name
+			return "waiting for the image pre-pull on node " + node.name, &node
 		}
-		if node.name != self.name && !node.isAvailable {
-			unavailable = node.name
+		switch {
+		case node.name == selfName:
+			self = &node
+		case !node.isAvailable:
+			unavailable = &node
 		}
 		if node.isPending && (firstPending == "" || node.name < firstPending) {
 			firstPending = node.name
 		}
 	}
 	switch {
-	case !self.isAvailable:
-		return ""
-	case unavailable != "":
-		return "waiting for node " + unavailable + " to become available"
+	case self == nil:
+		return "node is cordoned or not ready", nil
+	case !self.isPending || !self.isAvailable:
+		return "", nil
+	case unavailable != nil:
+		return "waiting for node " + unavailable.name + " to become available", unavailable
 	case firstPending != self.name:
-		return "waiting for node " + firstPending + " to roll out first"
+		return "waiting for node " + firstPending + " to roll out first", nil
+	}
+	return "", nil
+}
+
+func (c *Controller) blockerProblem(blocker *nodeRollout, image string) string {
+	switch {
+	case blocker == nil:
+		return ""
+	case blocker.needsPrePull && !blocker.hasPrePulled(image):
+		return blocker.prePullProblem(image)
+	case !blocker.isAvailable:
+		return c.caddyProblem(*blocker)
 	}
 	return ""
 }
 
-func (r nodeRollout) prePullProblem() string {
-	if !r.needsPrePull || r.prePull == nil || caddy.IsImagePrePulled(r.prePull) {
+func (r nodeRollout) prePullProblem(image string) string {
+	if r.prePull == nil || caddy.PrePullPodImage(r.prePull) != image {
 		return ""
 	}
-	return caddy.PrePullProblem(r.prePull)
+	return caddy.PodProblem(r.prePull)
 }
 
 func (r nodeRollout) hasPrePulled(image string) bool {
 	return r.prePull != nil && caddy.PrePullPodImage(r.prePull) == image && caddy.IsImagePrePulled(r.prePull)
 }
 
-func (c *Controller) listRollouts() ([]nodeRollout, error) {
+func (c *Controller) caddyProblem(rollout nodeRollout) string {
+	pods, err := c.podLister.Pods(c.config.Namespace).List(labels.SelectorFromSet(caddy.ManagedLabels(rollout.name)))
+	if err != nil {
+		return ""
+	}
+	for _, pod := range pods {
+		if !caddy.IsActivePod(pod) {
+			continue
+		}
+		if problem := caddy.PodProblem(pod); problem != "" {
+			return problem
+		}
+	}
+	return caddy.DeploymentProblem(rollout.deployment, time.Now())
+}
+
+func (c *Controller) listRollouts(ctx context.Context) ([]nodeRollout, error) {
 	nodes, err := c.nodeLister.List(c.nodeSelector)
+	if err != nil {
+		return nil, err
+	}
+	deployments, err := caddy.ListDeployments(ctx, c.config.Deploy)
 	if err != nil {
 		return nil, err
 	}
 	fleet := make([]nodeRollout, 0, len(nodes))
 	for _, node := range nodes {
-		fleet = append(fleet, c.nodeRollout(node.Name))
+		if isInService(node) {
+			fleet = append(fleet, c.nodeRollout(node, deployments[caddy.DeploymentName(node.Name)]))
+		}
 	}
 	return fleet, nil
 }
 
-func (c *Controller) nodeRollout(nodeName string) nodeRollout {
-	opts := c.config.Deploy
-	rollout := nodeRollout{name: nodeName, isAvailable: true}
-	if prePull, err := c.podLister.Pods(c.config.Namespace).Get(caddy.PrePullPodName(nodeName)); err == nil {
-		rollout.prePull = prePull
-	}
+func (c *Controller) cachedDeployment(nodeName string) *appsv1.Deployment {
 	deployment, err := c.deployLister.Deployments(c.config.Namespace).Get(caddy.DeploymentName(nodeName))
 	if err != nil {
+		return nil
+	}
+	return deployment
+}
+
+func (c *Controller) nodeRollout(node *corev1.Node, deployment *appsv1.Deployment) nodeRollout {
+	opts := c.config.Deploy
+	rollout := nodeRollout{name: node.Name, isInService: isInService(node), isAvailable: true, deployment: deployment}
+	if prePull, err := c.podLister.Pods(c.config.Namespace).Get(caddy.PrePullPodName(node.Name)); err == nil {
+		rollout.prePull = prePull
+	}
+	if deployment == nil {
 		return rollout
 	}
-	rollout.isPending = caddy.AppliedTemplateHash(deployment) != caddy.TemplateHash(opts, nodeName)
+	rollout.isPending = caddy.AppliedTemplateHash(deployment) != caddy.TemplateHash(opts, node.Name)
 	rollout.isAvailable = isRolledOut(deployment)
-	rollout.needsPrePull = rollout.isPending && opts.PrePullImage && caddyImageOf(deployment) != opts.CaddyImage
+	rollout.needsPrePull = rollout.isPending && rollout.isInService && opts.PrePullImage && caddyImageOf(deployment) != opts.CaddyImage
 	return rollout
+}
+
+func isInService(node *corev1.Node) bool {
+	if node.Spec.Unschedulable {
+		return false
+	}
+	for _, condition := range node.Status.Conditions {
+		if condition.Type == corev1.NodeReady {
+			return condition.Status == corev1.ConditionTrue
+		}
+	}
+	return false
 }
 
 func (c *Controller) syncPrePullPod(ctx context.Context, rollout nodeRollout, now time.Time) error {

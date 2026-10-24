@@ -8,11 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/validate/content"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation"
 	appsv1ac "k8s.io/client-go/applyconfigurations/apps/v1"
@@ -131,22 +133,22 @@ func applyOptions() metav1.ApplyOptions {
 	return metav1.ApplyOptions{FieldManager: fieldManager, Force: true}
 }
 
-func EnsureCaddy(ctx context.Context, opts DeployOptions, nodeName string, externalIPs []string) error {
+func ApplyDeployment(ctx context.Context, opts DeployOptions, nodeName string) error {
 	if err := ValidateName("instance label for node", nodeName, content.IsLabelValue); err != nil {
 		return err
 	}
-	deploymentName := DeploymentName(nodeName)
 	if _, err := opts.Clientset.AppsV1().Deployments(opts.Namespace).
 		Apply(ctx, deploymentApplyConfig(opts, nodeName), applyOptions()); err != nil {
-		return fmt.Errorf("failed to apply deployment %s: %w", deploymentName, err)
+		return fmt.Errorf("failed to apply deployment %s: %w", DeploymentName(nodeName), err)
 	}
-	if err := ensureLoadBalancerService(ctx, opts, nodeName, externalIPs); err != nil {
-		return err
-	}
-	return deleteDeploymentsExcept(ctx, opts, nodeName, deploymentName)
+	return nil
 }
 
-func ensureLoadBalancerService(ctx context.Context, opts DeployOptions, nodeName string, externalIPs []string) error {
+func DeleteStaleDeployments(ctx context.Context, opts DeployOptions, nodeName string) error {
+	return deleteDeploymentsExcept(ctx, opts, nodeName, DeploymentName(nodeName))
+}
+
+func EnsureLoadBalancerService(ctx context.Context, opts DeployOptions, nodeName string, externalIPs []string) error {
 	if !opts.EnableCiliumLB {
 		return deleteServicesExcept(ctx, opts, nodeName, "")
 	}
@@ -181,8 +183,8 @@ func deploymentApplyConfig(opts DeployOptions, nodeName string) *appsv1ac.Deploy
 	strategy := appsv1ac.DeploymentStrategy().
 		WithType(appsv1.RollingUpdateDeploymentStrategyType).
 		WithRollingUpdate(appsv1ac.RollingUpdateDeployment().
-			WithMaxSurge(intstr.FromString("25%")).
-			WithMaxUnavailable(intstr.FromString("25%")))
+			WithMaxSurge(intstr.FromInt32(1)).
+			WithMaxUnavailable(intstr.FromInt32(0)))
 	if opts.UseHostNetwork {
 		strategy = appsv1ac.DeploymentStrategy().WithType(appsv1.RecreateDeploymentStrategyType)
 	}
@@ -323,6 +325,19 @@ func loadBalancerServiceApplyConfig(namespace, nodeName string, externalIPs []st
 			WithPorts(ports...))
 }
 
+func ListDeployments(ctx context.Context, opts DeployOptions) (map[string]*appsv1.Deployment, error) {
+	selector := labels.SelectorFromSet(map[string]string{labelApp: labelAppValue, labelCaddyManaged: labelManagedValue})
+	list, err := opts.Clientset.AppsV1().Deployments(opts.Namespace).List(ctx, metav1.ListOptions{LabelSelector: selector.String()})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list Caddy deployments: %w", err)
+	}
+	deployments := make(map[string]*appsv1.Deployment, len(list.Items))
+	for idx := range list.Items {
+		deployments[list.Items[idx].Name] = &list.Items[idx]
+	}
+	return deployments, nil
+}
+
 func FindActivePod(ctx context.Context, opts DeployOptions, nodeName string) (Pod, error) {
 	pods, err := opts.Clientset.CoreV1().Pods(opts.Namespace).List(ctx, managedListOptions(nodeName))
 	if err != nil {
@@ -339,8 +354,7 @@ func selectNewestActivePod(pods []corev1.Pod) (*corev1.Pod, bool) {
 	var selected *corev1.Pod
 	for idx := range pods {
 		pod := &pods[idx]
-		if pod.DeletionTimestamp != nil ||
-			pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded {
+		if !IsActivePod(pod) {
 			continue
 		}
 		if selected == nil {
@@ -355,6 +369,57 @@ func selectNewestActivePod(pods []corev1.Pod) (*corev1.Pod, bool) {
 		}
 	}
 	return selected, selected != nil
+}
+
+func IsActivePod(pod *corev1.Pod) bool {
+	return pod.DeletionTimestamp == nil && pod.Status.Phase != corev1.PodFailed && pod.Status.Phase != corev1.PodSucceeded
+}
+
+func PodProblem(pod *corev1.Pod) string {
+	if pod.Status.Phase == corev1.PodFailed {
+		return "pod failed: " + pod.Status.Reason
+	}
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodScheduled && condition.Status == corev1.ConditionFalse {
+			return condition.Reason + ": " + condition.Message
+		}
+	}
+	for _, status := range pod.Status.ContainerStatuses {
+		if waiting := status.State.Waiting; waiting != nil && waiting.Reason != "ContainerCreating" {
+			return waiting.Reason + ": " + waiting.Message
+		}
+	}
+	return ""
+}
+
+func DeploymentProblem(deployment *appsv1.Deployment, now time.Time) string {
+	failure := deploymentCondition(deployment, appsv1.DeploymentReplicaFailure)
+	progressing := deploymentCondition(deployment, appsv1.DeploymentProgressing)
+	available := deploymentCondition(deployment, appsv1.DeploymentAvailable)
+	switch {
+	case failure.Status == corev1.ConditionTrue:
+		return failure.Reason + ": " + failure.Message
+	case progressing.Status == corev1.ConditionFalse:
+		return progressing.Reason + ": " + progressing.Message
+	case available.Status == corev1.ConditionFalse && isPastProgressDeadline(deployment, available, now):
+		return available.Reason + ": " + available.Message
+	}
+	return ""
+}
+
+func isPastProgressDeadline(deployment *appsv1.Deployment, available appsv1.DeploymentCondition, now time.Time) bool {
+	deadline := deployment.Spec.ProgressDeadlineSeconds
+	return deadline != nil && deployment.Status.ObservedGeneration >= deployment.Generation &&
+		now.Sub(available.LastTransitionTime.Time) > time.Duration(*deadline)*time.Second
+}
+
+func deploymentCondition(deployment *appsv1.Deployment, conditionType appsv1.DeploymentConditionType) appsv1.DeploymentCondition {
+	for _, condition := range deployment.Status.Conditions {
+		if condition.Type == conditionType {
+			return condition
+		}
+	}
+	return appsv1.DeploymentCondition{}
 }
 
 func caddyContainerID(pod *corev1.Pod) string {

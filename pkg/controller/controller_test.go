@@ -52,7 +52,7 @@ func TestReconcileNodePushesOnlyWhenNeeded(t *testing.T) {
 	t.Cleanup(c.queue.ShutDown)
 	addNode(t, c)
 	pod := caddy.Pod{IP: "192.0.2.1", ContainerID: "container-1"}
-	c.deployFn = func(context.Context, string) (caddy.Pod, error) {
+	c.deployFn = func(context.Context, *corev1.Node) (caddy.Pod, error) {
 		return pod, nil
 	}
 	var pushes []string
@@ -110,7 +110,7 @@ func TestReconcileNodeTearsDownUnmanagedNode(t *testing.T) {
 	t.Parallel()
 	client := fake.NewClientset(&appsv1.Deployment{Name: "caddy-gone", Namespace: "caddy-system", Labels: caddy.ManagedLabels("gone")})
 	c := newTestController(t, client)
-	c.deployFn = func(context.Context, string) (caddy.Pod, error) {
+	c.deployFn = func(context.Context, *corev1.Node) (caddy.Pod, error) {
 		t.Fatal("deployFn must not be called for an unmanaged node")
 		return caddy.Pod{}, errors.New("unreachable")
 	}
@@ -136,7 +136,7 @@ func TestRunWaitsForBaseAndPushesAllConfigFragments(t *testing.T) {
 		t.Fatal(err)
 	}
 	deployed := make(chan struct{}, 1)
-	c.deployFn = func(context.Context, string) (caddy.Pod, error) {
+	c.deployFn = func(context.Context, *corev1.Node) (caddy.Pod, error) {
 		select {
 		case deployed <- struct{}{}:
 		default:
@@ -250,7 +250,7 @@ func TestBootSnapshotKeepsLoadedConfigAcrossWriteFailures(t *testing.T) {
 	if err := c.aggregator.InitializeMirror(t.Context(), "bootstrap"); err != nil {
 		t.Fatal(err)
 	}
-	c.deployFn = func(context.Context, string) (caddy.Pod, error) {
+	c.deployFn = func(context.Context, *corev1.Node) (caddy.Pod, error) {
 		return caddy.Pod{IP: "192.0.2.1", ContainerID: "container-1"}, nil
 	}
 	pushes := 0
@@ -310,18 +310,42 @@ func TestRolloutPrePullsEverywhereThenRollsOneNodeAtATime(t *testing.T) {
 	nodes := c.nodeFactory.Core().V1().Nodes().Informer().GetStore()
 	deployments := c.nsFactory.Apps().V1().Deployments().Informer().GetStore()
 	pods := c.nsFactory.Core().V1().Pods().Informer().GetStore()
-	setDeployment := func(node, hash string, isAvailable bool) {
+	setAPIDeployment := func(node, image string, isAvailable bool) *appsv1.Deployment {
 		t.Helper()
+		opts := c.config.Deploy
+		opts.CaddyImage = image
 		deployment := &appsv1.Deployment{
-			Name: caddy.DeploymentName(node), Namespace: "system", Generation: 2,
-			Annotations: map[string]string{"ckic.cmld.ru/template-hash": hash},
+			Name: caddy.DeploymentName(node), Namespace: "system", Generation: 2, Labels: caddy.ManagedLabels(node),
+			Annotations: map[string]string{"ckic.cmld.ru/template-hash": caddy.TemplateHash(opts, node)},
 		}
-		deployment.Spec.Template.Spec.Containers = []corev1.Container{{Name: "caddy", Image: "caddy:old"}}
-		deployment.Status = appsv1.DeploymentStatus{ObservedGeneration: 2, Replicas: 1, UpdatedReplicas: 1}
-		if isAvailable {
-			deployment.Status.AvailableReplicas = 1
+		deployment.Spec.Template.Spec.Containers = []corev1.Container{{Name: "caddy", Image: image}}
+		deployment.Status = appsv1.DeploymentStatus{ObservedGeneration: 2, Replicas: 1, UpdatedReplicas: 1, AvailableReplicas: 1}
+		if !isAvailable {
+			deployment.Generation = 3
 		}
-		if err := deployments.Update(deployment); err != nil {
+		api := client.AppsV1().Deployments("system")
+		_, err := api.Update(t.Context(), deployment.DeepCopy(), metav1.UpdateOptions{})
+		if apierrors.IsNotFound(err) {
+			_, err = api.Create(t.Context(), deployment.DeepCopy(), metav1.CreateOptions{})
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		return deployment
+	}
+	setDeployment := func(node, image string, isAvailable bool) {
+		t.Helper()
+		if err := deployments.Update(setAPIDeployment(node, image, isAvailable)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setNode := func(name string, isReady bool) {
+		t.Helper()
+		ready := corev1.NodeCondition{Type: corev1.NodeReady, Status: corev1.ConditionFalse}
+		if isReady {
+			ready.Status = corev1.ConditionTrue
+		}
+		if err := nodes.Update(&corev1.Node{Name: name, Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{ready}}}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -347,53 +371,67 @@ func TestRolloutPrePullsEverywhereThenRollsOneNodeAtATime(t *testing.T) {
 			}
 		}
 	}
-	isHeld := func(node string) bool {
+	isHeld := func(name string) bool {
 		t.Helper()
+		node, err := c.nodeLister.Get(name)
+		if err != nil {
+			t.Fatal(err)
+		}
 		held, err := c.syncRollout(t.Context(), node)
 		if err != nil {
 			t.Fatal(err)
 		}
 		return held
 	}
-	for _, node := range []string{"a", "b"} {
-		if err := nodes.Add(&corev1.Node{Name: node}); err != nil {
-			t.Fatal(err)
-		}
-		setDeployment(node, "outdated", true)
+	for _, node := range []string{"a", "b", "c"} {
+		setNode(node, node != "a")
+		setDeployment(node, "caddy:old", node != "a")
 	}
-	if !isHeld("a") || !isHeld("b") {
+	if !isHeld("a") || !isHeld("b") || !isHeld("c") {
 		t.Fatal("a node rolled out before every node pre-pulled the image")
 	}
 	syncPrePulls()
 	if len(pods.List()) != 2 {
-		t.Fatalf("pre-pull pods = %d, want one per pending node", len(pods.List()))
+		t.Fatalf("pre-pull pods = %d, want one per pending node in service", len(pods.List()))
 	}
-	if !isHeld("b") || isHeld("a") {
-		t.Fatal("pending nodes must roll out one at a time in name order")
+	if !isHeld("a") {
+		t.Fatal("a node that is not ready was rolled out")
 	}
-	setDeployment("a", caddy.TemplateHash(c.config.Deploy, "a"), false)
-	if !isHeld("b") {
-		t.Fatal("b rolled out while a was still rolling out")
+	if !isHeld("c") || isHeld("b") {
+		t.Fatal("pending nodes in service must roll out one at a time in name order")
 	}
-	if isHeld("a") {
+	setAPIDeployment("b", "caddy:new", false)
+	setNode("a", true)
+	setDeployment("a", "caddy:old", true)
+	isHeld("a")
+	syncPrePulls()
+	if !isHeld("a") {
+		t.Fatal("a node returning to service rolled out while the cache still hid the rollout of b")
+	}
+	setDeployment("b", "caddy:new", false)
+	if !isHeld("c") {
+		t.Fatal("c rolled out while b was still rolling out")
+	}
+	if isHeld("b") {
 		t.Fatal("a rolled out node must not be held")
 	}
 	syncPrePulls()
-	if len(pods.List()) != 1 {
+	if len(pods.List()) != 2 {
 		t.Fatal("rolled out node kept its pre-pull pod")
 	}
-	setDeployment("a", caddy.TemplateHash(c.config.Deploy, "a"), true)
-	if isHeld("b") {
-		t.Fatal("b was held after a finished rolling out")
+	setDeployment("b", "caddy:new", true)
+	if !isHeld("c") || isHeld("a") {
+		t.Fatal("a returned node must take its turn in name order")
 	}
-	setDeployment("b", caddy.TemplateHash(c.config.Deploy, "b"), false)
+	setDeployment("a", "caddy:new", false)
 	c.config.Deploy.CaddyImage = "caddy:newest"
 	for range 2 {
 		isHeld("a")
 		isHeld("b")
+		isHeld("c")
 		syncPrePulls()
 	}
-	if !isHeld("a") || isHeld("b") {
+	if !isHeld("b") || isHeld("a") {
 		t.Fatal("a target change mid-rollout must finish the unavailable node before touching available ones")
 	}
 }

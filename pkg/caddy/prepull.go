@@ -94,23 +94,6 @@ func IsImagePrePulled(pod *corev1.Pod) bool {
 	return false
 }
 
-func PrePullProblem(pod *corev1.Pod) string {
-	if pod.Status.Phase == corev1.PodFailed {
-		return "pod failed: " + pod.Status.Reason
-	}
-	for _, condition := range pod.Status.Conditions {
-		if condition.Type == corev1.PodScheduled && condition.Status == corev1.ConditionFalse {
-			return condition.Reason + ": " + condition.Message
-		}
-	}
-	for _, status := range pod.Status.ContainerStatuses {
-		if waiting := status.State.Waiting; status.Name == prePullContainerName && waiting != nil && waiting.Reason != "ContainerCreating" {
-			return waiting.Reason + ": " + waiting.Message
-		}
-	}
-	return ""
-}
-
 func deletePrePullPod(ctx context.Context, clientset kubernetes.Interface, namespace, podName string, uid *types.UID) error {
 	err := clientset.CoreV1().Pods(namespace).Delete(ctx, podName, metav1.DeleteOptions{
 		GracePeriodSeconds: new(int64(0)),
