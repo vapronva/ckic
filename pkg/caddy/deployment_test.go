@@ -28,7 +28,7 @@ func runningCaddyPod() *corev1.Pod {
 		Labels:    ManagedLabels(testNode),
 		Status: corev1.PodStatus{
 			Phase: corev1.PodRunning, PodIP: "192.0.2.1",
-			ContainerStatuses: []corev1.ContainerStatus{{Name: "caddy", ContainerID: "container-1"}},
+			ContainerStatuses: []corev1.ContainerStatus{{Name: "caddy", ContainerID: "container-1", Started: new(true)}},
 			Conditions:        []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
 		},
 	}
@@ -71,7 +71,7 @@ func TestApplyCaddyModeTransitions(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if pod != (Pod{NodeName: testNode, Name: "caddy-node1-abc", IP: "192.0.2.1", ContainerID: "container-1"}) {
+				if pod != (Pod{Name: "caddy-node1-abc", IP: "192.0.2.1", ContainerID: "container-1"}) {
 					t.Fatalf("pod was not resolved: %+v", pod)
 				}
 			}

@@ -210,6 +210,7 @@ func kubernetesClient(kubeconfigPath string) (*kubernetes.Clientset, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to build kubernetes config: %w", err)
 	}
+	config.QPS = -1
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create kubernetes client: %w", err)

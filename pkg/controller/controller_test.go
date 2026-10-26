@@ -56,7 +56,7 @@ func TestReconcileNodePushesOnlyWhenNeeded(t *testing.T) {
 		return pod, nil
 	}
 	var pushes []string
-	c.pushFn = func(_ context.Context, _ caddy.Pod, merged string) error {
+	c.pushFn = func(_ context.Context, _, merged string) error {
 		pushes = append(pushes, merged)
 		if merged == "rejected\n" {
 			return caddy.ErrConfigRejected
@@ -78,10 +78,9 @@ func TestReconcileNodePushesOnlyWhenNeeded(t *testing.T) {
 	reconcile("same digest and container", 1)
 	c.aggregator.UpdateBase("changed\n")
 	reconcile("config change", 2)
-	pod.ContainerID = "container-2"
-	pod.IP = ""
+	pod.ContainerID = ""
 	reconcile("container restarting", 2)
-	pod.IP = "192.0.2.1"
+	pod.ContainerID = "container-2"
 	reconcile("container restarted", 3)
 	c.forceConfigResync()
 	reconcile("forced resync", 4)
@@ -144,7 +143,7 @@ func TestRunWaitsForBaseAndPushesAllConfigFragments(t *testing.T) {
 		return caddy.Pod{IP: "192.0.2.1", ContainerID: "container-1"}, nil
 	}
 	pushed := make(chan string, 1)
-	c.pushFn = func(_ context.Context, _ caddy.Pod, config string) error {
+	c.pushFn = func(_ context.Context, _, config string) error {
 		select {
 		case pushed <- config:
 		default:
@@ -254,7 +253,7 @@ func TestBootSnapshotKeepsLoadedConfigAcrossWriteFailures(t *testing.T) {
 		return caddy.Pod{IP: "192.0.2.1", ContainerID: "container-1"}, nil
 	}
 	pushes := 0
-	c.pushFn = func(_ context.Context, _ caddy.Pod, merged string) error {
+	c.pushFn = func(_ context.Context, _, merged string) error {
 		pushes++
 		if merged != "loaded\n" {
 			return caddy.ErrConfigRejected

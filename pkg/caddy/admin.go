@@ -12,8 +12,6 @@ import (
 	"slices"
 	"strconv"
 	"time"
-
-	"github.com/rs/zerolog/log"
 )
 
 const (
@@ -54,11 +52,8 @@ func (a *Admin) BootstrapCaddyfile() string {
 	return fmt.Sprintf("{\n\tadmin %s {\n\t\torigins %s\n\t\tenforce_origin\n\t}\n}\n", adminListen, adminOrigin(a.originKey))
 }
 
-func (a *Admin) Load(ctx context.Context, pod Pod, caddyfile string) error {
-	if pod.IP == "" {
-		return errors.New("caddy pod IP is empty")
-	}
-	adminURL := "http://" + net.JoinHostPort(pod.IP, strconv.Itoa(adminPort))
+func (a *Admin) Load(ctx context.Context, podIP, caddyfile string) error {
+	adminURL := "http://" + net.JoinHostPort(podIP, strconv.Itoa(adminPort))
 	adaptRequest, err := a.newRequest(ctx, adminURL+"/adapt", "text/caddyfile", []byte(caddyfile))
 	if err != nil {
 		return err
@@ -83,11 +78,8 @@ func (a *Admin) Load(ctx context.Context, pod Pod, caddyfile string) error {
 	if a.forceReload {
 		loadRequest.Header.Set("Cache-Control", "must-revalidate")
 	}
-	if _, err := a.do(loadRequest); err != nil {
-		return err
-	}
-	log.Info().Str("node", pod.NodeName).Str("pod", pod.Name).Msg("Updated Caddy configuration")
-	return nil
+	_, err = a.do(loadRequest)
+	return err
 }
 
 func (a *Admin) checkAdminReachable(config json.RawMessage) error {

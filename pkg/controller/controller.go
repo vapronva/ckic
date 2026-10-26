@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -53,26 +54,24 @@ type pushRecord struct {
 }
 
 type Controller struct {
-	clientset         kubernetes.Interface
-	config            Config
-	admin             *caddy.Admin
-	aggregator        *aggregator.Aggregator
-	nodeSelector      labels.Selector
-	allowedNamespaces map[string]struct{}
-	deniedNamespaces  map[string]struct{}
-	nodeFactory       informers.SharedInformerFactory
-	nsFactory         informers.SharedInformerFactory
-	extFactory        informers.SharedInformerFactory
-	nodeLister        corev1listers.NodeLister
-	deployLister      appsv1listers.DeploymentLister
-	podLister         corev1listers.PodLister
-	cacheSyncs        []cache.InformerSynced
-	queue             workqueue.TypedRateLimitingInterface[string]
-	rolloutMu         sync.Mutex
-	pushMu            sync.Mutex
-	pushState         map[string]pushRecord
-	deployFn          func(context.Context, *corev1.Node) (caddy.Pod, error)
-	pushFn            func(context.Context, caddy.Pod, string) error
+	clientset    kubernetes.Interface
+	config       Config
+	admin        *caddy.Admin
+	aggregator   *aggregator.Aggregator
+	nodeSelector labels.Selector
+	nodeFactory  informers.SharedInformerFactory
+	nsFactory    informers.SharedInformerFactory
+	extFactory   informers.SharedInformerFactory
+	nodeLister   corev1listers.NodeLister
+	deployLister appsv1listers.DeploymentLister
+	podLister    corev1listers.PodLister
+	cacheSyncs   []cache.InformerSynced
+	queue        workqueue.TypedRateLimitingInterface[string]
+	rolloutMu    sync.Mutex
+	pushMu       sync.Mutex
+	pushState    map[string]pushRecord
+	deployFn     func(context.Context, *corev1.Node) (caddy.Pod, error)
+	pushFn       func(ctx context.Context, podIP, caddyfile string) error
 }
 
 func NewController(clientset kubernetes.Interface, config Config) (*Controller, error) {
@@ -85,15 +84,13 @@ func NewController(clientset kubernetes.Interface, config Config) (*Controller, 
 	config.Deploy.BootConfigMapName = config.BootConfigMapName
 	admin := caddy.NewAdmin(config.Deploy.CaddyAdminOriginKey, config.ForceReload)
 	c := &Controller{
-		clientset:         clientset,
-		config:            config,
-		admin:             admin,
-		nodeSelector:      selector,
-		allowedNamespaces: namespaceSet(config.ExternalAllowNamespaces),
-		deniedNamespaces:  namespaceSet(config.ExternalDenyNamespaces),
-		queue:             workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
-		pushState:         make(map[string]pushRecord),
-		pushFn:            admin.Load,
+		clientset:    clientset,
+		config:       config,
+		admin:        admin,
+		nodeSelector: selector,
+		queue:        workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
+		pushState:    make(map[string]pushRecord),
+		pushFn:       admin.Load,
 	}
 	c.deployFn = c.deployNode
 	c.aggregator = aggregator.New(clientset, config.Namespace, config.BootConfigMapName, c.enqueueManagedNodes)
@@ -124,6 +121,11 @@ func validateConfig(config Config) (Config, labels.Selector, error) {
 			return config, nil, errors.New("external label selector must not be empty")
 		}
 		config.ExternalLabel = externalSelector.String()
+		for _, namespace := range slices.Concat(config.ExternalAllowNamespaces, config.ExternalDenyNamespaces) {
+			if err := caddy.ValidateName("external namespace", namespace, content.IsDNS1123Label); err != nil {
+				return config, nil, err
+			}
+		}
 	}
 	if err := errors.Join(
 		caddy.ValidateName("namespace", config.Namespace, content.IsDNS1123Label),
@@ -136,14 +138,6 @@ func validateConfig(config Config) (Config, labels.Selector, error) {
 		return config, nil, errors.New("external aggregated config name must differ from the base config-map name")
 	}
 	return config, selector, nil
-}
-
-func namespaceSet(namespaces []string) map[string]struct{} {
-	set := make(map[string]struct{}, len(namespaces))
-	for _, ns := range namespaces {
-		set[ns] = struct{}{}
-	}
-	return set
 }
 
 func (c *Controller) setupInformers() error {
@@ -307,17 +301,11 @@ func (c *Controller) managedObjectHandler() cache.ResourceEventHandler {
 }
 
 func (c *Controller) namespaceAllowed(namespace string) bool {
-	if namespace == c.config.Namespace {
+	allowed := c.config.ExternalAllowNamespaces
+	if namespace == c.config.Namespace || slices.Contains(c.config.ExternalDenyNamespaces, namespace) {
 		return false
 	}
-	if _, denied := c.deniedNamespaces[namespace]; denied {
-		return false
-	}
-	if len(c.allowedNamespaces) == 0 {
-		return true
-	}
-	_, allowed := c.allowedNamespaces[namespace]
-	return allowed
+	return len(allowed) == 0 || slices.Contains(allowed, namespace)
 }
 
 func (c *Controller) Run(ctx context.Context) error {

@@ -75,7 +75,7 @@ func TestLoadPushesAdaptedJSON(t *testing.T) {
 			defer transport.CloseIdleConnections()
 			admin := NewAdmin("key", test.forceReload)
 			admin.client.Transport = transport
-			err := admin.Load(t.Context(), Pod{NodeName: "node1", IP: "192.0.2.1"}, "config")
+			err := admin.Load(t.Context(), "192.0.2.1", "config")
 			if (err != nil) != test.wantError || errors.Is(err, ErrConfigRejected) != test.wantRejected {
 				t.Fatalf("Load = %v, want error=%v rejected=%v", err, test.wantError, test.wantRejected)
 			}

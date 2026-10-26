@@ -80,7 +80,6 @@ type DeployOptions struct {
 }
 
 type Pod struct {
-	NodeName    string
 	Name        string
 	IP          string
 	ContainerID string
@@ -347,7 +346,7 @@ func FindActivePod(ctx context.Context, opts DeployOptions, nodeName string) (Po
 	if !ok {
 		return Pod{}, nil
 	}
-	return Pod{NodeName: nodeName, Name: pod.Name, IP: pod.Status.PodIP, ContainerID: caddyContainerID(pod)}, nil
+	return Pod{Name: pod.Name, IP: pod.Status.PodIP, ContainerID: startedCaddyContainerID(pod)}, nil
 }
 
 func selectNewestActivePod(pods []corev1.Pod) (*corev1.Pod, bool) {
@@ -422,9 +421,9 @@ func deploymentCondition(deployment *appsv1.Deployment, conditionType appsv1.Dep
 	return appsv1.DeploymentCondition{}
 }
 
-func caddyContainerID(pod *corev1.Pod) string {
+func startedCaddyContainerID(pod *corev1.Pod) string {
 	for _, status := range pod.Status.ContainerStatuses {
-		if status.Name == caddyContainerName {
+		if status.Name == caddyContainerName && status.Started != nil && *status.Started {
 			return status.ContainerID
 		}
 	}
