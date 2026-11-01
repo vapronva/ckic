@@ -1,0 +1,29 @@
+{{- if and .Values.adminNetworkPolicy (not .Values.config.useHostNetwork) }}
+---
+kind: NetworkPolicy
+apiVersion: networking.k8s.io/v1
+
+metadata:
+  name: {{ include "ckic-manager.fullname" . }}-caddy-admin
+  labels:
+    {{- include "ckic-manager.labels" . | nindent 4 }}
+
+spec:
+  podSelector:
+    matchLabels:
+      app: caddy
+      ckic.cmld.ru/caddy-managed: "true"
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "ckic-manager.selectorLabels" . | nindent 14 }}
+      ports:
+        - { port: 2019, protocol: TCP }
+    - ports:
+        - { port: 1, endPort: 2018, protocol: TCP }
+        - { port: 2020, endPort: 65535, protocol: TCP }
+        - { port: 1, endPort: 65535, protocol: UDP }
+{{- end }}

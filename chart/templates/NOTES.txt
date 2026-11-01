@@ -1,6 +1,10 @@
 CKIC manager installed.
 
-Caddy's admin API on :2019 requires network isolation. The Origin check is not authentication.
+{{- if and .Values.adminNetworkPolicy (not .Values.config.useHostNetwork) }}
+Only the manager may reach Caddy's admin API on :2019; this needs a CNI that enforces NetworkPolicy.
+{{- else }}
+Caddy's admin API on :2019 requires network isolation (adminNetworkPolicy=true, or your own). The Origin check is not authentication.
+{{- end }}
 
 {{- if and .Values.config.useHostNetwork (ne .Values.loadBalancer.mode "none") }}
 

@@ -122,14 +122,14 @@ func (a *Aggregator) CurrentMerged() (Snapshot, error) {
 	return Snapshot{Caddyfile: merged, Revision: a.revision}, nil
 }
 
-func (a *Aggregator) InitializeMirror(ctx context.Context, bootstrap string) error {
+func (a *Aggregator) InitializeMirror(ctx context.Context, bootstrap string, bootable func(string) bool) error {
 	ctx, cancel := context.WithTimeout(ctx, mirrorPublishTimeout)
 	defer cancel()
 	accepted, err := a.readMirror(ctx)
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(accepted) == "" {
+	if strings.TrimSpace(accepted) == "" || !bootable(accepted) {
 		accepted = bootstrap
 		if err := a.publishMirror(ctx, accepted); err != nil {
 			return err

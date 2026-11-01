@@ -46,7 +46,7 @@ func TestBootMirrorKeepsAcceptedSnapshot(t *testing.T) {
 	client := fake.NewClientset()
 	agg := aggregator.New(client, "system", "accepted", nil)
 	const bootstrap = "{\n\tadmin :2019\n}\n"
-	if err := agg.InitializeMirror(t.Context(), bootstrap); err != nil {
+	if err := agg.InitializeMirror(t.Context(), bootstrap, func(string) bool { return true }); err != nil {
 		t.Fatal(err)
 	}
 	checkMirror := func(want string) {
@@ -95,7 +95,7 @@ func TestBootMirrorKeepsAcceptedSnapshot(t *testing.T) {
 	publish()
 	checkMirror("newer\n")
 	restarted := aggregator.New(client, "system", "accepted", nil)
-	if err := restarted.InitializeMirror(t.Context(), bootstrap); err != nil {
+	if err := restarted.InitializeMirror(t.Context(), bootstrap, func(string) bool { return true }); err != nil {
 		t.Fatal(err)
 	}
 	restarted.UpdateBase("invalid\n")
@@ -118,7 +118,7 @@ func TestBootMirrorRepairsMissingCaddyfile(t *testing.T) {
 		client := fake.NewClientset(&corev1.ConfigMap{Name: "accepted", Namespace: "system", Data: data})
 		agg := aggregator.New(client, "system", "accepted", nil)
 		const bootstrap = "{\n\tadmin :2019\n}\n"
-		if err := agg.InitializeMirror(t.Context(), bootstrap); err != nil {
+		if err := agg.InitializeMirror(t.Context(), bootstrap, func(string) bool { return true }); err != nil {
 			t.Fatal(err)
 		}
 		mirror, err := client.CoreV1().ConfigMaps("system").Get(t.Context(), "accepted", metav1.GetOptions{})

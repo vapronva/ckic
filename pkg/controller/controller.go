@@ -311,7 +311,7 @@ func (c *Controller) namespaceAllowed(namespace string) bool {
 func (c *Controller) Run(ctx context.Context) error {
 	defer c.queue.ShutDown()
 	logger := log.With().Str("component", "controller").Logger()
-	if err := c.aggregator.InitializeMirror(ctx, c.admin.BootstrapCaddyfile()); err != nil {
+	if err := c.aggregator.InitializeMirror(ctx, c.admin.BootstrapCaddyfile(), c.admin.Bootable); err != nil {
 		return err
 	}
 	stopCh := ctx.Done()
