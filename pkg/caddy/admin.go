@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"slices"
 	"strconv"
-	"strings"
 	"time"
 )
 
@@ -42,17 +41,8 @@ func NewAdmin(originKey string, forceReload bool) *Admin {
 	}
 }
 
-const adminOriginDomain = ".caddy-admin-api.ckic.cmld.ru"
-
 func adminOrigin(originKey string) string {
-	return "http://" + originKey + adminOriginDomain
-}
-
-func (a *Admin) Bootable(caddyfile string) bool {
-	if a.originKey == "" {
-		return !strings.Contains(caddyfile, adminOriginDomain)
-	}
-	return strings.Contains(caddyfile, adminOrigin(a.originKey))
+	return "http://" + originKey + ".caddy-admin-api.ckic.cmld.ru"
 }
 
 func (a *Admin) BootstrapCaddyfile() string {

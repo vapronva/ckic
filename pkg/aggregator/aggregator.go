@@ -2,6 +2,8 @@ package aggregator
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"maps"
@@ -10,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rs/zerolog/log"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -20,8 +23,9 @@ import (
 )
 
 const (
-	mirrorPublishTimeout = 30 * time.Second
-	mirrorFieldManager   = "ckic-aggregator"
+	mirrorPublishTimeout   = 30 * time.Second
+	mirrorFieldManager     = "ckic-aggregator"
+	annotationSnapshotHash = "ckic.cmld.ru/snapshot-hash"
 )
 
 type Snapshot struct {
@@ -40,6 +44,7 @@ type Aggregator struct {
 	clientset        kubernetes.Interface
 	namespace        string
 	mirrorName       string
+	bootstrap        string
 	enqueue          func()
 }
 
@@ -47,6 +52,7 @@ func New(
 	clientset kubernetes.Interface,
 	namespace string,
 	mirrorName string,
+	bootstrap string,
 	enqueue func(),
 ) *Aggregator {
 	return &Aggregator{
@@ -54,6 +60,7 @@ func New(
 		clientset:  clientset,
 		namespace:  namespace,
 		mirrorName: mirrorName,
+		bootstrap:  bootstrap,
 		enqueue:    enqueue,
 	}
 }
@@ -122,18 +129,20 @@ func (a *Aggregator) CurrentMerged() (Snapshot, error) {
 	return Snapshot{Caddyfile: merged, Revision: a.revision}, nil
 }
 
-func (a *Aggregator) InitializeMirror(ctx context.Context, bootstrap string, bootable func(string) bool) error {
+func (a *Aggregator) InitializeMirror(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, mirrorPublishTimeout)
 	defer cancel()
-	accepted, err := a.readMirror(ctx)
+	mirror, err := a.readMirror(ctx)
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(accepted) == "" || !bootable(accepted) {
-		accepted = bootstrap
+	accepted := mirror.Data[caddy.CaddyfileKey]
+	if mirror.Annotations[annotationSnapshotHash] != a.snapshotHash(accepted) {
+		accepted = a.bootstrap
 		if err := a.publishMirror(ctx, accepted); err != nil {
 			return err
 		}
+		log.Info().Str("configmap", a.mirrorName).Msg("Published the bootstrap Caddyfile as the boot snapshot")
 	}
 	a.mu.Lock()
 	a.accepted = accepted
@@ -141,21 +150,31 @@ func (a *Aggregator) InitializeMirror(ctx context.Context, bootstrap string, boo
 	return nil
 }
 
-func (a *Aggregator) readMirror(ctx context.Context) (string, error) {
-	mirror, err := a.clientset.CoreV1().ConfigMaps(a.namespace).Get(ctx, a.mirrorName, metav1.GetOptions{})
-	if apierrors.IsNotFound(err) {
-		return "", nil
-	}
-	if err != nil {
-		return "", fmt.Errorf("failed to read boot ConfigMap %s: %w", a.mirrorName, err)
-	}
-	return mirror.Data[caddy.CaddyfileKey], nil
+func (a *Aggregator) snapshotHash(caddyfile string) string {
+	digest := sha256.Sum256([]byte(a.bootstrap + "\x00" + caddyfile))
+	return hex.EncodeToString(digest[:8])
 }
 
-func (a *Aggregator) CurrentAccepted() (string, bool) {
+func (a *Aggregator) readMirror(ctx context.Context) (*corev1.ConfigMap, error) {
+	mirror, err := a.clientset.CoreV1().ConfigMaps(a.namespace).Get(ctx, a.mirrorName, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return &corev1.ConfigMap{}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to read boot ConfigMap %s: %w", a.mirrorName, err)
+	}
+	return mirror, nil
+}
+
+func (a *Aggregator) IsMirrorCurrent(mirror *corev1.ConfigMap) bool {
+	caddyfile := mirror.Data[caddy.CaddyfileKey]
+	return caddyfile == a.currentAccepted() && mirror.Annotations[annotationSnapshotHash] == a.snapshotHash(caddyfile)
+}
+
+func (a *Aggregator) currentAccepted() string {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return a.accepted, a.accepted != ""
+	return a.accepted
 }
 
 func (a *Aggregator) Accept(snapshot Snapshot) bool {
@@ -170,8 +189,8 @@ func (a *Aggregator) Accept(snapshot Snapshot) bool {
 }
 
 func (a *Aggregator) PublishMirror(ctx context.Context) error {
-	accepted, ok := a.CurrentAccepted()
-	if !ok {
+	accepted := a.currentAccepted()
+	if accepted == "" {
 		return fmt.Errorf("boot ConfigMap %s has not been initialized", a.mirrorName)
 	}
 	return a.publishMirror(ctx, accepted)
@@ -180,6 +199,7 @@ func (a *Aggregator) PublishMirror(ctx context.Context) error {
 func (a *Aggregator) publishMirror(ctx context.Context, accepted string) error {
 	apply := corev1ac.ConfigMap(a.mirrorName, a.namespace).
 		WithLabels(caddy.BootConfigLabels()).
+		WithAnnotations(map[string]string{annotationSnapshotHash: a.snapshotHash(accepted)}).
 		WithData(map[string]string{caddy.CaddyfileKey: accepted})
 	ctx, cancel := context.WithTimeout(ctx, mirrorPublishTimeout)
 	defer cancel()

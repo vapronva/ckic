@@ -246,7 +246,7 @@ func TestBootSnapshotKeepsLoadedConfigAcrossWriteFailures(t *testing.T) {
 	client := fake.NewClientset()
 	c := newTestController(t, client)
 	addNode(t, c)
-	if err := c.aggregator.InitializeMirror(t.Context(), "bootstrap", func(string) bool { return true }); err != nil {
+	if err := c.aggregator.InitializeMirror(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	c.deployFn = func(context.Context, *corev1.Node) (caddy.Pod, error) {

@@ -56,7 +56,6 @@ type pushRecord struct {
 type Controller struct {
 	clientset    kubernetes.Interface
 	config       Config
-	admin        *caddy.Admin
 	aggregator   *aggregator.Aggregator
 	nodeSelector labels.Selector
 	nodeFactory  informers.SharedInformerFactory
@@ -86,14 +85,13 @@ func NewController(clientset kubernetes.Interface, config Config) (*Controller, 
 	c := &Controller{
 		clientset:    clientset,
 		config:       config,
-		admin:        admin,
 		nodeSelector: selector,
 		queue:        workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
 		pushState:    make(map[string]pushRecord),
 		pushFn:       admin.Load,
 	}
 	c.deployFn = c.deployNode
-	c.aggregator = aggregator.New(clientset, config.Namespace, config.BootConfigMapName, c.enqueueManagedNodes)
+	c.aggregator = aggregator.New(clientset, config.Namespace, config.BootConfigMapName, admin.BootstrapCaddyfile(), c.enqueueManagedNodes)
 	if err := c.setupInformers(); err != nil {
 		c.queue.ShutDown()
 		return nil, err
@@ -220,7 +218,9 @@ func (c *Controller) configMapHandler() cache.ResourceEventHandler {
 			return
 		}
 		if cm.Name == c.config.BootConfigMapName {
-			c.enqueueChangedMirror(cm)
+			if !c.aggregator.IsMirrorCurrent(cm) {
+				c.queue.Add(mirrorKey)
+			}
 			return
 		}
 		if cm.Name != c.config.BaseConfigMapName {
@@ -248,13 +248,6 @@ func (c *Controller) configMapHandler() cache.ResourceEventHandler {
 				c.queue.Add(mirrorKey)
 			}
 		},
-	}
-}
-
-func (c *Controller) enqueueChangedMirror(cm *corev1.ConfigMap) {
-	accepted, ok := c.aggregator.CurrentAccepted()
-	if ok && cm.Data[caddy.CaddyfileKey] != accepted {
-		c.queue.Add(mirrorKey)
 	}
 }
 
@@ -311,7 +304,7 @@ func (c *Controller) namespaceAllowed(namespace string) bool {
 func (c *Controller) Run(ctx context.Context) error {
 	defer c.queue.ShutDown()
 	logger := log.With().Str("component", "controller").Logger()
-	if err := c.aggregator.InitializeMirror(ctx, c.admin.BootstrapCaddyfile(), c.admin.Bootable); err != nil {
+	if err := c.aggregator.InitializeMirror(ctx); err != nil {
 		return err
 	}
 	stopCh := ctx.Done()
