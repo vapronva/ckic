@@ -41,10 +41,11 @@ type Config struct {
 
 const (
 	mirrorKey            = "mirror/publish"
+	rolloutKeyPrefix     = "rollout/"
 	workerCount          = 4
 	reconcileTimeout     = 5 * time.Minute
 	informerResync       = 10 * time.Minute
-	requeueInterval      = 5 * time.Second
+	rolloutPollInterval  = 5 * time.Second
 	prePullRetryInterval = time.Minute
 )
 

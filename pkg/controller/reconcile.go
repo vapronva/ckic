@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"strings"
 
 	"github.com/rs/zerolog/log"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -33,8 +34,8 @@ func logReconcileError(key string, err error, requeues int) {
 		Str("key", key).
 		Int("requeues", requeues).
 		Logger()
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		logger.Debug().Err(err).Msg("Reconcile deadline/cancel; will retry")
+	if errors.Is(err, context.Canceled) {
+		logger.Debug().Err(err).Msg("Reconcile canceled")
 		return
 	}
 	logger.Warn().Err(err).Msg("Reconcile failed; requeueing")
@@ -46,7 +47,24 @@ func (c *Controller) reconcile(ctx context.Context, key string) error {
 	if key == mirrorKey {
 		return c.aggregator.PublishMirror(ctx)
 	}
+	if nodeName, isRollout := strings.CutPrefix(key, rolloutKeyPrefix); isRollout {
+		return c.reconcileRollout(ctx, nodeName)
+	}
 	return c.reconcileNode(ctx, key)
+}
+
+func (c *Controller) reconcileRollout(ctx context.Context, nodeName string) error {
+	node, err := c.nodeLister.Get(nodeName)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !c.isManagedNode(node) {
+		return nil
+	}
+	return c.applyCaddy(ctx, node)
 }
 
 func (c *Controller) reconcileNode(ctx context.Context, nodeName string) error {

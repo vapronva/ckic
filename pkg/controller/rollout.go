@@ -76,7 +76,7 @@ func (c *Controller) admitRollout(ctx context.Context, nodeName string) (bool, e
 	reason, blocker := rolloutHold(fleet, nodeName, image)
 	if reason != "" {
 		logRolloutHold(nodeName, reason, c.blockerProblem(blocker, image))
-		c.queue.AddAfter(nodeName, requeueInterval)
+		c.queue.AddAfter(rolloutKeyPrefix+nodeName, rolloutPollInterval)
 		return true, nil
 	}
 	log.Info().Str("node", nodeName).Msg("Rolling out Caddy")

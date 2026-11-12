@@ -63,11 +63,7 @@ func prePullPodApplyConfig(opts DeployOptions, nodeName string) *corev1ac.PodApp
 				WithCommand(caddyBinary, "version").
 				WithSecurityContext(corev1ac.SecurityContext().
 					WithAllowPrivilegeEscalation(false).
-					WithRunAsNonRoot(true).
-					WithRunAsUser(prePullRunAsID).
-					WithRunAsGroup(prePullRunAsID).
-					WithCapabilities(corev1ac.Capabilities().WithAdd("NET_BIND_SERVICE").WithDrop("ALL")).
-					WithSeccompProfile(corev1ac.SeccompProfile().WithType(corev1.SeccompProfileTypeRuntimeDefault)))))
+					WithCapabilities(corev1ac.Capabilities().WithAdd("NET_BIND_SERVICE").WithDrop("ALL")))))
 }
 
 func IsImagePrePulled(pod *corev1.Pod) bool {
