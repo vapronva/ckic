@@ -14,7 +14,7 @@ import (
 
 func TestLoadPushesAdaptedJSON(t *testing.T) {
 	t.Parallel()
-	const reachable = `{"admin":{"listen":":2019","origins":["http://key.caddy-admin-api.ckic.cmld.ru"]},"apps":{}}`
+	const reachable = `{"admin":{"listen":":2019","enforce_origin":true,"origins":["http://key.caddy-admin-api.ckic.cmld.ru"]},"apps":{}}`
 	for _, test := range []struct {
 		name, adaptation        string
 		adaptStatus, loadStatus int
@@ -32,6 +32,7 @@ func TestLoadPushesAdaptedJSON(t *testing.T) {
 		{"null result", `{"result":null}`, 200, 200, true, 0, true, true},
 		{"admin on loopback", `{"result":{"apps":{}}}`, 200, 200, true, 0, true, true},
 		{"admin origin dropped", `{"result":{"admin":{"listen":":2019"},"apps":{}}}`, 200, 200, true, 0, true, true},
+		{"admin origin not enforced", `{"result":{"admin":{"listen":":2019","origins":["http://key.caddy-admin-api.ckic.cmld.ru"]},"apps":{}}}`, 200, 200, true, 0, true, true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()

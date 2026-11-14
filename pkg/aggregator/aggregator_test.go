@@ -16,16 +16,16 @@ import (
 func TestCurrentMergedSortsExternalsAfterBase(t *testing.T) {
 	t.Parallel()
 	agg := aggregator.New(nil, "caddy-system", "", "", nil)
-	if _, err := agg.CurrentMerged(); err == nil {
+	if _, isLoadable := agg.CurrentMerged(); isLoadable {
 		t.Fatal("missing base was accepted")
 	}
 	agg.UpdateBase(":80 {\n  respond \"base\"\n}")
 	agg.SetExternal("team-b/cm", "b.example.com {\n  respond \"b\"\n}")
 	agg.SetExternal("team-a/cm", "a.example.com {\n  respond \"a\"\n}")
 	agg.SetExternal("team-c/cm", "   ")
-	snapshot, err := agg.CurrentMerged()
-	if err != nil {
-		t.Fatal(err)
+	snapshot, isLoadable := agg.CurrentMerged()
+	if !isLoadable {
+		t.Fatal("merged config is not loadable")
 	}
 	merged := snapshot.Caddyfile
 	if !strings.HasPrefix(merged, ":80 {\n  respond \"base\"\n}\n") {
@@ -62,9 +62,9 @@ func TestBootMirrorKeepsAcceptedSnapshot(t *testing.T) {
 	updateBase := func(base string) aggregator.Snapshot {
 		t.Helper()
 		agg.UpdateBase(base)
-		snapshot, err := agg.CurrentMerged()
-		if err != nil {
-			t.Fatal(err)
+		snapshot, isLoadable := agg.CurrentMerged()
+		if !isLoadable {
+			t.Fatal("merged config is not loadable")
 		}
 		return snapshot
 	}

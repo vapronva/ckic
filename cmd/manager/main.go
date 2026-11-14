@@ -30,8 +30,8 @@ import (
 )
 
 const (
-	probeReadHeaderTimeout = 10 * time.Second
-	leaderRunErrTimeout    = 30 * time.Second
+	probeTimeout        = 10 * time.Second
+	leaderRunErrTimeout = 30 * time.Second
 )
 
 var errLeaderElectionLost = errors.New("leader election lost")
@@ -114,7 +114,7 @@ func parseFlags() options {
 	pflag.StringVar(&deploy.ConfigVolumePVC, "config-pvc", "", "Name of PVC to use for the /config volume (defaults to HostPath if empty)")
 	pflag.StringArrayVar(&opts.externalEndpoints, "external-endpoints", nil, "External endpoints for nodes (format: nodeName=ip1,ip2,...)")
 	pflag.BoolVar(&deploy.UseHostNetwork, "use-host-network", false, "Use hostNetwork for Caddy pods")
-	pflag.StringVar(&deploy.CaddyAdminOriginKey, "caddy-admin-origin-key", "", "Origin check for the Caddy admin API (not authentication)")
+	pflag.StringVar(&deploy.CaddyAdminOriginKey, "caddy-admin-origin-key", "", "Origin the Caddy admin API requires on every request; required with --use-host-network")
 	pflag.BoolVar(&cfg.ExternalEnable, "external-enable", false, "Enable external namespace ConfigMap aggregation")
 	pflag.StringVar(&cfg.ExternalLabel, "external-label", "ckic.cmld.ru/aggregate=true", "Label selector for external ConfigMaps")
 	pflag.StringSliceVar(&cfg.ExternalAllowNamespaces, "external-allow-namespaces", nil, "Only aggregate ConfigMaps from these namespaces (empty allows all)")
@@ -331,7 +331,13 @@ func serveHealthProbes(ctx context.Context, bindAddress string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", ok)
 	mux.HandleFunc("/readyz", ok)
-	server := &http.Server{Handler: mux, ReadHeaderTimeout: probeReadHeaderTimeout}
+	server := &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: probeTimeout,
+		ReadTimeout:       probeTimeout,
+		WriteTimeout:      probeTimeout,
+		IdleTimeout:       probeTimeout,
+	}
 	log.Info().Str("bindAddress", listener.Addr().String()).Msg("Serving health probes")
 	go func() {
 		log.Error().Err(server.Serve(listener)).Msg("Probe server stopped")

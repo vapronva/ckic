@@ -61,6 +61,10 @@ func ManagedNodeName(obj metav1.Object) string {
 	return objLabels[labelInstance]
 }
 
+func prePullLabels(nodeName string) map[string]string {
+	return map[string]string{labelCaddyManaged: labelManagedValue, labelType: labelTypePrePull, labelInstance: nodeName}
+}
+
 func BootConfigLabels() map[string]string {
 	return map[string]string{labelCaddyManaged: labelManagedValue, labelType: labelTypeBootConfig}
 }

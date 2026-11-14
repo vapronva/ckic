@@ -29,7 +29,7 @@ func (c *Controller) deployNode(ctx context.Context, node *corev1.Node) (caddy.P
 	if err := c.applyCaddy(ctx, node); err != nil {
 		return caddy.Pod{}, err
 	}
-	return caddy.FindActivePod(ctx, c.config.Deploy, node.Name)
+	return caddy.FindStartedPod(ctx, c.config.Deploy, node.Name)
 }
 
 func (c *Controller) applyCaddy(ctx context.Context, node *corev1.Node) error {
@@ -191,7 +191,7 @@ func (c *Controller) cachedDeployment(nodeName string) *appsv1.Deployment {
 func (c *Controller) nodeRollout(node *corev1.Node, deployment *appsv1.Deployment) nodeRollout {
 	opts := c.config.Deploy
 	rollout := nodeRollout{name: node.Name, isInService: isInService(node), isAvailable: true, deployment: deployment}
-	if prePull, err := c.podLister.Pods(c.config.Namespace).Get(caddy.PrePullPodName(node.Name)); err == nil {
+	if prePull, err := c.podLister.Pods(c.config.Namespace).Get(caddy.PrePullPodName(node.Name)); err == nil && caddy.IsPrePullPod(prePull, node.Name) {
 		rollout.prePull = prePull
 	}
 	if deployment == nil {

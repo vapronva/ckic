@@ -1,6 +1,9 @@
 {{- if not (has .Values.loadBalancer.mode (list "none" "cilium" "shared")) }}
 {{- fail (printf "loadBalancer.mode must be one of \"none\", \"cilium\", or \"shared\"; got %q" .Values.loadBalancer.mode) }}
 {{- end }}
+{{- if and .Values.config.useHostNetwork (not .Values.config.caddyAdminOriginKey) }}
+{{- fail "config.useHostNetwork exposes Caddy's admin API on every node address; set config.caddyAdminOriginKey" }}
+{{- end }}
 ---
 kind: Deployment
 apiVersion: apps/v1

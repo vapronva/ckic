@@ -100,8 +100,8 @@ func (a *Admin) checkAdminReachable(config json.RawMessage) error {
 	if a.originKey == "" && admin.EnforceOrigin {
 		return fmt.Errorf("%w: merged Caddyfile enforces an admin origin, but no origin key is configured", ErrConfigRejected)
 	}
-	if a.originKey != "" && !slices.Contains(admin.Origins, adminOrigin(a.originKey)) {
-		return fmt.Errorf("%w: merged Caddyfile must allow the admin origin %s", ErrConfigRejected, adminOrigin(a.originKey))
+	if a.originKey != "" && (!admin.EnforceOrigin || !slices.Contains(admin.Origins, adminOrigin(a.originKey))) {
+		return fmt.Errorf("%w: merged Caddyfile must keep enforce_origin and the configured admin origin", ErrConfigRejected)
 	}
 	return nil
 }

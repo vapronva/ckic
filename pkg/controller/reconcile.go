@@ -2,8 +2,6 @@ package controller
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"strings"
 
@@ -79,9 +77,8 @@ func (c *Controller) reconcileNode(ctx context.Context, nodeName string) error {
 	if err != nil {
 		return err
 	}
-	snapshot, err := c.aggregator.CurrentMerged()
-	if err != nil {
-		log.Warn().Err(err).Str("node", nodeName).Msg("No loadable Caddy configuration; waiting for a ConfigMap change")
+	snapshot, isLoadable := c.aggregator.CurrentMerged()
+	if !isLoadable {
 		return nil
 	}
 	isLoaded, err := c.ensureLoaded(ctx, nodeName, pod, snapshot)
@@ -95,13 +92,12 @@ func (c *Controller) reconcileNode(ctx context.Context, nodeName string) error {
 }
 
 func (c *Controller) ensureLoaded(ctx context.Context, nodeName string, pod caddy.Pod, snapshot aggregator.Snapshot) (bool, error) {
-	digest := configDigest(snapshot.Caddyfile)
-	if c.pushUpToDate(nodeName, digest, pod.ContainerID) {
-		return true, nil
-	}
-	if pod.IP == "" || pod.ContainerID == "" {
-		log.Debug().Str("node", nodeName).Str("pod", pod.Name).Msg("Caddy container has not started yet")
+	if pod.ContainerID == "" {
+		log.Debug().Str("node", nodeName).Msg("No started Caddy container to push to yet")
 		return false, nil
+	}
+	if c.pushUpToDate(nodeName, snapshot.Digest, pod.ContainerID) {
+		return true, nil
 	}
 	err := c.pushFn(ctx, pod.IP, snapshot.Caddyfile)
 	if errors.Is(err, caddy.ErrConfigRejected) {
@@ -113,7 +109,7 @@ func (c *Controller) ensureLoaded(ctx context.Context, nodeName string, pod cadd
 		return false, err
 	}
 	log.Info().Str("node", nodeName).Str("pod", pod.Name).Msg("Updated Caddy configuration")
-	c.recordPush(nodeName, digest, pod.ContainerID)
+	c.recordPush(nodeName, snapshot.Digest, pod.ContainerID)
 	return true, nil
 }
 
@@ -126,9 +122,6 @@ func (c *Controller) teardownNode(ctx context.Context, nodeName string) error {
 }
 
 func (c *Controller) pushUpToDate(nodeName, digest, containerID string) bool {
-	if containerID == "" {
-		return false
-	}
 	c.pushMu.Lock()
 	defer c.pushMu.Unlock()
 	record, ok := c.pushState[nodeName]
@@ -152,9 +145,4 @@ func (c *Controller) forceConfigResync() {
 	clear(c.pushState)
 	c.pushMu.Unlock()
 	c.enqueueManagedNodes()
-}
-
-func configDigest(configData string) string {
-	sum := sha256.Sum256([]byte(configData))
-	return hex.EncodeToString(sum[:])
 }

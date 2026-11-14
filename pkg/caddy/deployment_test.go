@@ -67,7 +67,7 @@ func TestApplyCaddyModeTransitions(t *testing.T) {
 				); err != nil {
 					t.Fatal(err)
 				}
-				pod, err := FindActivePod(t.Context(), opts, testNode)
+				pod, err := FindStartedPod(t.Context(), opts, testNode)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -143,31 +143,31 @@ func TestNodeDerivedNames(t *testing.T) {
 	}
 }
 
-func TestSelectNewestActivePod(t *testing.T) {
+func TestNewestStartedPodSkipsUnstartedSurge(t *testing.T) {
 	t.Parallel()
 	now := time.Now()
-	older := metav1.NewTime(now.Add(-time.Hour))
-	newer := metav1.NewTime(now)
-	pods := []corev1.Pod{
-		{Name: "old", CreationTimestamp: older},
-		{Name: "new", CreationTimestamp: newer},
-		{Name: "failed", CreationTimestamp: metav1.NewTime(now.Add(time.Second)), Status: corev1.PodStatus{Phase: corev1.PodFailed}},
-		{Name: "succeeded", CreationTimestamp: metav1.NewTime(now.Add(time.Second)), Status: corev1.PodStatus{Phase: corev1.PodSucceeded}},
-		{Name: "terminating", CreationTimestamp: newer, DeletionTimestamp: &newer},
+	started := func(name string, created time.Time) corev1.Pod {
+		pod := *runningCaddyPod()
+		pod.Name, pod.CreationTimestamp = name, metav1.NewTime(created)
+		return pod
 	}
-	pod, ok := selectNewestActivePod(pods)
-	if !ok || pod.Name != "new" {
-		t.Fatalf("selectNewestActivePod = %v, %v; want new", pod, ok)
+	surge := corev1.Pod{Name: "surge", CreationTimestamp: metav1.NewTime(now.Add(time.Minute)), Status: corev1.PodStatus{Phase: corev1.PodPending}}
+	crashing := started("crashing", now.Add(time.Minute))
+	crashing.Status.ContainerStatuses[0].Started = new(false)
+	terminating := started("terminating", now.Add(time.Minute))
+	terminating.DeletionTimestamp = &terminating.CreationTimestamp
+	failed := started("failed", now.Add(time.Minute))
+	failed.Status.Phase = corev1.PodFailed
+	pods := []corev1.Pod{started("serving", now), surge, crashing, terminating, failed, started("older", now.Add(-time.Hour))}
+	if pod := newestStartedPod(pods); pod == nil || pod.Name != "serving" {
+		t.Fatalf("newestStartedPod = %v, want the serving pod", pod)
 	}
-	tie := []corev1.Pod{
-		{Name: "aaa", CreationTimestamp: newer},
-		{Name: "bbb", CreationTimestamp: newer},
+	tie := []corev1.Pod{started("aaa", now), started("bbb", now)}
+	if pod := newestStartedPod(tie); pod == nil || pod.Name != "bbb" {
+		t.Fatalf("tie-break = %v, want bbb", pod)
 	}
-	if tiePod, _ := selectNewestActivePod(tie); tiePod == nil || tiePod.Name != "bbb" {
-		t.Fatalf("tie-break = %v, want bbb", tiePod)
-	}
-	if _, noneOK := selectNewestActivePod(nil); noneOK {
-		t.Fatal("expected ok=false for empty input")
+	if pod := newestStartedPod([]corev1.Pod{surge}); pod != nil {
+		t.Fatalf("unstarted pod selected: %v", pod.Name)
 	}
 }
 

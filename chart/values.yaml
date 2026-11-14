@@ -10,7 +10,7 @@ updateStrategy:
 image:
   repository: docker.horse
   image: vapronva/ckic/manager
-  tag: 0.41.2
+  tag: 0.42.0
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []

@@ -57,3 +57,25 @@ func TestDeletePrePullPodPreservesReplacement(t *testing.T) {
 		t.Fatalf("replacement pre-pull pod was deleted by a stale cleanup: %v", err)
 	}
 }
+
+func TestCreatePrePullPodNeverAdoptsForeignPod(t *testing.T) {
+	t.Parallel()
+	foreign := &corev1.Pod{Name: PrePullPodName(testNode), Namespace: testNS, Labels: map[string]string{"owner": "someone-else"}}
+	client := fake.NewClientset(foreign)
+	opts := DeployOptions{Clientset: client, Namespace: testNS, CaddyImage: testImage}
+	if err := CreatePrePullPod(t.Context(), opts, testNode); err == nil {
+		t.Fatal("a foreign pod at the pre-pull name was accepted")
+	}
+	kept, err := client.CoreV1().Pods(testNS).Get(t.Context(), foreign.Name, metav1.GetOptions{})
+	if err != nil || IsPrePullPod(kept, testNode) {
+		t.Fatalf("foreign pod was deleted or relabelled: %v %v", kept.GetLabels(), err)
+	}
+	if err := client.CoreV1().Pods(testNS).Delete(t.Context(), foreign.Name, metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := CreatePrePullPod(t.Context(), opts, testNode); err != nil {
+			t.Fatalf("own pre-pull pod creation must be idempotent: %v", err)
+		}
+	}
+}

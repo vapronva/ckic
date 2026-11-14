@@ -89,6 +89,9 @@ func (o DeployOptions) Validate() error {
 	if o.UseHostNetwork && o.EnableCiliumLB {
 		return errors.New("cannot combine host networking with the cilium loadbalancer")
 	}
+	if o.UseHostNetwork && o.CaddyAdminOriginKey == "" {
+		return errors.New("host networking exposes the Caddy admin API on every node address and requires an admin origin key")
+	}
 	if len(o.EnvSecretKeys) > 0 && o.EnvSecretName == "" {
 		return fmt.Errorf("environment keys %q require an environment secret", o.EnvSecretKeys)
 	}
@@ -337,37 +340,31 @@ func ListDeployments(ctx context.Context, opts DeployOptions) (map[string]*appsv
 	return deployments, nil
 }
 
-func FindActivePod(ctx context.Context, opts DeployOptions, nodeName string) (Pod, error) {
+func FindStartedPod(ctx context.Context, opts DeployOptions, nodeName string) (Pod, error) {
 	pods, err := opts.Clientset.CoreV1().Pods(opts.Namespace).List(ctx, managedListOptions(nodeName))
 	if err != nil {
 		return Pod{}, fmt.Errorf("failed to list pods for node %s: %w", nodeName, err)
 	}
-	pod, ok := selectNewestActivePod(pods.Items)
-	if !ok {
+	pod := newestStartedPod(pods.Items)
+	if pod == nil {
 		return Pod{}, nil
 	}
 	return Pod{Name: pod.Name, IP: pod.Status.PodIP, ContainerID: startedCaddyContainerID(pod)}, nil
 }
 
-func selectNewestActivePod(pods []corev1.Pod) (*corev1.Pod, bool) {
-	var selected *corev1.Pod
+func newestStartedPod(pods []corev1.Pod) *corev1.Pod {
+	var newest *corev1.Pod
 	for idx := range pods {
 		pod := &pods[idx]
-		if !IsActivePod(pod) {
+		if !IsActivePod(pod) || pod.Status.PodIP == "" || startedCaddyContainerID(pod) == "" {
 			continue
 		}
-		if selected == nil {
-			selected = pod
-			continue
-		}
-		switch {
-		case pod.CreationTimestamp.After(selected.CreationTimestamp.Time):
-			selected = pod
-		case pod.CreationTimestamp.Equal(&selected.CreationTimestamp) && pod.Name > selected.Name:
-			selected = pod
+		if newest == nil || pod.CreationTimestamp.After(newest.CreationTimestamp.Time) ||
+			pod.CreationTimestamp.Equal(&newest.CreationTimestamp) && pod.Name > newest.Name {
+			newest = pod
 		}
 	}
-	return selected, selected != nil
+	return newest
 }
 
 func IsActivePod(pod *corev1.Pod) bool {

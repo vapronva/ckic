@@ -18,7 +18,7 @@ func Teardown(ctx context.Context, opts DeployOptions, nodeName string) error {
 	return errors.Join(
 		deleteServicesExcept(ctx, opts, nodeName, ""),
 		deleteDeploymentsExcept(ctx, opts, nodeName, ""),
-		deletePrePullPod(ctx, opts.Clientset, opts.Namespace, PrePullPodName(nodeName), nil),
+		deletePrePullPods(ctx, opts, nodeName),
 	)
 }
 

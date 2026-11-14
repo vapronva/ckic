@@ -107,7 +107,8 @@ func TestReconcileNodePushesOnlyWhenNeeded(t *testing.T) {
 
 func TestReconcileNodeTearsDownUnmanagedNode(t *testing.T) {
 	t.Parallel()
-	client := fake.NewClientset(&appsv1.Deployment{Name: "caddy-gone", Namespace: "caddy-system", Labels: caddy.ManagedLabels("gone")})
+	foreign := &corev1.Pod{Name: caddy.PrePullPodName("gone"), Namespace: "caddy-system", Labels: map[string]string{"owner": "someone-else"}}
+	client := fake.NewClientset(&appsv1.Deployment{Name: "caddy-gone", Namespace: "caddy-system", Labels: caddy.ManagedLabels("gone")}, foreign)
 	c := newTestController(t, client)
 	c.deployFn = func(context.Context, *corev1.Node) (caddy.Pod, error) {
 		t.Fatal("deployFn must not be called for an unmanaged node")
@@ -119,6 +120,9 @@ func TestReconcileNodeTearsDownUnmanagedNode(t *testing.T) {
 	if _, err := client.AppsV1().Deployments("caddy-system").Get(t.Context(), "caddy-gone", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("expected deployment torn down, got %v", err)
 	}
+	if _, err := client.CoreV1().Pods("caddy-system").Get(t.Context(), foreign.Name, metav1.GetOptions{}); err != nil {
+		t.Fatalf("teardown deleted a pod it does not own: %v", err)
+	}
 }
 
 func TestRunWaitsForBaseAndPushesAllConfigFragments(t *testing.T) {
@@ -128,8 +132,8 @@ func TestRunWaitsForBaseAndPushesAllConfigFragments(t *testing.T) {
 		&corev1.ConfigMap{Name: "external", Namespace: "team", Labels: map[string]string{"aggregate": "true"}, Data: map[string]string{caddy.CaddyfileKey: "external"}},
 	)
 	c, err := NewController(client, Config{
-		Namespace: "system", BaseConfigMapName: "base", ExternalEnable: true, ExternalLabel: "aggregate=true",
-		BootConfigMapName: "merged",
+		Namespace: "system", BaseConfigMapName: "base", BootConfigMapName: "merged",
+		ExternalEnable: true, ExternalLabel: "aggregate=true", ExternalAllowNamespaces: []string{"team", "system"},
 	})
 	if err != nil {
 		t.Fatal(err)

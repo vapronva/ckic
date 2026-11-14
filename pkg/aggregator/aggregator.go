@@ -30,14 +30,21 @@ const (
 
 type Snapshot struct {
 	Caddyfile string
+	Digest    string
 	Revision  uint64
 }
 
+type mergeResult struct {
+	snapshot   Snapshot
+	isLoadable bool
+}
+
 type Aggregator struct {
-	mu               sync.RWMutex
+	mu               sync.Mutex
 	base             string
 	hasBase          bool
 	revision         uint64
+	merged           *mergeResult
 	accepted         string
 	acceptedRevision uint64
 	externals        map[string]string
@@ -70,6 +77,7 @@ func (a *Aggregator) update(mutate func() bool) {
 	changed := mutate()
 	if changed {
 		a.revision++
+		a.merged = nil
 	}
 	a.mu.Unlock()
 	if changed && a.enqueue != nil {
@@ -102,31 +110,42 @@ func (a *Aggregator) RemoveExternal(source string) {
 	})
 }
 
-func (a *Aggregator) CurrentMerged() (Snapshot, error) {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
+func (a *Aggregator) CurrentMerged() (Snapshot, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.merged == nil {
+		snapshot, err := a.merge()
+		if err != nil {
+			log.Warn().Err(err).Uint64("revision", a.revision).Msg("No loadable Caddy configuration; keeping the last loaded one until a ConfigMap changes")
+		}
+		a.merged = &mergeResult{snapshot: snapshot, isLoadable: err == nil}
+	}
+	return a.merged.snapshot, a.merged.isLoadable
+}
+
+func (a *Aggregator) merge() (Snapshot, error) {
 	if !a.hasBase {
 		return Snapshot{}, errors.New("base ConfigMap has not supplied a Caddyfile")
 	}
-	var sb strings.Builder
-	sb.WriteString(a.base)
+	parts := []string{a.base}
 	if !strings.HasSuffix(a.base, "\n") {
-		sb.WriteByte('\n')
+		parts = append(parts, "\n")
 	}
 	for _, source := range slices.Sorted(maps.Keys(a.externals)) {
-		fragment := strings.TrimSpace(a.externals[source])
-		if fragment == "" {
-			continue
+		if fragment := strings.TrimSpace(a.externals[source]); fragment != "" {
+			parts = append(parts, "\n\n# ---- Begin external from "+source+" ----\n", fragment, "\n# ---- End external from "+source+" ----\n")
 		}
-		fmt.Fprintf(&sb, "\n\n# ---- Begin external from %s ----\n", source)
-		sb.WriteString(fragment)
-		fmt.Fprintf(&sb, "\n# ---- End external from %s ----\n", source)
 	}
-	merged := sb.String()
-	if len(merged) > corev1.MaxSecretSize {
-		return Snapshot{}, fmt.Errorf("merged Caddyfile is %d bytes, exceeding the ConfigMap limit of %d", len(merged), corev1.MaxSecretSize)
+	size := 0
+	for _, part := range parts {
+		size += len(part)
 	}
-	return Snapshot{Caddyfile: merged, Revision: a.revision}, nil
+	if size > corev1.MaxSecretSize {
+		return Snapshot{}, fmt.Errorf("merged Caddyfile would be %d bytes, exceeding the ConfigMap limit of %d", size, corev1.MaxSecretSize)
+	}
+	merged := strings.Join(parts, "")
+	digest := sha256.Sum256([]byte(merged))
+	return Snapshot{Caddyfile: merged, Digest: hex.EncodeToString(digest[:]), Revision: a.revision}, nil
 }
 
 func (a *Aggregator) InitializeMirror(ctx context.Context) error {
@@ -172,8 +191,8 @@ func (a *Aggregator) IsMirrorCurrent(mirror *corev1.ConfigMap) bool {
 }
 
 func (a *Aggregator) currentAccepted() string {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	return a.accepted
 }
 

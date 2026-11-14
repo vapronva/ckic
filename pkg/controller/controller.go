@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,7 +13,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/validate/content"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	appsv1listers "k8s.io/client-go/listers/apps/v1"
@@ -47,6 +50,7 @@ const (
 	informerResync       = 10 * time.Minute
 	rolloutPollInterval  = 5 * time.Second
 	prePullRetryInterval = time.Minute
+	namespaceField       = "metadata.namespace"
 )
 
 type pushRecord struct {
@@ -61,7 +65,7 @@ type Controller struct {
 	nodeSelector labels.Selector
 	nodeFactory  informers.SharedInformerFactory
 	nsFactory    informers.SharedInformerFactory
-	extFactory   informers.SharedInformerFactory
+	extFactories []informers.SharedInformerFactory
 	nodeLister   corev1listers.NodeLister
 	deployLister appsv1listers.DeploymentLister
 	podLister    corev1listers.PodLister
@@ -79,6 +83,7 @@ func NewController(clientset kubernetes.Interface, config Config) (*Controller, 
 	if err != nil {
 		return nil, err
 	}
+	warnAboutExposure(config, selector)
 	config.Deploy.Clientset = clientset
 	config.Deploy.Namespace = config.Namespace
 	config.Deploy.BootConfigMapName = config.BootConfigMapName
@@ -125,6 +130,9 @@ func validateConfig(config Config) (Config, labels.Selector, error) {
 				return config, nil, err
 			}
 		}
+		if len(externalNamespaces(config)) == 0 {
+			return config, nil, errors.New("every allowed external namespace is denied or is the manager namespace")
+		}
 	}
 	if err := errors.Join(
 		caddy.ValidateName("namespace", config.Namespace, content.IsDNS1123Label),
@@ -137,6 +145,60 @@ func validateConfig(config Config) (Config, labels.Selector, error) {
 		return config, nil, errors.New("external aggregated config name must differ from the base config-map name")
 	}
 	return config, selector, nil
+}
+
+func warnAboutExposure(config Config, selector labels.Selector) {
+	if !config.Deploy.UseHostNetwork && config.Deploy.CaddyAdminOriginKey == "" {
+		log.Warn().Msg("The Caddy admin API on :2019 has no origin key; only a NetworkPolicy keeps other pods from replacing its configuration")
+	}
+	if canNodeSelfEnroll(selector) {
+		log.Warn().Str("selector", selector.String()).
+			Msg("Kubelets can set this node selector's labels on their own Node; select on a node-restriction.kubernetes.io label so a compromised node cannot enroll itself")
+	}
+}
+
+func canNodeSelfEnroll(selector labels.Selector) bool {
+	requirements, _ := selector.Requirements()
+	if len(requirements) == 0 {
+		return false
+	}
+	for _, requirement := range requirements {
+		switch requirement.Operator() {
+		case selection.NotEquals, selection.NotIn, selection.DoesNotExist:
+			continue
+		}
+		if isNodeRestrictionLabel(requirement.Key()) {
+			return false
+		}
+	}
+	return true
+}
+
+func isNodeRestrictionLabel(key string) bool {
+	domain, _, hasDomain := strings.Cut(key, "/")
+	return hasDomain && (domain == corev1.LabelNamespaceNodeRestriction || strings.HasSuffix(domain, "."+corev1.LabelNamespaceNodeRestriction))
+}
+
+func externalNamespaces(config Config) []string {
+	if len(config.ExternalAllowNamespaces) == 0 {
+		return []string{metav1.NamespaceAll}
+	}
+	var namespaces []string
+	for _, namespace := range config.ExternalAllowNamespaces {
+		isExcluded := namespace == config.Namespace || slices.Contains(config.ExternalDenyNamespaces, namespace)
+		if !isExcluded && !slices.Contains(namespaces, namespace) {
+			namespaces = append(namespaces, namespace)
+		}
+	}
+	return namespaces
+}
+
+func externalFieldSelector(config Config) string {
+	excluded := []fields.Selector{fields.OneTermNotEqualSelector(namespaceField, config.Namespace)}
+	for _, namespace := range config.ExternalDenyNamespaces {
+		excluded = append(excluded, fields.OneTermNotEqualSelector(namespaceField, namespace))
+	}
+	return fields.AndSelectors(excluded...).String()
 }
 
 func (c *Controller) setupInformers() error {
@@ -161,14 +223,33 @@ func (c *Controller) setupInformers() error {
 	if err != nil || !c.config.ExternalEnable {
 		return err
 	}
-	label := c.config.ExternalLabel
-	c.extFactory = informers.NewSharedInformerFactoryWithOptions(
-		c.clientset, informerResync,
-		informers.WithTweakListOptions(func(opts *metav1.ListOptions) {
-			opts.LabelSelector = label
-		}),
-	)
-	return c.register(c.extFactory.Core().V1().ConfigMaps().Informer(), c.externalConfigMapHandler())
+	labelSelector, fieldSelector := c.config.ExternalLabel, externalFieldSelector(c.config)
+	scope := informers.WithTweakListOptions(func(opts *metav1.ListOptions) {
+		opts.LabelSelector = labelSelector
+		opts.FieldSelector = fieldSelector
+	})
+	handler := c.externalConfigMapHandler()
+	for _, namespace := range externalNamespaces(c.config) {
+		factory := informers.NewSharedInformerFactoryWithOptions(c.clientset, informerResync, informers.WithNamespace(namespace), scope)
+		informer := factory.Core().V1().ConfigMaps().Informer()
+		if err := errors.Join(informer.SetTransform(keepCaddyfile), c.register(informer, handler)); err != nil {
+			return err
+		}
+		c.extFactories = append(c.extFactories, factory)
+	}
+	return nil
+}
+
+func keepCaddyfile(obj any) (any, error) {
+	cm, ok := obj.(*corev1.ConfigMap)
+	if !ok {
+		return obj, nil
+	}
+	kept := &corev1.ConfigMap{Name: cm.Name, Namespace: cm.Namespace, UID: cm.UID, ResourceVersion: cm.ResourceVersion}
+	if fragment, exists := cm.Data[caddy.CaddyfileKey]; exists {
+		kept.Data = map[string]string{caddy.CaddyfileKey: fragment}
+	}
+	return kept, nil
 }
 
 func (c *Controller) register(informer cache.SharedIndexInformer, handler cache.ResourceEventHandler) error {
@@ -255,7 +336,7 @@ func (c *Controller) configMapHandler() cache.ResourceEventHandler {
 func (c *Controller) externalConfigMapHandler() cache.ResourceEventHandler {
 	upsert := func(obj any) {
 		cm, ok := obj.(*corev1.ConfigMap)
-		if !ok || !c.namespaceAllowed(cm.Namespace) {
+		if !ok {
 			return
 		}
 		source := cm.Namespace + "/" + cm.Name
@@ -294,14 +375,6 @@ func (c *Controller) managedObjectHandler() cache.ResourceEventHandler {
 	}
 }
 
-func (c *Controller) namespaceAllowed(namespace string) bool {
-	allowed := c.config.ExternalAllowNamespaces
-	if namespace == c.config.Namespace || slices.Contains(c.config.ExternalDenyNamespaces, namespace) {
-		return false
-	}
-	return len(allowed) == 0 || slices.Contains(allowed, namespace)
-}
-
 func (c *Controller) Run(ctx context.Context) error {
 	defer c.queue.ShutDown()
 	logger := log.With().Str("component", "controller").Logger()
@@ -309,10 +382,8 @@ func (c *Controller) Run(ctx context.Context) error {
 		return err
 	}
 	stopCh := ctx.Done()
-	c.nodeFactory.Start(stopCh)
-	c.nsFactory.Start(stopCh)
-	if c.extFactory != nil {
-		c.extFactory.Start(stopCh)
+	for _, factory := range slices.Concat([]informers.SharedInformerFactory{c.nodeFactory, c.nsFactory}, c.extFactories) {
+		factory.Start(stopCh)
 	}
 	logger.Info().Msg("Waiting for informer caches to sync")
 	if !cache.WaitForCacheSync(stopCh, c.cacheSyncs...) {

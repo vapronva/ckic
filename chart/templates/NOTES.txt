@@ -1,20 +1,19 @@
 CKIC manager installed.
 
-{{- if and .Values.adminNetworkPolicy (not .Values.config.useHostNetwork) }}
+{{- if .Values.config.useHostNetwork }}
+Caddy's admin API listens on :2019 on every node address and requires the origin key; block it from untrusted networks with a host firewall.
+{{- else if .Values.adminNetworkPolicy }}
 Only the manager may reach Caddy's admin API on :2019; this needs a CNI that enforces NetworkPolicy.
+{{- else if .Values.config.caddyAdminOriginKey }}
+Caddy's admin API on :2019 requires the origin key; adminNetworkPolicy=true also limits it to the manager.
 {{- else }}
-Caddy's admin API on :2019 requires network isolation (adminNetworkPolicy=true, or your own). The Origin check is not authentication.
+WARNING: any pod can replace Caddy's configuration through :2019. Set config.caddyAdminOriginKey, enable adminNetworkPolicy, or apply your own NetworkPolicy.
 {{- end }}
 
 {{- if and .Values.config.useHostNetwork (ne .Values.loadBalancer.mode "none") }}
 
 config.useHostNetwork is true, so loadBalancer.mode ({{ .Values.loadBalancer.mode }}) is ignored and the manager runs with --loadbalancer-mode=none.
 hostNetwork exposes Caddy directly on host ports; a managed LoadBalancer Service would be redundant and is disabled.
-{{- end }}
-
-{{- if .Values.config.useHostNetwork }}
-
-hostNetwork exposes :2019 on the node; restrict access with a host firewall.
 {{- end }}
 
 LoadBalancer mode: {{ if .Values.config.useHostNetwork }}none (hostNetwork){{ else }}{{ .Values.loadBalancer.mode }}{{ end }}
@@ -29,6 +28,9 @@ Watch the external address: kubectl --namespace {{ .Release.Namespace }} get ser
 {{- if eq .Values.loadBalancer.clientIP "proxy-protocol" }}
 
 PROXY protocol {{ .Values.loadBalancer.proxyProtocolVersion }}; HTTP/3 is disabled in this profile.
+{{- if eq .Values.loadBalancer.trustedProxyCIDRs "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7" }}
+WARNING: loadBalancer.trustedProxyCIDRs is the default private-range list, so any pod can send a PROXY header and choose its client IP. Set it to the load balancer or node source ranges.
+{{- end }}
 {{- else if .Values.loadBalancer.enableUDP }}
 
 HTTP/3 is enabled on UDP 443. The load balancer provider must support mixed TCP/UDP Services.
